@@ -175,6 +175,75 @@ class NamedLaneGuardTest(unittest.TestCase):
         self._prefix_test_workspaces.append(prepared)
         return prepared, base, head
 
+    def run_codex_git_prefix_committed_cleanup_fault(
+        self,
+        *,
+        mode: str,
+        prepared: review_workspace_runtime.PreparedWorkspace,
+        base: str,
+        head: str,
+    ) -> subprocess.CompletedProcess[str]:
+        probe = """
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from review_runtime import named_lane
+from review_runtime.common import ForwardedSignal
+
+real_restore = named_lane.restore_signal_mask
+restore_calls = 0
+
+def fail_committed_cleanup_restore(previous):
+    global restore_calls
+    restore_calls += 1
+    real_restore(previous)
+    if restore_calls == 2:
+        raise OSError("synthetic committed context cleanup restore failure")
+
+named_lane.restore_signal_mask = fail_committed_cleanup_restore
+if sys.argv[2] == "failure":
+    def fail_prefix_receipt(**_kwargs):
+        raise ForwardedSignal(signal.SIGTERM)
+
+    named_lane.sanitized_git_argv_prefix_receipt = fail_prefix_receipt
+
+returncode = named_lane.main(
+    (
+        "codex-git-prefix",
+        "--worktree",
+        sys.argv[3],
+        "--base",
+        sys.argv[4],
+        "--head",
+        sys.argv[5],
+        "--git-executable",
+        sys.argv[6],
+    )
+)
+raise SystemExit(returncode)
+"""
+        return subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                probe,
+                str(SCRIPTS),
+                mode,
+                str(prepared.root),
+                base,
+                head,
+                str(named_lane_runtime.resolve_git()),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
     def test_codex_git_prefix_v2_matches_exact_accepted_adapter_sequence(
         self,
     ) -> None:
@@ -361,6 +430,129 @@ class NamedLaneGuardTest(unittest.TestCase):
                 ).encode("utf-8")
             ).hexdigest(),
         )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_committed_success_cleanup_fault_keeps_success(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-committed-success-cleanup-fault"
+        )
+
+        completed = self.run_codex_git_prefix_committed_cleanup_fault(
+            mode="success",
+            prepared=prepared,
+            base=base,
+            head=head,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(len(completed.stdout.splitlines()), 1)
+        self.assertEqual(json.loads(completed.stdout)["command"], "codex-git-prefix")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_committed_failure_cleanup_fault_keeps_failure(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-committed-failure-cleanup-fault"
+        )
+
+        completed = self.run_codex_git_prefix_committed_cleanup_fault(
+            mode="failure",
+            prepared=prepared,
+            base=base,
+            head=head,
+        )
+
+        self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(len(completed.stderr.splitlines()), 1)
+        self.assertEqual(
+            json.loads(completed.stderr),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "Codex Git prefix signal custody requires POSIX pthread masks",
+    )
+    def test_codex_git_prefix_signal_during_validation_uses_structured_handoff(
+        self,
+    ) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "prefix-validation-signal-workspace"
+        )
+        git_executable = named_lane_runtime.resolve_git()
+        original_validate = named_lane_runtime.validate_workspace
+        structured_handler_observed = False
+        signal_queued = False
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            raise ForwardedSignal(signal.Signals(signum))
+
+        def validate_then_signal(*args: object, **kwargs: object) -> object:
+            nonlocal structured_handler_observed, signal_queued
+            result = original_validate(*args, **kwargs)
+            structured_handler_observed = (
+                signal.getsignal(signal.SIGTERM) is not raise_forwarded_signal
+            )
+            signal_queued = True
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "validate_workspace",
+                    side_effect=validate_then_signal,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                returncode = named_lane_main(
+                    (
+                        "codex-git-prefix",
+                        "--worktree",
+                        str(prepared.root),
+                        "--base",
+                        base,
+                        "--head",
+                        head,
+                        "--git-executable",
+                        str(git_executable),
+                    )
+                )
+            self.assertEqual(returncode, 128 + signal.SIGTERM)
+            self.assertTrue(signal_queued)
+            self.assertTrue(structured_handler_observed)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(
+                json.loads(stderr.getvalue()),
+                {"status": "blocked-safety", "reason": "forwarded-signal"},
+            )
+            self.assertIs(signal.getsignal(signal.SIGTERM), raise_forwarded_signal)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                set(previous_mask) - {signal.SIGTERM},
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def test_codex_git_prefix_guard_entrypoint_issues_composite_receipt(self) -> None:
         prepared, base, head = self.prepared_review_workspace(

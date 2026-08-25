@@ -1371,6 +1371,94 @@ superseded_by:
   whole suite with the same six conditional skips in 1,147.173 seconds, and
   the independent closing audit reported `No findings.`
 
+### Formal review remediation after `cd5ccd2`
+
+- Signed head `cd5ccd2ddd2a0975db6c5286765d4aab838bc736` received a
+  fresh, non-resumed GPT-5.6 Sol Ultra Codex CLI review in a newly materialized
+  host-bound workspace over
+  `c8df0f5d17e93a7b22d5fe5294baf9884ab2ba51..cd5ccd2ddd2a0975db6c5286765d4aab838bc736`.
+  The reviewer found one P1 signal-custody defect. Partial-recovery controls
+  could be created and finalized without one surrounding forwarded-signal
+  mask, and `codex-git-prefix` validated its workspace outside the structured
+  workspace-command handoff. A SIGTERM delivered after an armed control was
+  created but before unlink, sealing, or final descriptor closure could leave
+  a sidecar that neither ordinary cleanup nor `recover-partial-workspace` could
+  safely consume. That head did not pass local review; none of its positive
+  evidence is reusable for the replacement head.
+- The failed review attempt itself passed its evidence-integrity gates. Its
+  stream contained 833 events and 409 command events; 79 Git command events
+  represented 80 Git invocations because one event contained two invocations.
+  Every Git invocation used the exact parent-bound sanitized prefix. The
+  subcommand inventory was 69 `diff`, one `log`, one `ls-files`, three
+  `rev-list`, three `rev-parse`, and three `show` invocations. Prelaunch and
+  post-run trusted validation remained type-preserving equal at 16 commits,
+  15 parent edges, the same parent-graph digest, and local-config digest
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The source authentication object retained exact identity and the temporary
+  auth-only home was removed. One bounded websocket connection-limit warning
+  appeared on stderr, but the process reached its terminal finding and the
+  finding-mode audit accepted the complete run.
+- The candidate workspace helper was also exercised against the actual private
+  companion merge DAG from
+  `284f0f54daba1e9e17e922e4fa87aa6b586e37a4` through
+  `6d6bf6a51c6f448f1d2be077b50fdeb0516eca05`. The prior installed materializer
+  failed closed with `materializer review graph cannot be represented by the
+  sole shallow boundary`. Candidate `prepare-workspace` succeeded with
+  `strategy: exact-pack`, seven scoped commits, 172 parent-support objects, 420
+  range objects, no shallow boundary, and independently owned object
+  identities; its paired cleanup receipt reported complete removal. This was
+  an ordinary implementation proof of merge-DAG support, not authorization to
+  use candidate-head control code as the formal bootstrap for its own review.
+- The correction places every production partial-control owner under complete
+  forwarded-signal custody: per-Git controls in `_run_git_raw`, owner-exit
+  recovery retention, exact-pack object-store construction, and range-object
+  verification. Each owner acquires the mask before control creation can
+  return and retains it through process settlement, revalidation, unlink or
+  durable sealing, every owned descriptor close, and recovery-metadata
+  attachment. A queued signal propagates only after that interval. If an
+  operation already failed, the exact primary remains primary and the deferred
+  signal is a secondary diagnostic.
+- Publication rollback now passes its active signal-mask owner into owner-exit
+  recovery rather than opening an interruptible caller/helper handoff. Record
+  fsync followed by parent-directory fsync is the durable seal commit point;
+  the executable recovery payload is cached immediately. Post-commit binding
+  revalidation remains mandatory, but its failure and any later unlock,
+  mask-restore, or descriptor-close failure inherit that exact cached route.
+  Before the commit point, an armed control is never advertised as executable
+  recovery. Failed creation durably removes it when possible or reports a
+  bounded, identity-bound locator with `argv_ready: false`.
+- Control creation, path revalidation, snapshot reads, stream and descriptor
+  retirement, process release, control finalization, and recovery cleanup now
+  use all-attempt teardown. The first active operation error remains primary;
+  otherwise the first teardown error in fixed ownership order is selected, and
+  every later failure remains visible with inherited quiescence, retention,
+  and recovery metadata. The exact-pack stream owner closes both streams even
+  when both close operations fail. A replaced parent path can no longer turn a
+  descriptor-bound armed sidecar into a false path locator: the public
+  `control_file` becomes null and only an identity-bound, unverified expected
+  locator remains. Revalidation retains its original low-level cause while
+  concurrent process-leak, settlement, operation, release, and control-close
+  failures remain labeled diagnostics.
+- `codex-git-prefix` now uses the same structured workspace-command dispatcher
+  as prepare, validate, cleanup, and partial recovery. Validation, final
+  identity reread, receipt flush, signal-mask restoration, and terminal
+  return-code commitment share one cleanup path. Once a success or failure
+  receipt is durably flushed, a later cleanup fault exits with that committed
+  return code rather than emitting a traceback or contradictory second result.
+- Final verification of the replacement candidate passed 12 focused signal,
+  recovery, publication, locator, stream-close, and cause-chain tests; the
+  parent independently reran the six newly decisive cases. The complete
+  `test_review_workspace.py` file passed 185 tests in 222.698 seconds and the
+  complete `test_named_lane.py` file passed 297 tests in 222.965 seconds. The
+  77-test contract matrix passed in 3.661 seconds. Ruff 0.13.2 default
+  E4/E7/E9/F checks and format checks passed for all four modified Python
+  files, along with source compilation, reviewer TOML parsing, skill quick
+  validation, and `git diff --check`. The authoritative host-side whole suite,
+  with `ResourceWarning` promoted to an error, passed 3,164 tests with six
+  conditional skips in 1,181.076 seconds. A new signed head, exact-head secret
+  admission, and one fresh whole-range GPT-5.6 Sol Ultra review remain the next
+  immutable gates; this entry intentionally does not predict their outcome.
+
 ## Next Steps
 
 - Sign the corrected head, rerun exact-head secret admission and one fresh
@@ -1392,15 +1480,17 @@ superseded_by:
   `docs/project_journal/2026/08/2026-08-07-large-repo-range-materialization-wme001.md`.
 - Prior terminal-payload completion record:
   `docs/project_journal/2026/08/2026-08-05-whole-pr-completion-evidence-wpe001.md`.
-- Final post-fix full
+- Final post-`cd5ccd2` remediation
   `python3 -B -W error::ResourceWarning -m unittest discover` review-playbook
-  suite (`3,142` tests, `6` conditional skips, `1,147.173` seconds) outside the
-  nested macOS sandbox restriction. The post-prefix, pre-late-remediation tree
-  passed `3,135` tests with the same six skips in `1,098.645` seconds; the
-  earlier signal-remediation tree passed `3,120` tests with the same six skips
-  in `1,128.061` seconds. The preceding stable tree passed `3,116` tests with
-  the same six skips in `1,118.931` seconds. Its corresponding restricted probe
-  reached one environment-only nested-broker failure, whose exact test passed
+  suite (`3,164` tests, `6` conditional skips, `1,181.076` seconds) outside the
+  nested macOS sandbox restriction. The prior stable tree passed `3,142` tests
+  with the same six skips in `1,147.173` seconds; the post-prefix,
+  pre-late-remediation tree passed `3,135` tests with the same six skips in
+  `1,098.645` seconds; the earlier signal-remediation tree passed `3,120` tests
+  with the same six skips in `1,128.061` seconds. The preceding stable tree
+  passed `3,116` tests with the same six skips in `1,118.931` seconds. Its
+  corresponding restricted probe reached one environment-only nested-broker
+  failure, whose exact test passed
   separately in `1.990` seconds before that authoritative full rerun. The
   earlier stable tree passed `3,112` tests with the same six skips in
   `1,000.276` seconds; the prior signed `2e89971` checkpoint passed `3,010`

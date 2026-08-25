@@ -2050,6 +2050,187 @@ class ReviewWorkspaceTest(unittest.TestCase):
             (-1, -1, -1),
         )
 
+    def test_partial_control_revalidation_preserves_cause_and_closes_all(self) -> None:
+        workspace = self.root / "partial-control-revalidation-cleanup"
+        workspace.mkdir(mode=0o700)
+        control = workspace_runtime._PartialRecoveryControl.create(workspace)
+        real_open = workspace_runtime.os.open
+        real_fstat = workspace_runtime.os.fstat
+        real_close = workspace_runtime.os.close
+        opened: list[int] = []
+        attempted: list[int] = []
+        cause = OSError("fixture final parent revalidation failure")
+
+        def observe_open(*args: object, **kwargs: object) -> int:
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        def fail_final_parent_fstat(descriptor: int) -> os.stat_result:
+            if len(opened) == 4 and descriptor == opened[-1]:
+                raise cause
+            return real_fstat(descriptor)
+
+        def close_then_report(descriptor: int) -> None:
+            real_close(descriptor)
+            if descriptor in opened:
+                attempted.append(descriptor)
+                raise OSError(f"fixture revalidation close failure {descriptor}")
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "open",
+                    side_effect=observe_open,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fstat",
+                    side_effect=fail_final_parent_fstat,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                control._revalidate_bindings()
+            self.assertEqual(
+                caught.exception.reason,
+                "partial-recovery-binding-unavailable",
+            )
+            self.assertIs(caught.exception.__cause__, cause)
+            self.assertEqual(attempted, list(reversed(opened)))
+            diagnostics = self.exception_diagnostics(caught.exception)
+            self.assertEqual(
+                sum("descriptor close failed" in item for item in diagnostics),
+                4,
+            )
+        finally:
+            control.close(retain=False)
+
+    def test_relative_directory_cleanup_preserves_validation_primary(self) -> None:
+        workspace = self.root / "relative-directory-cleanup"
+        workspace.mkdir(mode=0o700)
+        (workspace / "child").mkdir(mode=0o700)
+        root_descriptor = os.open(
+            workspace,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        primary = ReviewWorkspaceError(
+            "fixture-relative-validation",
+            "fixture relative-directory validation failure",
+        )
+        real_close = workspace_runtime.os.close
+        validation_failed = False
+        attempted: list[int] = []
+
+        def fail_validation(*_args: object, **_kwargs: object) -> None:
+            nonlocal validation_failed
+            validation_failed = True
+            raise primary
+
+        def close_then_report(descriptor: int) -> None:
+            real_close(descriptor)
+            if validation_failed:
+                attempted.append(descriptor)
+                raise OSError(f"fixture relative-directory close failure {descriptor}")
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_validate_no_extended_acl",
+                    side_effect=fail_validation,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._open_relative_directory(
+                    root_descriptor,
+                    ("child",),
+                )
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(
+                sum(
+                    "relative-directory" in item
+                    for item in self.exception_diagnostics(primary)
+                ),
+                2,
+            )
+        finally:
+            os.close(root_descriptor)
+
+    def test_control_snapshot_cleanup_preserves_read_cause_and_closes_all(self) -> None:
+        workspace = self.root / "control-snapshot-close-cleanup"
+        workspace.mkdir(mode=0o700)
+        git_directory = workspace / ".git"
+        git_directory.mkdir(mode=0o700)
+        config = git_directory / "config"
+        config.write_text("fixture\n", encoding="utf-8")
+        os.chmod(config, 0o600)
+        root_descriptor = os.open(
+            workspace,
+            workspace_runtime._nofollow_flags(directory=True),
+        )
+        real_close = workspace_runtime.os.close
+        cause = OSError("fixture control snapshot read failure")
+        read_failed = False
+        attempted: list[int] = []
+
+        def fail_read(*_args: object, **_kwargs: object) -> bytes:
+            nonlocal read_failed
+            read_failed = True
+            raise cause
+
+        def close_then_report(descriptor: int) -> None:
+            real_close(descriptor)
+            if read_failed:
+                attempted.append(descriptor)
+                raise OSError(f"fixture snapshot close failure {descriptor}")
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "read",
+                    side_effect=fail_read,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=close_then_report,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._snapshot_control_file(
+                    root_descriptor,
+                    (".git", "config"),
+                    capture_payload=True,
+                )
+            self.assertEqual(
+                caught.exception.reason,
+                "workspace-control-file-unavailable",
+            )
+            self.assertIs(caught.exception.__cause__, cause)
+            self.assertEqual(len(attempted), 2)
+            self.assertEqual(
+                sum(
+                    "control-file" in item
+                    for item in self.exception_diagnostics(caught.exception)
+                ),
+                2,
+            )
+        finally:
+            os.close(root_descriptor)
+
     def test_partial_control_rejects_parent_alias_replacement_after_lock(self) -> None:
         parent = self.root / "partial-control-parent"
         parent.mkdir(mode=0o700)
@@ -2798,6 +2979,122 @@ class ReviewWorkspaceTest(unittest.TestCase):
                 control["sha256"],
             )
         self.assertEqual(recovered.cleanup_status, "already-clean")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "rollback recovery handoff requires POSIX pthread masks",
+    )
+    def test_prepare_rollback_return_signal_preserves_exact_recovery_payload(
+        self,
+    ) -> None:
+        destination = self.root / "rollback-recovery-return-signal"
+        original_retain = workspace_runtime.retain_workspace_for_owner_exit_recovery
+        signal_queued = False
+        handler_calls = 0
+
+        def fail_validation(*_args: object, **_kwargs: object) -> object:
+            raise ReviewWorkspaceError(
+                "fixture-post-validate-failure",
+                "fixture post-validate failure",
+            )
+
+        def fail_after_marker_removal(*_args: object, **_kwargs: object) -> None:
+            raise OSError("fixture late directory removal failure")
+
+        def retain_then_signal(*args: object, **kwargs: object) -> object:
+            nonlocal signal_queued
+            owner = kwargs.get("signal_owner")
+            self.assertIsInstance(
+                owner,
+                workspace_runtime.ForwardedSignalMaskOwner,
+            )
+            assert isinstance(owner, workspace_runtime.ForwardedSignalMaskOwner)
+            self.assertTrue(owner.active)
+            result = original_retain(*args, **kwargs)
+            self.assertTrue(owner.active)
+            signal_queued = True
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "validate_workspace",
+                    side_effect=fail_validation,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_finish_bound_directory_removal",
+                    side_effect=fail_after_marker_removal,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "retain_workspace_for_owner_exit_recovery",
+                    side_effect=retain_then_signal,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertTrue(signal_queued)
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                caught.exception.reason,
+                "workspace-publication-rollback-incomplete",
+            )
+            self.assertIn(
+                "forwarded signal 15 was deferred behind the primary failure",
+                self.exception_diagnostics(caught.exception),
+            )
+            recovery = workspace_runtime._partial_workspace_recovery_payload(
+                caught.exception
+            )
+            self.assertIsNotNone(recovery)
+            assert recovery is not None
+            self.assertEqual(
+                caught.exception.details["partial_recovery_control"],
+                recovery["partial_recovery_control"],
+            )
+            self.assertEqual(caught.exception.details["recovery"], recovery["recovery"])
+            control = recovery["partial_recovery_control"]
+            assert isinstance(control, dict)
+            self.assertEqual(
+                recovery["recovery"]["argv"],
+                [
+                    "recover-partial-workspace",
+                    "--control-file",
+                    control["path"],
+                    "--control-sha256",
+                    control["sha256"],
+                ],
+            )
+            with mock.patch.object(
+                workspace_runtime,
+                "_process_start_identity",
+                side_effect=ProcessLookupError,
+            ):
+                recovered = workspace_runtime.recover_partial_workspace(
+                    pathlib.Path(str(control["path"])),
+                    str(control["sha256"]),
+                )
+            self.assertEqual(recovered.cleanup_status, "already-clean")
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def test_marker_write_failure_does_not_fabricate_formal_recovery_marker(
         self,
@@ -6898,7 +7195,8 @@ class ReviewWorkspaceTest(unittest.TestCase):
             )
             self.assertIs(caught.exception.__cause__, late_os_error)
             self.assertIn(
-                "object verifier teardown also failed (KeyboardInterrupt): "
+                "object verifier primary operation also failed "
+                "(KeyboardInterrupt): "
                 "fixture selector close interruption",
                 self.exception_diagnostics(caught.exception),
             )
@@ -6995,6 +7293,25 @@ class ReviewWorkspaceTest(unittest.TestCase):
         self.assertEqual(
             recovery,
             workspace_runtime._partial_workspace_recovery_payload(process_leak),
+        )
+        diagnostics = self.exception_diagnostics(caught.exception)
+        self.assertTrue(
+            any(
+                "object verifier process leak also occurred" in item
+                for item in diagnostics
+            )
+        )
+        self.assertTrue(
+            any(
+                "object verifier lease settlement also failed" in item
+                for item in diagnostics
+            )
+        )
+        self.assertTrue(
+            any(
+                "object verifier primary operation also failed" in item
+                for item in diagnostics
+            )
         )
         assert recovery is not None
         control = recovery["partial_recovery_control"]
@@ -7256,6 +7573,1336 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             if prepared.root.exists():
                 self.cleanup(prepared)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "partial recovery signal custody requires POSIX pthread masks",
+    )
+    def test_git_control_creation_return_signal_waits_for_owned_control_close(
+        self,
+    ) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "git-control-creation-return-signal",
+            self.commits[1],
+            self.commits[2],
+        )
+        binding = workspace_runtime._bind_workspace_controls(
+            prepared.root,
+            include_index=True,
+            include_marker=True,
+        )
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        original_close = workspace_runtime._PartialRecoveryControl.close
+        target_control: object | None = None
+        events: list[str] = []
+        handler_calls = 0
+
+        def create_then_signal(root: pathlib.Path) -> object:
+            nonlocal target_control
+            target_control = original_create(root)
+            events.append("control-created")
+            signal.raise_signal(signal.SIGTERM)
+            events.append("signal-queued")
+            return target_control
+
+        def observe_close(control: object, *, retain: bool) -> None:
+            if control is target_control:
+                events.append("control-close-entered")
+            original_close(control, retain=retain)
+            if control is target_control:
+                events.append("control-closed")
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=create_then_signal,
+                ),
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "close",
+                    new=observe_close,
+                ),
+                self.assertRaises(workspace_runtime.ForwardedSignal) as caught,
+            ):
+                workspace_runtime._run_git_raw(
+                    prepared.root,
+                    ("rev-parse", "--git-dir"),
+                    control_binding=binding,
+                )
+            self.assertEqual(caught.exception.signum, signal.SIGTERM)
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                events,
+                [
+                    "control-created",
+                    "signal-queued",
+                    "control-close-entered",
+                    "control-closed",
+                ],
+            )
+            self.assertFalse(
+                tuple(
+                    prepared.root.parent.glob(
+                        f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                    )
+                )
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if (
+                target_control is not None
+                and getattr(target_control, "descriptor", -1) >= 0
+            ):
+                original_close(target_control, retain=False)
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "partial recovery signal custody requires POSIX pthread masks",
+    )
+    def test_git_control_final_descriptor_signal_waits_for_close(self) -> None:
+        prepared = prepare_workspace(
+            self.repo,
+            self.root / "git-control-final-close-signal",
+            self.commits[1],
+            self.commits[2],
+        )
+        binding = workspace_runtime._bind_workspace_controls(
+            prepared.root,
+            include_index=True,
+            include_marker=True,
+        )
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        original_os_close = workspace_runtime.os.close
+        target_parent_descriptor: int | None = None
+        events: list[str] = []
+        handler_calls = 0
+
+        def observe_create(root: pathlib.Path) -> object:
+            nonlocal target_parent_descriptor
+            control = original_create(root)
+            target_parent_descriptor = control.parent_descriptor
+            return control
+
+        def signal_before_final_close(descriptor: int) -> None:
+            if descriptor == target_parent_descriptor:
+                events.append("signal-queued")
+                signal.raise_signal(signal.SIGTERM)
+                events.append("final-close-entered")
+            original_os_close(descriptor)
+            if descriptor == target_parent_descriptor:
+                events.append("final-descriptor-closed")
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=observe_create,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=signal_before_final_close,
+                ),
+                self.assertRaises(workspace_runtime.ForwardedSignal) as caught,
+            ):
+                workspace_runtime._run_git_raw(
+                    prepared.root,
+                    ("rev-parse", "--git-dir"),
+                    control_binding=binding,
+                )
+            self.assertEqual(caught.exception.signum, signal.SIGTERM)
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                events,
+                [
+                    "signal-queued",
+                    "final-close-entered",
+                    "final-descriptor-closed",
+                ],
+            )
+            assert target_parent_descriptor is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(target_parent_descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertFalse(
+                tuple(
+                    prepared.root.parent.glob(
+                        f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                    )
+                )
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if target_parent_descriptor is not None:
+                try:
+                    os.fstat(target_parent_descriptor)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+                else:
+                    original_os_close(target_parent_descriptor)
+            if prepared.root.exists():
+                self.cleanup(prepared)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "exact-pack signal custody requires POSIX pthread masks",
+    )
+    def test_exact_pack_control_creation_return_signal_waits_for_close(self) -> None:
+        destination = self.root / "exact-pack-control-return-signal"
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        original_close = workspace_runtime._PartialRecoveryControl.close
+        original_run_process = workspace_runtime.run_process
+        target_control: object | None = None
+        events: list[str] = []
+        handler_calls = 0
+
+        def create_then_signal(root: pathlib.Path) -> object:
+            nonlocal target_control
+            control = original_create(root)
+            if root == destination and target_control is None:
+                target_control = control
+                events.append("control-created")
+                signal.raise_signal(signal.SIGTERM)
+                events.append("signal-queued")
+            return control
+
+        def observe_close(control: object, *, retain: bool) -> None:
+            if control is target_control:
+                events.append("control-close-entered")
+            original_close(control, retain=retain)
+            if control is target_control:
+                events.append("control-closed")
+
+        def fail_pack_process(
+            command: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            if "pack-objects" in command:
+                raise workspace_runtime.ReviewError(
+                    "fixture exact-pack process failure"
+                )
+            return original_run_process(command, *args, **kwargs)
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=create_then_signal,
+                ),
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "close",
+                    new=observe_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "run_process",
+                    side_effect=fail_pack_process,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                prepare_workspace(
+                    self.repo,
+                    destination,
+                    self.commits[1],
+                    self.commits[2],
+                )
+            self.assertEqual(caught.exception.reason, "range-pack-failed")
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                events,
+                [
+                    "control-created",
+                    "signal-queued",
+                    "control-close-entered",
+                    "control-closed",
+                ],
+            )
+            self.assertIn(
+                "forwarded signal 15 was deferred behind the primary failure",
+                self.exception_diagnostics(caught.exception),
+            )
+            self.assertFalse(destination.exists())
+            self.assertFalse(
+                tuple(
+                    destination.parent.glob(
+                        f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                    )
+                )
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if (
+                target_control is not None
+                and getattr(target_control, "descriptor", -1) >= 0
+            ):
+                original_close(target_control, retain=False)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "owner-exit recovery signal custody requires POSIX pthread masks",
+    )
+    def test_owner_exit_recovery_final_descriptor_signal_waits_for_close(
+        self,
+    ) -> None:
+        parent = self.root / "owner-exit-final-close-parent"
+        parent.mkdir(mode=0o700)
+        workspace = parent / "workspace"
+        workspace.mkdir(mode=0o700)
+        parent_metadata = parent.stat(follow_symlinks=False)
+        workspace_metadata = workspace.stat(follow_symlinks=False)
+        parent_identity = (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+            parent_metadata.st_uid,
+        )
+        workspace_identity = (
+            workspace_metadata.st_dev,
+            workspace_metadata.st_ino,
+            workspace_metadata.st_uid,
+        )
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        original_os_close = workspace_runtime.os.close
+        target_control: object | None = None
+        target_parent_descriptor: int | None = None
+        events: list[str] = []
+        handler_calls = 0
+        recovery_payload: dict[str, object] | None = None
+        primary = ReviewWorkspaceError(
+            "fixture-publication-failure",
+            "fixture publication failure",
+        )
+
+        def observe_create(root: pathlib.Path) -> object:
+            nonlocal target_control, target_parent_descriptor
+            target_control = original_create(root)
+            target_parent_descriptor = target_control.parent_descriptor
+            return target_control
+
+        def signal_before_final_close(descriptor: int) -> None:
+            if descriptor == target_parent_descriptor:
+                events.append("signal-queued")
+                signal.raise_signal(signal.SIGTERM)
+                events.append("final-close-entered")
+            original_os_close(descriptor)
+            if descriptor == target_parent_descriptor:
+                events.append("final-descriptor-closed")
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=observe_create,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=signal_before_final_close,
+                ),
+            ):
+                recovery_payload = (
+                    workspace_runtime.retain_workspace_for_owner_exit_recovery(
+                        workspace,
+                        parent_identity,
+                        workspace_identity,
+                        primary_error=primary,
+                    )
+                )
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(
+                events,
+                [
+                    "signal-queued",
+                    "final-close-entered",
+                    "final-descriptor-closed",
+                ],
+            )
+            self.assertIn(
+                "forwarded signal 15 was deferred behind the primary failure",
+                self.exception_diagnostics(primary),
+            )
+            assert target_parent_descriptor is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(target_parent_descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            control = recovery_payload["partial_recovery_control"]
+            assert isinstance(control, dict)
+            control_path = pathlib.Path(str(control["path"]))
+            self.assertTrue(control_path.is_file())
+            with mock.patch.object(
+                workspace_runtime,
+                "_process_start_identity",
+                side_effect=ProcessLookupError,
+            ):
+                recovered = workspace_runtime.recover_partial_workspace(
+                    control_path,
+                    str(control["sha256"]),
+                )
+            self.assertEqual(recovered.cleanup_status, "already-clean")
+            self.assertEqual(recovered.tombstone_status, "retained")
+            self.assertEqual(tuple(workspace.iterdir()), ())
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if target_parent_descriptor is not None:
+                try:
+                    os.fstat(target_parent_descriptor)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+                else:
+                    original_os_close(target_parent_descriptor)
+            if target_control is not None and target_control.path.exists():
+                target_control.path.unlink()
+            if workspace.exists():
+                workspace.rmdir()
+
+    def test_owner_exit_recovery_close_failure_preserves_sealed_capability(
+        self,
+    ) -> None:
+        parent = self.root / "owner-exit-close-failure-parent"
+        parent.mkdir(mode=0o700)
+        workspace = parent / "workspace"
+        workspace.mkdir(mode=0o700)
+        parent_metadata = parent.stat(follow_symlinks=False)
+        workspace_metadata = workspace.stat(follow_symlinks=False)
+        parent_identity = (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+            parent_metadata.st_uid,
+        )
+        workspace_identity = (
+            workspace_metadata.st_dev,
+            workspace_metadata.st_ino,
+            workspace_metadata.st_uid,
+        )
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        original_close = workspace_runtime._PartialRecoveryControl.close
+        target_control: object | None = None
+        close_error = PermissionError("fixture retained control close failure")
+        primary = ReviewWorkspaceError(
+            "fixture-publication-failure",
+            "fixture publication failure",
+        )
+
+        def observe_create(root: pathlib.Path) -> object:
+            nonlocal target_control
+            target_control = original_create(root)
+            return target_control
+
+        def close_then_report_failure(control: object, *, retain: bool) -> None:
+            original_close(control, retain=retain)
+            if control is target_control and retain:
+                raise close_error
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=observe_create,
+                ),
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "close",
+                    new=close_then_report_failure,
+                ),
+                self.assertRaises(PermissionError) as caught,
+            ):
+                workspace_runtime.retain_workspace_for_owner_exit_recovery(
+                    workspace,
+                    parent_identity,
+                    workspace_identity,
+                    primary_error=primary,
+                )
+            self.assertIs(caught.exception, close_error)
+            recovery = workspace_runtime._partial_workspace_recovery_payload(
+                caught.exception
+            )
+            self.assertIsNotNone(recovery)
+            assert recovery is not None
+            self.assertEqual(
+                workspace_runtime._partial_workspace_recovery_payload(primary),
+                recovery,
+            )
+            control = recovery["partial_recovery_control"]
+            assert isinstance(control, dict)
+            self.assertEqual(
+                recovery["recovery"]["argv"],
+                [
+                    "recover-partial-workspace",
+                    "--control-file",
+                    control["path"],
+                    "--control-sha256",
+                    control["sha256"],
+                ],
+            )
+            self.assertTrue(pathlib.Path(str(control["path"])).is_file())
+            with mock.patch.object(
+                workspace_runtime,
+                "_process_start_identity",
+                side_effect=ProcessLookupError,
+            ):
+                recovered = workspace_runtime.recover_partial_workspace(
+                    pathlib.Path(str(control["path"])),
+                    str(control["sha256"]),
+                )
+            self.assertEqual(recovered.cleanup_status, "already-clean")
+        finally:
+            if target_control is not None and target_control.path.exists():
+                target_control.path.unlink()
+            if workspace.exists():
+                workspace.rmdir()
+
+    def test_owner_exit_post_commit_revalidation_failure_keeps_exact_route(
+        self,
+    ) -> None:
+        parent = self.root / "owner-exit-post-commit-parent"
+        parent.mkdir(mode=0o700)
+        workspace = parent / "workspace"
+        workspace.mkdir(mode=0o700)
+        parent_metadata = parent.stat(follow_symlinks=False)
+        workspace_metadata = workspace.stat(follow_symlinks=False)
+        parent_identity = (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+            parent_metadata.st_uid,
+        )
+        workspace_identity = (
+            workspace_metadata.st_dev,
+            workspace_metadata.st_ino,
+            workspace_metadata.st_uid,
+        )
+        original_revalidate = (
+            workspace_runtime._PartialRecoveryControl._revalidate_bindings
+        )
+        original_close = workspace_runtime._PartialRecoveryControl.close
+        late_error = ReviewWorkspaceError(
+            "fixture-post-seal-revalidation",
+            "fixture post-seal revalidation failure",
+            status="inconclusive",
+        )
+        primary = ReviewWorkspaceError(
+            "fixture-publication-failure",
+            "fixture publication failure",
+        )
+        close_retain: list[bool] = []
+
+        def fail_after_commit(control: object) -> None:
+            if control.committed_recovery_payload() is not None:
+                raise late_error
+            original_revalidate(control)
+
+        def observe_close(control: object, *, retain: bool) -> None:
+            close_retain.append(retain)
+            original_close(control, retain=retain)
+
+        with (
+            mock.patch.object(
+                workspace_runtime._PartialRecoveryControl,
+                "_revalidate_bindings",
+                new=fail_after_commit,
+            ),
+            mock.patch.object(
+                workspace_runtime._PartialRecoveryControl,
+                "close",
+                new=observe_close,
+            ),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            workspace_runtime.retain_workspace_for_owner_exit_recovery(
+                workspace,
+                parent_identity,
+                workspace_identity,
+                primary_error=primary,
+            )
+        self.assertIs(caught.exception, late_error)
+        self.assertEqual(close_retain, [True])
+        recovery = workspace_runtime._partial_workspace_recovery_payload(
+            caught.exception
+        )
+        self.assertIsNotNone(recovery)
+        assert recovery is not None
+        self.assertEqual(
+            workspace_runtime._partial_workspace_recovery_payload(primary),
+            recovery,
+        )
+        control = recovery["partial_recovery_control"]
+        assert isinstance(control, dict)
+        self.assertEqual(
+            recovery["recovery"]["argv"],
+            [
+                "recover-partial-workspace",
+                "--control-file",
+                control["path"],
+                "--control-sha256",
+                control["sha256"],
+            ],
+        )
+        control_path = pathlib.Path(str(control["path"]))
+        self.assertTrue(control_path.is_file())
+        with mock.patch.object(
+            workspace_runtime,
+            "_process_start_identity",
+            side_effect=ProcessLookupError,
+        ):
+            recovered = workspace_runtime.recover_partial_workspace(
+                control_path,
+                str(control["sha256"]),
+            )
+        self.assertEqual(recovered.tombstone_status, "retained")
+        self.assertTrue(control_path.is_file())
+
+    def test_owner_exit_parent_sync_failure_does_not_claim_durable_seal(
+        self,
+    ) -> None:
+        workspace = self.root / "owner-exit-parent-sync-failure"
+        workspace.mkdir(mode=0o700)
+        control = workspace_runtime._PartialRecoveryControl.create(workspace)
+        real_fsync = workspace_runtime.os.fsync
+        sync_error = OSError("fixture owner-exit parent sync failure")
+
+        def fail_parent_sync(descriptor: int) -> None:
+            if descriptor == control.parent_descriptor:
+                raise sync_error
+            real_fsync(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fsync",
+                    side_effect=fail_parent_sync,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                control.owner_exit_recovery_payload()
+            self.assertIs(caught.exception, sync_error)
+            self.assertIsNone(control.committed_recovery_payload())
+            self.assertIsNone(
+                workspace_runtime._partial_workspace_recovery_payload(caught.exception)
+            )
+            control.close(retain=False)
+            self.assertFalse(control.path.exists())
+        finally:
+            if control.descriptor >= 0:
+                control.close(retain=False)
+
+    def test_unquiesced_post_commit_revalidation_failure_keeps_exact_route(
+        self,
+    ) -> None:
+        workspace = self.root / "process-post-commit-workspace"
+        workspace.mkdir(mode=0o700)
+        control = workspace_runtime._PartialRecoveryControl.create(workspace)
+        control.bind_process(
+            "fixture-operation",
+            workspace_runtime._RecoveryProcessIdentity(
+                905_001,
+                905_001,
+                "fixture-process-start",
+            ),
+        )
+        original_revalidate = (
+            workspace_runtime._PartialRecoveryControl._revalidate_bindings
+        )
+        late_error = ReviewWorkspaceError(
+            "fixture-process-post-seal-revalidation",
+            "fixture process post-seal revalidation failure",
+            status="inconclusive",
+        )
+
+        def fail_after_commit(candidate: object) -> None:
+            if candidate.committed_recovery_payload() is not None:
+                raise late_error
+            original_revalidate(candidate)
+
+        primary = ReviewWorkspaceError(
+            "fixture-process-failure",
+            "fixture process failure",
+            status="inconclusive",
+        )
+        try:
+            with mock.patch.object(
+                workspace_runtime._PartialRecoveryControl,
+                "_revalidate_bindings",
+                new=fail_after_commit,
+            ):
+                recovery = workspace_runtime._retain_unquiesced_workspace(
+                    primary,
+                    control,
+                    diagnostic_context="fixture process",
+                )
+            self.assertTrue(workspace_runtime.process_quiescence_unproven(primary))
+            self.assertTrue(
+                workspace_runtime._partial_workspace_requires_retention(primary)
+            )
+            self.assertTrue(recovery["recovery"]["argv_ready"])
+            self.assertIsNotNone(recovery["partial_recovery_control"]["sha256"])
+            self.assertEqual(
+                workspace_runtime._partial_workspace_recovery_payload(primary),
+                recovery,
+            )
+            control.close(retain=True)
+            control_path = pathlib.Path(
+                str(recovery["partial_recovery_control"]["path"])
+            )
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_process_start_identity",
+                    side_effect=ProcessLookupError,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_process_group_exists",
+                    return_value=False,
+                ),
+            ):
+                recovered = workspace_runtime.recover_partial_workspace(
+                    control_path,
+                    str(recovery["partial_recovery_control"]["sha256"]),
+                )
+            self.assertEqual(recovered.tombstone_status, "retained")
+        finally:
+            if control.descriptor >= 0:
+                control.close(retain=control.committed_recovery_payload() is not None)
+
+    def test_partial_control_create_preserves_primary_and_armed_locator(self) -> None:
+        workspace = self.root / "partial-control-create-cleanup"
+        workspace.mkdir(mode=0o700)
+        primary = ReviewWorkspaceError(
+            "fixture-create-publication-failure",
+            "fixture create publication failure",
+        )
+        close_errors: list[OSError] = []
+        attempted_closes: list[int] = []
+        cleanup_started = False
+        real_close = workspace_runtime.os.close
+        real_unlink = workspace_runtime.os.unlink
+
+        def fail_write(*_args: object, **_kwargs: object) -> str:
+            nonlocal cleanup_started
+            cleanup_started = True
+            raise primary
+
+        def close_then_report(descriptor: int) -> None:
+            attempted_closes.append(descriptor)
+            real_close(descriptor)
+            if cleanup_started:
+                error = OSError(
+                    f"fixture create descriptor close failure {len(close_errors)}"
+                )
+                close_errors.append(error)
+                raise error
+
+        def retain_control(leaf: object, *args: object, **kwargs: object) -> None:
+            if os.fspath(leaf).startswith(workspace_runtime.PARTIAL_RECOVERY_PREFIX):
+                raise PermissionError("fixture create control unlink failure")
+            real_unlink(leaf, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_write_partial_recovery_record",
+                side_effect=fail_write,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "close",
+                side_effect=close_then_report,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "unlink",
+                side_effect=retain_control,
+            ),
+            self.assertRaises(ReviewWorkspaceError) as caught,
+        ):
+            workspace_runtime._PartialRecoveryControl.create(workspace)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(len(close_errors), 3)
+        self.assertEqual(len(attempted_closes[-3:]), 3)
+        locator = getattr(
+            primary,
+            "_review_workspace_partial_control_cleanup",
+        )
+        self.assertEqual(locator["status"], "cleanup-incomplete")
+        self.assertFalse(locator["recovery"]["argv_ready"])
+        self.assertIsNone(locator["control_sha256"])
+        control_path = pathlib.Path(locator["control_file"])
+        self.assertTrue(control_path.is_file())
+        diagnostics = self.exception_diagnostics(primary)
+        self.assertTrue(
+            any("control unlink failed" in diagnostic for diagnostic in diagnostics)
+        )
+        self.assertEqual(
+            sum("descriptor close failed" in item for item in diagnostics),
+            3,
+        )
+        control_path.unlink()
+
+    def test_partial_control_create_does_not_publish_replaced_parent_path(
+        self,
+    ) -> None:
+        parent = self.root / "partial-control-create-parent-alias"
+        parent.mkdir(mode=0o700)
+        workspace = parent / "workspace"
+        workspace.mkdir(mode=0o700)
+        displaced = self.root / "partial-control-create-parent-displaced"
+        replacement_sentinel = parent / "workspace" / "sentinel.txt"
+        primary = ReviewWorkspaceError(
+            "fixture-create-parent-replacement",
+            "fixture create parent replacement",
+        )
+        unlink_error = PermissionError("fixture retained sidecar unlink failure")
+        real_unlink = workspace_runtime.os.unlink
+        replaced = False
+
+        def replace_parent_then_fail(*_args: object, **_kwargs: object) -> str:
+            nonlocal replaced
+            parent.rename(displaced)
+            parent.mkdir(mode=0o700)
+            (parent / "workspace").mkdir(mode=0o700)
+            replacement_sentinel.write_text("unrelated\n", encoding="utf-8")
+            replaced = True
+            raise primary
+
+        def retain_sidecar(leaf: object, *args: object, **kwargs: object) -> None:
+            if os.fspath(leaf).startswith(workspace_runtime.PARTIAL_RECOVERY_PREFIX):
+                raise unlink_error
+            real_unlink(leaf, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_write_partial_recovery_record",
+                    side_effect=replace_parent_then_fail,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "unlink",
+                    side_effect=retain_sidecar,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._PartialRecoveryControl.create(workspace)
+            self.assertIs(caught.exception, primary)
+            self.assertTrue(replaced)
+            locator = primary.details["partial_recovery_control_cleanup"]
+            self.assertIsNone(locator["control_file"])
+            self.assertEqual(locator["locator_status"], "parent-path-unverified")
+            self.assertFalse(locator["recovery"]["argv_ready"])
+            expected = locator["expected_locator"]
+            self.assertEqual(expected["parent"], str(parent))
+            self.assertEqual(expected["control_identity"], locator["identity"])
+            retained_controls = tuple(
+                displaced.glob(f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json")
+            )
+            self.assertEqual(len(retained_controls), 1)
+            retained_metadata = retained_controls[0].stat(follow_symlinks=False)
+            self.assertEqual(
+                locator["identity"],
+                {
+                    "device": retained_metadata.st_dev,
+                    "inode": retained_metadata.st_ino,
+                    "uid": retained_metadata.st_uid,
+                },
+            )
+            self.assertEqual(
+                replacement_sentinel.read_text(encoding="utf-8"),
+                "unrelated\n",
+            )
+            self.assertFalse(
+                tuple(parent.glob(f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"))
+            )
+            diagnostics = self.exception_diagnostics(primary)
+            self.assertTrue(
+                any("control unlink failed" in item for item in diagnostics)
+            )
+            self.assertTrue(
+                any(
+                    "partial-recovery-parent-alias-drift" in item
+                    for item in diagnostics
+                )
+            )
+        finally:
+            if replaced:
+                for retained in displaced.glob(
+                    f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                ):
+                    retained.unlink()
+                replacement_sentinel.unlink(missing_ok=True)
+                (parent / "workspace").rmdir()
+                parent.rmdir()
+                displaced.rename(parent)
+
+    def test_exact_pack_fdopen_failures_preserve_original_error(self) -> None:
+        for failing_call in (1, 2):
+            with self.subTest(failing_call=failing_call):
+                workspace = self.root / f"exact-pack-fdopen-{failing_call}"
+                workspace.mkdir(mode=0o700)
+                (workspace / ".git").mkdir(mode=0o700)
+                (workspace / ".git/objects").mkdir(mode=0o700)
+                primary = OSError(f"fixture fdopen failure {failing_call}")
+                real_fdopen = workspace_runtime.os.fdopen
+                calls = 0
+
+                def fail_selected_fdopen(*args: object, **kwargs: object) -> object:
+                    nonlocal calls
+                    calls += 1
+                    if calls == failing_call:
+                        raise primary
+                    return real_fdopen(*args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        workspace_runtime.os,
+                        "fdopen",
+                        side_effect=fail_selected_fdopen,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    workspace_runtime._build_exact_object_store_under_signal_mask(
+                        workspace,
+                        mock.Mock(),
+                        ("a" * 40,),
+                        workspace_runtime.time.monotonic() + 10.0,
+                    )
+                self.assertIs(caught.exception, primary)
+                self.assertFalse(
+                    tuple(
+                        workspace.parent.glob(
+                            f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                        )
+                    )
+                )
+
+    def test_exact_pack_body_primary_survives_both_stream_close_failures(
+        self,
+    ) -> None:
+        workspace = self.root / "exact-pack-stream-primary"
+        workspace.mkdir(mode=0o700)
+        (workspace / ".git").mkdir(mode=0o700)
+        (workspace / ".git/objects").mkdir(mode=0o700)
+        original_create = workspace_runtime._PartialRecoveryControl.create
+        real_fdopen = workspace_runtime.os.fdopen
+        primary = ReviewWorkspaceError(
+            "fixture-exact-pack-body-primary",
+            "fixture exact-pack body primary",
+            status="inconclusive",
+        )
+        stream_errors = (
+            PermissionError("fixture pack stream close failure"),
+            OSError("fixture error stream close failure"),
+        )
+        stream_labels = ("pack", "error")
+        stream_index = 0
+        closed: list[str] = []
+        target_control: object | None = None
+        recovery: dict[str, object] | None = None
+
+        class FaultingStream:
+            def __init__(
+                self,
+                descriptor: int,
+                label: str,
+                close_error: BaseException,
+            ) -> None:
+                self.stream = real_fdopen(descriptor, "w+b", closefd=True)
+                self.label = label
+                self.close_error = close_error
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.stream, name)
+
+            def close(self) -> None:
+                closed.append(self.label)
+                self.stream.close()
+                raise self.close_error
+
+        def create_sealed(root: pathlib.Path) -> object:
+            nonlocal target_control, recovery
+            target_control = original_create(root)
+            recovery = target_control.owner_exit_recovery_payload()
+            workspace_runtime.mark_process_quiescence_unproven(primary)
+            workspace_runtime._mark_partial_workspace_for_retention(primary)
+            workspace_runtime._record_partial_workspace_recovery(
+                primary,
+                recovery,
+            )
+            return target_control
+
+        def faulting_fdopen(
+            descriptor: int,
+            _mode: str,
+            *,
+            closefd: bool,
+        ) -> object:
+            nonlocal stream_index
+            self.assertTrue(closefd)
+            current = stream_index
+            stream_index += 1
+            return FaultingStream(
+                descriptor,
+                stream_labels[current],
+                stream_errors[current],
+            )
+
+        def fail_body() -> dict[str, str]:
+            raise primary
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime._PartialRecoveryControl,
+                    "create",
+                    side_effect=create_sealed,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fdopen",
+                    side_effect=faulting_fdopen,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_git_environment",
+                    side_effect=fail_body,
+                ),
+                self.assertRaises(ReviewWorkspaceError) as caught,
+            ):
+                workspace_runtime._build_exact_object_store_under_signal_mask(
+                    workspace,
+                    mock.Mock(),
+                    ("a" * 40,),
+                    workspace_runtime.time.monotonic() + 10.0,
+                )
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(closed, ["pack", "error"])
+            self.assertTrue(workspace_runtime.process_quiescence_unproven(primary))
+            self.assertTrue(
+                workspace_runtime._partial_workspace_requires_retention(primary)
+            )
+            self.assertEqual(
+                workspace_runtime._partial_workspace_recovery_payload(primary),
+                recovery,
+            )
+            diagnostics = self.exception_diagnostics(primary)
+            self.assertIn(
+                "exact-pack pack stream close failed (PermissionError): "
+                "fixture pack stream close failure",
+                diagnostics,
+            )
+            self.assertIn(
+                "exact-pack error stream close failed (OSError): "
+                "fixture error stream close failure",
+                diagnostics,
+            )
+            self.assertIsNotNone(target_control)
+            self.assertEqual(target_control.descriptor, -1)
+        finally:
+            if target_control is not None and target_control.path.exists():
+                target_control.path.unlink()
+
+    def test_exact_pack_clean_body_selects_first_stream_close_failure(self) -> None:
+        workspace = self.root / "exact-pack-stream-close-only"
+        workspace.mkdir(mode=0o700)
+        (workspace / ".git").mkdir(mode=0o700)
+        (workspace / ".git/objects").mkdir(mode=0o700)
+        real_fdopen = workspace_runtime.os.fdopen
+        stream_errors = (
+            PermissionError("fixture pack stream close failure"),
+            OSError("fixture error stream close failure"),
+        )
+        stream_labels = ("pack", "error")
+        stream_index = 0
+        closed: list[str] = []
+
+        class FaultingStream:
+            def __init__(
+                self,
+                descriptor: int,
+                label: str,
+                close_error: BaseException,
+            ) -> None:
+                self.stream = real_fdopen(descriptor, "w+b", closefd=True)
+                self.label = label
+                self.close_error = close_error
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.stream, name)
+
+            def close(self) -> None:
+                closed.append(self.label)
+                self.stream.close()
+                raise self.close_error
+
+        def faulting_fdopen(
+            descriptor: int,
+            _mode: str,
+            *,
+            closefd: bool,
+        ) -> object:
+            nonlocal stream_index
+            self.assertTrue(closefd)
+            current = stream_index
+            stream_index += 1
+            return FaultingStream(
+                descriptor,
+                stream_labels[current],
+                stream_errors[current],
+            )
+
+        def complete_pack(
+            _command: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            stdout_file = kwargs["stdout_file"]
+            os.write(stdout_file.fileno(), b"fixture-pack")
+            return mock.Mock(returncode=0, stderr=b"")
+
+        source = mock.Mock(
+            root=self.repo,
+            git_dir=self.repo / ".git",
+            object_format="sha1",
+        )
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "fdopen",
+                side_effect=faulting_fdopen,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_git_environment",
+                return_value={},
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_git_argv",
+                return_value=("/usr/bin/git", "pack-objects"),
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "run_process",
+                side_effect=complete_pack,
+            ),
+            self.assertRaises(PermissionError) as caught,
+        ):
+            workspace_runtime._build_exact_object_store_under_signal_mask(
+                workspace,
+                source,
+                ("a" * 40,),
+                workspace_runtime.time.monotonic() + 10.0,
+            )
+        self.assertIs(caught.exception, stream_errors[0])
+        self.assertEqual(closed, ["pack", "error"])
+        diagnostics = self.exception_diagnostics(caught.exception)
+        self.assertIn("exact-pack pack stream close failed", diagnostics)
+        self.assertIn(
+            "exact-pack error stream close failed (OSError): "
+            "fixture error stream close failure",
+            diagnostics,
+        )
+        self.assertFalse(
+            tuple(
+                workspace.parent.glob(
+                    f"{workspace_runtime.PARTIAL_RECOVERY_PREFIX}*.json"
+                )
+            )
+        )
+
+    def test_exact_pack_teardown_attempts_all_failures(self) -> None:
+        workspace = self.root / "exact-pack-teardown-failures"
+        workspace.mkdir(mode=0o700)
+        (workspace / ".git").mkdir(mode=0o700)
+        (workspace / ".git/objects").mkdir(mode=0o700)
+        primary = OSError("fixture fdopen primary")
+        original_close = workspace_runtime._PartialRecoveryControl.close
+        original_unlink = pathlib.Path.unlink
+        removals: list[str] = []
+        control_closed = False
+
+        def fail_fdopen(*_args: object, **_kwargs: object) -> object:
+            raise primary
+
+        def fail_removal(path: pathlib.Path, *args: object, **kwargs: object) -> None:
+            if path.name.startswith(".review-"):
+                removals.append(path.suffix)
+                raise PermissionError(f"fixture {path.suffix} removal failure")
+            original_unlink(path, *args, **kwargs)
+
+        def close_then_report(control: object, *, retain: bool) -> None:
+            nonlocal control_closed
+            original_close(control, retain=retain)
+            control_closed = True
+            raise PermissionError("fixture control finalization failure")
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "fdopen",
+                side_effect=fail_fdopen,
+            ),
+            mock.patch.object(pathlib.Path, "unlink", new=fail_removal),
+            mock.patch.object(
+                workspace_runtime._PartialRecoveryControl,
+                "close",
+                new=close_then_report,
+            ),
+            self.assertRaises(OSError) as caught,
+        ):
+            workspace_runtime._build_exact_object_store_under_signal_mask(
+                workspace,
+                mock.Mock(),
+                ("a" * 40,),
+                workspace_runtime.time.monotonic() + 10.0,
+            )
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(removals, [".pack", ".idx", ".stderr"])
+        self.assertTrue(control_closed)
+        diagnostics = self.exception_diagnostics(primary)
+        for label in ("pack", "index", "error"):
+            self.assertTrue(
+                any(
+                    f"temporary {label} removal failed" in diagnostic
+                    for diagnostic in diagnostics
+                )
+            )
+        self.assertTrue(
+            any(
+                "partial recovery control finalization failed" in diagnostic
+                for diagnostic in diagnostics
+            )
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "partial recovery signal custody requires POSIX pthread masks",
+    )
+    def test_recover_signal_before_first_descriptor_close_waits_for_teardown(
+        self,
+    ) -> None:
+        workspace = self.root / "recover-final-close-signal"
+        workspace.mkdir(mode=0o700)
+        control_path, control_digest, _payload = self.retained_control(workspace)
+        original_attempt_closes = workspace_runtime._attempt_workspace_descriptor_closes
+        original_os_close = workspace_runtime.os.close
+        events: list[str] = []
+        handler_calls = 0
+        queued = False
+
+        def signal_then_close(descriptors: object) -> object:
+            nonlocal queued
+            items = tuple(descriptors)
+            if items and items[0][0].startswith(
+                "partial recovery workspace root descriptor"
+            ):
+                queued = True
+                signal.raise_signal(signal.SIGTERM)
+                events.append("signal-queued")
+            return original_attempt_closes(items)
+
+        def observe_close(descriptor: int) -> None:
+            original_os_close(descriptor)
+            if queued:
+                events.append("descriptor-closed")
+
+        def raise_forwarded_signal(signum: int, _frame: object) -> None:
+            nonlocal handler_calls
+            handler_calls += 1
+            raise workspace_runtime.ForwardedSignal(signal.Signals(signum))
+
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        signal.signal(signal.SIGTERM, raise_forwarded_signal)
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_process_start_identity",
+                    side_effect=ProcessLookupError,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_process_group_exists",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_attempt_workspace_descriptor_closes",
+                    side_effect=signal_then_close,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "close",
+                    side_effect=observe_close,
+                ),
+                self.assertRaises(workspace_runtime.ForwardedSignal) as caught,
+            ):
+                workspace_runtime.recover_partial_workspace(
+                    control_path,
+                    control_digest,
+                )
+            self.assertEqual(caught.exception.signum, signal.SIGTERM)
+            self.assertEqual(handler_calls, 0)
+            self.assertEqual(events, ["signal-queued", *("descriptor-closed",) * 3])
+            self.assertTrue(control_path.is_file())
+            self.assertEqual(tuple(workspace.iterdir()), ())
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def test_object_integrity_selector_close_failure_is_secondary_to_verification(
         self,

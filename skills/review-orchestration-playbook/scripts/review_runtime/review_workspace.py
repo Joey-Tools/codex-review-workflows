@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import ctypes
 import errno
 import fcntl
@@ -678,6 +679,9 @@ def _directory_snapshot_from_descriptor(
 
 def _open_relative_directory(root_descriptor: int, parts: Sequence[str]) -> int:
     descriptor = os.dup(root_descriptor)
+    child = -1
+    result = -1
+    operation_error: BaseException | None = None
     try:
         traversed: list[str] = []
         for part in parts:
@@ -687,21 +691,33 @@ def _open_relative_directory(root_descriptor: int, parts: Sequence[str]) -> int:
                 dir_fd=descriptor,
             )
             traversed.append(part)
-            try:
-                _validate_private_directory_metadata(
-                    os.fstat(child),
-                    "/".join(traversed),
-                )
-                _validate_no_extended_acl(child, "/".join(traversed))
-            except BaseException:
-                os.close(child)
-                raise
-            os.close(descriptor)
+            _validate_private_directory_metadata(
+                os.fstat(child),
+                "/".join(traversed),
+            )
+            _validate_no_extended_acl(child, "/".join(traversed))
+            previous = descriptor
+            descriptor = -1
+            os.close(previous)
             descriptor = child
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
+            child = -1
+        result = descriptor
+        descriptor = -1
+    except BaseException as error:
+        operation_error = error
+    close_failures = _attempt_workspace_descriptor_closes(
+        (
+            ("relative-directory child descriptor close failed", child),
+            ("relative-directory descriptor close failed", descriptor),
+        )
+    )
+    if operation_error is not None:
+        _attach_workspace_teardown_failures(operation_error, close_failures)
+        raise operation_error
+    close_error = _select_workspace_teardown_failure(close_failures)
+    if close_error is not None:
+        raise close_error
+    return result
 
 
 def _snapshot_control_file(
@@ -717,8 +733,11 @@ def _snapshot_control_file(
             _nofollow_flags(directory=False),
             dir_fd=parent_descriptor,
         )
-    except BaseException:
-        os.close(parent_descriptor)
+    except BaseException as error:
+        close_failures = _attempt_workspace_descriptor_closes(
+            (("control-file parent descriptor close failed", parent_descriptor),)
+        )
+        _attach_workspace_teardown_failures(error, close_failures)
         raise
     label = "/".join(relative)
 
@@ -792,6 +811,8 @@ def _snapshot_control_file(
             )
         return final_metadata, final_path_metadata
 
+    result: _FileControlSnapshot | None = None
+    operation_error: BaseException | None = None
     try:
         metadata = os.fstat(descriptor)
         validate_metadata(metadata)
@@ -844,7 +865,7 @@ def _snapshot_control_file(
             final_metadata = repeated_metadata
             digest = repeated_digest
             captured = repeated_payload
-        return _FileControlSnapshot(
+        result = _FileControlSnapshot(
             relative=relative,
             device=final_metadata.st_dev,
             inode=final_metadata.st_ino,
@@ -858,14 +879,32 @@ def _snapshot_control_file(
             payload=captured,
         )
     except OSError as error:
-        raise ReviewWorkspaceError(
+        operation_error = ReviewWorkspaceError(
             "workspace-control-file-unavailable",
             f"{label} could not be completely read and validated",
             status="inconclusive",
-        ) from error
-    finally:
-        os.close(descriptor)
-        os.close(parent_descriptor)
+        )
+        _bind_workspace_failure_cause(
+            operation_error,
+            error,
+            context="control-file read failure",
+        )
+    except BaseException as error:
+        operation_error = error
+    close_failures = _attempt_workspace_descriptor_closes(
+        (
+            ("control-file descriptor close failed", descriptor),
+            ("control-file parent descriptor close failed", parent_descriptor),
+        )
+    )
+    if operation_error is not None:
+        _attach_workspace_teardown_failures(operation_error, close_failures)
+        raise operation_error
+    close_error = _select_workspace_teardown_failure(close_failures)
+    if close_error is not None:
+        raise close_error
+    assert result is not None
+    return result
 
 
 def _snapshot_workspace_controls(
@@ -1120,6 +1159,64 @@ def _git_argv(root: pathlib.Path, arguments: Iterable[str]) -> tuple[str, ...]:
 
 @_requires_validated_git
 def _run_git_raw(
+    root: pathlib.Path,
+    arguments: Iterable[str],
+    *,
+    stdin: bytes | None = None,
+    output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
+    timeout_seconds: float = GIT_TIMEOUT_SECONDS,
+    absolute_deadline: float | None = None,
+    deadline_checker: Callable[[float], None] | None = None,
+    control_binding: _WorkspaceControlBinding | None = None,
+    extra_environment: Mapping[str, str] | None = None,
+    partial_recovery_control: _PartialRecoveryControl | None = None,
+    partial_recovery_operation: str | None = None,
+) -> tuple[int, bytes, bytes]:
+    owns_recovery_control = (
+        partial_recovery_control is None and control_binding is not None
+    )
+    if not owns_recovery_control:
+        return _run_git_raw_impl(
+            root,
+            arguments,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+            timeout_seconds=timeout_seconds,
+            absolute_deadline=absolute_deadline,
+            deadline_checker=deadline_checker,
+            control_binding=control_binding,
+            extra_environment=extra_environment,
+            partial_recovery_control=partial_recovery_control,
+            partial_recovery_operation=partial_recovery_operation,
+        )
+
+    signal_owner = _begin_forwarded_signal_mask()
+    primary_error: BaseException | None = None
+    try:
+        return _run_git_raw_impl(
+            root,
+            arguments,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+            timeout_seconds=timeout_seconds,
+            absolute_deadline=absolute_deadline,
+            deadline_checker=deadline_checker,
+            control_binding=control_binding,
+            extra_environment=extra_environment,
+            partial_recovery_control=partial_recovery_control,
+            partial_recovery_operation=partial_recovery_operation,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _finish_forwarded_signal_mask(
+            signal_owner,
+            primary_error=primary_error,
+        )
+
+
+def _run_git_raw_impl(
     root: pathlib.Path,
     arguments: Iterable[str],
     *,
@@ -3488,6 +3585,105 @@ def _partial_workspace_recovery_payload(
     return dict(recovery)
 
 
+def _inherit_workspace_failure_metadata(
+    primary: BaseException,
+    secondary: BaseException,
+) -> None:
+    """Preserve recovery and retention state from a secondary teardown fault."""
+
+    if process_quiescence_unproven(secondary):
+        mark_process_quiescence_unproven(primary)
+    if _partial_workspace_requires_retention(secondary):
+        _mark_partial_workspace_for_retention(primary)
+    recovery = _partial_workspace_recovery_payload(secondary)
+    if recovery is not None:
+        _record_partial_workspace_recovery(primary, recovery)
+        if isinstance(primary, ReviewWorkspaceError):
+            primary.details.update(recovery)
+
+
+def _attach_workspace_teardown_failures(
+    primary: BaseException,
+    failures: Sequence[tuple[str, BaseException]],
+) -> None:
+    """Attach every attempted teardown failure without replacing ``primary``."""
+
+    for context, secondary in failures:
+        _inherit_workspace_failure_metadata(primary, secondary)
+        _attach_workspace_failure_diagnostic(
+            primary,
+            secondary,
+            context=context,
+        )
+
+
+def _select_workspace_teardown_failure(
+    failures: Sequence[tuple[str, BaseException]],
+) -> BaseException | None:
+    """Select the first teardown fault and retain every later diagnostic."""
+
+    if not failures:
+        return None
+    first_context, selected = failures[0]
+    _attach_workspace_diagnostic(selected, first_context)
+    _attach_workspace_teardown_failures(selected, failures[1:])
+    return selected
+
+
+def _attempt_workspace_descriptor_closes(
+    descriptors: Sequence[tuple[str, int]],
+) -> list[tuple[str, BaseException]]:
+    """Best-effort close each distinct owned descriptor exactly once."""
+
+    failures: list[tuple[str, BaseException]] = []
+    attempted: set[int] = set()
+    for context, descriptor in descriptors:
+        if descriptor < 0 or descriptor in attempted:
+            continue
+        attempted.add(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            failures.append((context, error))
+    return failures
+
+
+class _WorkspaceStreamCloseOwner:
+    """Own streams after raw-FD handoff and close every one exactly once."""
+
+    def __init__(self) -> None:
+        self._streams: list[tuple[str, object]] = []
+
+    def __enter__(self) -> _WorkspaceStreamCloseOwner:
+        return self
+
+    def adopt(self, context: str, stream: object) -> object:
+        self._streams.append((context, stream))
+        return stream
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        primary_error: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        owned_streams = self._streams
+        self._streams = []
+        close_failures: list[tuple[str, BaseException]] = []
+        for context, stream in owned_streams:
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except BaseException as error:
+                close_failures.append((context, error))
+        if primary_error is not None:
+            _attach_workspace_teardown_failures(primary_error, close_failures)
+            return False
+        close_error = _select_workspace_teardown_failure(close_failures)
+        if close_error is not None:
+            raise close_error
+        return False
+
+
 def _process_start_identity(pid: int) -> str:
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         raise ReviewWorkspaceError(
@@ -3736,6 +3932,91 @@ class _PartialRecoveryControl:
     sha256: str
     active_process: _RecoveryProcessIdentity | None = None
     active_operation: str | None = None
+    _committed_recovery: dict[str, object] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def _build_committed_recovery_payload(self) -> dict[str, object]:
+        state = self.payload.get("state")
+        if (
+            state
+            not in {
+                "retained-quiescence-unproven",
+                "retained-owner-exit-required",
+            }
+            or not self.sha256
+        ):
+            raise ReviewWorkspaceError(
+                "partial-recovery-control-unsealed",
+                "partial recovery control has no durably sealed recovery state",
+            )
+        control = {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "schema_version": PARTIAL_RECOVERY_SCHEMA_VERSION,
+            "identity": {
+                "device": self.identity[0],
+                "inode": self.identity[1],
+                "uid": self.identity[2],
+            },
+        }
+        recovery = {
+            "command": "recover-partial-workspace",
+            "argv": [
+                "recover-partial-workspace",
+                "--control-file",
+                str(self.path),
+                "--control-sha256",
+                self.sha256,
+            ],
+            "argv_ready": True,
+            "requires_quiescence_proof": True,
+            "ordinary_cleanup_available": False,
+        }
+        if state == "retained-quiescence-unproven":
+            active_process = dict(self.payload["active_process"])
+            recovery["instruction"] = (
+                "Invoke this exact trusted-guard argv after the original prepare "
+                "process exits. The route verifies the owner start identity, exact "
+                "active PID/PGID/start identity and process-group absence, control "
+                "digest/identity, and parent/workspace identities before "
+                "descriptor-bound removal."
+            )
+        else:
+            active_process = None
+            recovery["instruction"] = (
+                "Invoke this exact trusted-guard argv after the original prepare "
+                "process exits. The route verifies owner-process absence plus the "
+                "exact control, parent, workspace, and formal marker identities "
+                "before descriptor-bound removal."
+            )
+        return {
+            "partial_recovery_control": control,
+            "retained_path": self.payload["worktree"],
+            "parent_identity": dict(self.payload["parent_identity"]),
+            "workspace_identity": dict(self.payload["workspace_identity"]),
+            "workspace_state": dict(self.payload["workspace_state"]),
+            "owner_process": dict(self.payload["owner_process"]),
+            "active_process": active_process,
+            "cleanup_unavailable_until_quiescent": True,
+            "recovery": recovery,
+        }
+
+    def committed_recovery_payload(self) -> dict[str, object] | None:
+        if self._committed_recovery is None:
+            return None
+        return copy.deepcopy(self._committed_recovery)
+
+    def _attach_committed_recovery(self, error: BaseException) -> None:
+        recovery = self.committed_recovery_payload()
+        if recovery is None:
+            return
+        _mark_partial_workspace_for_retention(error)
+        _record_partial_workspace_recovery(error, recovery)
+        if isinstance(error, ReviewWorkspaceError):
+            error.details.update(recovery)
 
     def _revalidate_bindings(self) -> None:
         """Bind the advertised paths to the held parent/root/control objects."""
@@ -3792,6 +4073,8 @@ class _PartialRecoveryControl:
         advertised_parent_descriptor = -1
         advertised_root_descriptor = -1
         advertised_control_descriptor = -1
+        final_parent_descriptor = -1
+        operation_error: BaseException | None = None
         try:
             root_path_metadata = advertised_root.stat(follow_symlinks=False)
             advertised_parent_descriptor = os.open(
@@ -3843,39 +4126,65 @@ class _PartialRecoveryControl:
                 advertised_root.parent,
                 _nofollow_flags(directory=True),
             )
-            try:
-                if not os.path.samestat(
-                    parent_metadata,
-                    os.fstat(final_parent_descriptor),
-                ):
-                    raise ReviewWorkspaceError(
-                        "partial-recovery-binding-drift",
-                        "partial recovery parent alias changed during revalidation",
-                    )
-            finally:
-                os.close(final_parent_descriptor)
+            if not os.path.samestat(
+                parent_metadata,
+                os.fstat(final_parent_descriptor),
+            ):
+                raise ReviewWorkspaceError(
+                    "partial-recovery-binding-drift",
+                    "partial recovery parent alias changed during revalidation",
+                )
         except OSError as error:
-            raise ReviewWorkspaceError(
+            operation_error = ReviewWorkspaceError(
                 "partial-recovery-binding-unavailable",
                 "partial recovery advertised paths cannot be revalidated",
                 status="inconclusive",
-            ) from error
-        finally:
-            for opened in (
-                advertised_control_descriptor,
-                advertised_root_descriptor,
-                advertised_parent_descriptor,
-            ):
-                if opened >= 0:
-                    os.close(opened)
+            )
+            _bind_workspace_failure_cause(
+                operation_error,
+                error,
+                context="partial recovery binding revalidation failed",
+            )
+        except BaseException as error:
+            operation_error = error
+        close_failures = _attempt_workspace_descriptor_closes(
+            (
+                (
+                    "partial recovery final parent descriptor close failed",
+                    final_parent_descriptor,
+                ),
+                (
+                    "partial recovery advertised control descriptor close failed",
+                    advertised_control_descriptor,
+                ),
+                (
+                    "partial recovery advertised root descriptor close failed",
+                    advertised_root_descriptor,
+                ),
+                (
+                    "partial recovery advertised parent descriptor close failed",
+                    advertised_parent_descriptor,
+                ),
+            )
+        )
+        if operation_error is not None:
+            _attach_workspace_teardown_failures(operation_error, close_failures)
+            raise operation_error
+        close_error = _select_workspace_teardown_failure(close_failures)
+        if close_error is not None:
+            raise close_error
 
     @classmethod
     def create(cls, root: pathlib.Path) -> _PartialRecoveryControl:
+        leaf = f"{PARTIAL_RECOVERY_PREFIX}{secrets.token_hex(16)}.json"
         parent_descriptor = os.open(root.parent, _nofollow_flags(directory=True))
         root_descriptor = -1
         descriptor = -1
         locked = False
-        leaf = f"{PARTIAL_RECOVERY_PREFIX}{secrets.token_hex(16)}.json"
+        control_created = False
+        control_identity: tuple[int, int, int] | None = None
+        digest: str | None = None
+        publication_committed = False
         try:
             fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
             locked = True
@@ -3943,8 +4252,10 @@ class _PartialRecoveryControl:
                 0o600,
                 dir_fd=parent_descriptor,
             )
+            control_created = True
             metadata = os.fstat(descriptor)
             identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid)
+            control_identity = identity
             payload: dict[str, object] = {
                 "schema_version": PARTIAL_RECOVERY_SCHEMA_VERSION,
                 "control_id": secrets.token_hex(32),
@@ -3992,58 +4303,321 @@ class _PartialRecoveryControl:
                 payload,
             )
             os.fsync(parent_descriptor)
+            publication_committed = True
             result.sha256 = digest
             result._revalidate_bindings()
             fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
             locked = False
             return result
-        except BaseException:
-            if descriptor >= 0:
-                os.close(descriptor)
-                descriptor = -1
-                with contextlib.suppress(OSError):
-                    os.unlink(leaf, dir_fd=parent_descriptor)
-            if root_descriptor >= 0:
-                os.close(root_descriptor)
-                root_descriptor = -1
-            raise
-        finally:
+        except BaseException as primary_error:
+            cleanup_failures: list[tuple[str, BaseException]] = []
+            control_to_close = descriptor
+            root_to_close = root_descriptor
+            parent_to_close = parent_descriptor
+            descriptor = -1
+            root_descriptor = -1
+            parent_descriptor = -1
+            control_retained = False
+            locator_status = "removed"
+            advertised_parent_matches = False
+            if control_created:
+                absence_durable = True
+                unlink_safe = False
+                try:
+                    held_metadata = os.fstat(control_to_close)
+                    path_metadata = os.stat(
+                        leaf,
+                        dir_fd=parent_to_close,
+                        follow_symlinks=False,
+                    )
+                    unlink_safe = bool(
+                        control_identity is not None
+                        and (
+                            held_metadata.st_dev,
+                            held_metadata.st_ino,
+                            held_metadata.st_uid,
+                        )
+                        == control_identity
+                        and os.path.samestat(held_metadata, path_metadata)
+                    )
+                    if not unlink_safe:
+                        raise ReviewWorkspaceError(
+                            "partial-recovery-control-drift",
+                            "partial recovery create cleanup control identity changed",
+                        )
+                except BaseException as identity_error:
+                    cleanup_failures.append(
+                        (
+                            "partial recovery create control unlink identity check "
+                            "failed",
+                            identity_error,
+                        )
+                    )
+                    locator_status = "unverified"
+                if unlink_safe:
+                    try:
+                        os.unlink(leaf, dir_fd=parent_to_close)
+                    except FileNotFoundError:
+                        pass
+                    except BaseException as unlink_error:
+                        cleanup_failures.append(
+                            (
+                                "partial recovery create control unlink failed",
+                                unlink_error,
+                            )
+                        )
+                try:
+                    os.fsync(parent_to_close)
+                except BaseException as sync_error:
+                    absence_durable = False
+                    cleanup_failures.append(
+                        (
+                            "partial recovery create parent sync after control cleanup "
+                            "failed",
+                            sync_error,
+                        )
+                    )
+                try:
+                    residual_metadata = os.stat(
+                        leaf,
+                        dir_fd=parent_to_close,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    control_retained = not absence_durable
+                    if control_retained:
+                        locator_status = "absence-undurable"
+                except BaseException as locator_error:
+                    control_retained = True
+                    locator_status = "unverified"
+                    cleanup_failures.append(
+                        (
+                            "partial recovery create retained control locator "
+                            "could not be verified",
+                            locator_error,
+                        )
+                    )
+                else:
+                    control_retained = True
+                    locator_status = (
+                        "retained"
+                        if control_identity is not None
+                        and (
+                            residual_metadata.st_dev,
+                            residual_metadata.st_ino,
+                            residual_metadata.st_uid,
+                        )
+                        == control_identity
+                        else "identity-mismatch"
+                    )
+                if control_retained:
+                    try:
+                        held_parent_metadata = os.fstat(parent_to_close)
+                        advertised_parent_metadata = os.stat(
+                            root.parent,
+                            follow_symlinks=False,
+                        )
+                        advertised_parent_matches = bool(
+                            (
+                                held_parent_metadata.st_dev,
+                                held_parent_metadata.st_ino,
+                                held_parent_metadata.st_uid,
+                            )
+                            == parent_identity
+                            and os.path.samestat(
+                                held_parent_metadata,
+                                advertised_parent_metadata,
+                            )
+                        )
+                        if not advertised_parent_matches:
+                            raise ReviewWorkspaceError(
+                                "partial-recovery-parent-alias-drift",
+                                "partial recovery create retained parent path no "
+                                "longer names the descriptor-bound directory",
+                            )
+                    except BaseException as parent_alias_error:
+                        cleanup_failures.append(
+                            (
+                                "partial recovery create retained parent path "
+                                "could not be verified",
+                                parent_alias_error,
+                            )
+                        )
+            cleanup_failures.extend(
+                _attempt_workspace_descriptor_closes(
+                    (
+                        (
+                            "partial recovery create control descriptor close failed",
+                            control_to_close,
+                        ),
+                    )
+                )
+            )
+            cleanup_failures.extend(
+                _attempt_workspace_descriptor_closes(
+                    (
+                        (
+                            "partial recovery create workspace root descriptor "
+                            "close failed",
+                            root_to_close,
+                        ),
+                    )
+                )
+            )
             if locked:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
-            if descriptor < 0:
-                if root_descriptor >= 0:
-                    os.close(root_descriptor)
-                os.close(parent_descriptor)
+                try:
+                    fcntl.flock(parent_to_close, fcntl.LOCK_UN)
+                except BaseException as unlock_error:
+                    cleanup_failures.append(
+                        (
+                            "partial recovery create parent unlock failed",
+                            unlock_error,
+                        )
+                    )
+                locked = False
+            cleanup_failures.extend(
+                _attempt_workspace_descriptor_closes(
+                    (
+                        (
+                            "partial recovery create workspace parent descriptor "
+                            "close failed",
+                            parent_to_close,
+                        ),
+                    )
+                )
+            )
+            if control_retained:
+                locator = {
+                    "status": "cleanup-incomplete",
+                    "control_file": (
+                        str(root.parent / leaf) if advertised_parent_matches else None
+                    ),
+                    "control_sha256": digest if publication_committed else None,
+                    "publication_status": (
+                        "durable-armed" if publication_committed else "unverified"
+                    ),
+                    "locator_status": (
+                        locator_status
+                        if advertised_parent_matches
+                        else "parent-path-unverified"
+                    ),
+                    "bound_control_status": locator_status,
+                    "state": "armed",
+                    "ordinary_cleanup_available": False,
+                    "parent_identity": {
+                        "device": parent_identity[0],
+                        "inode": parent_identity[1],
+                        "uid": parent_identity[2],
+                    },
+                    "workspace_identity": {
+                        "device": workspace_identity[0],
+                        "inode": workspace_identity[1],
+                        "uid": workspace_identity[2],
+                    },
+                    "recovery": {
+                        "command": None,
+                        "argv": None,
+                        "argv_ready": False,
+                        "unavailable_reason": "armed-control-cleanup-incomplete",
+                    },
+                }
+                if not advertised_parent_matches:
+                    locator["expected_locator"] = {
+                        "parent": str(root.parent),
+                        "leaf": leaf,
+                        "parent_identity": dict(locator["parent_identity"]),
+                        "control_identity": (
+                            None
+                            if control_identity is None
+                            else {
+                                "device": control_identity[0],
+                                "inode": control_identity[1],
+                                "uid": control_identity[2],
+                            }
+                        ),
+                    }
+                if control_identity is not None:
+                    locator["identity"] = {
+                        "device": control_identity[0],
+                        "inode": control_identity[1],
+                        "uid": control_identity[2],
+                    }
+                setattr(
+                    primary_error,
+                    "_review_workspace_partial_control_cleanup",
+                    locator,
+                )
+                _mark_partial_workspace_for_retention(primary_error)
+                if isinstance(primary_error, ReviewWorkspaceError):
+                    primary_error.details["partial_recovery_control_cleanup"] = locator
+                if advertised_parent_matches:
+                    locator_diagnostic = (
+                        "partial recovery armed control cleanup is incomplete; "
+                        f"retained locator: {root.parent / leaf}"
+                    )
+                else:
+                    locator_diagnostic = (
+                        "partial recovery armed control cleanup is incomplete; "
+                        "the advertised parent path is unverified and only the "
+                        "expected identity locator is authoritative"
+                    )
+                _attach_workspace_diagnostic(primary_error, locator_diagnostic)
+            _attach_workspace_teardown_failures(primary_error, cleanup_failures)
+            raise
 
     def _publish(self) -> None:
         signal_owner = _begin_forwarded_signal_mask()
         primary_error: BaseException | None = None
         locked = False
         try:
-            fcntl.flock(self.parent_descriptor, fcntl.LOCK_EX)
-            locked = True
-            self._revalidate_bindings()
-            self.sha256 = _write_partial_recovery_record(
-                self.descriptor,
-                self.parent_descriptor,
-                self.path.name,
-                self.identity,
-                self.payload,
-            )
-            os.fsync(self.parent_descriptor)
-            self._revalidate_bindings()
-        except BaseException as error:
-            primary_error = error
-            raise
-        finally:
+            try:
+                fcntl.flock(self.parent_descriptor, fcntl.LOCK_EX)
+                locked = True
+                self._revalidate_bindings()
+                digest = _write_partial_recovery_record(
+                    self.descriptor,
+                    self.parent_descriptor,
+                    self.path.name,
+                    self.identity,
+                    self.payload,
+                )
+                os.fsync(self.parent_descriptor)
+                self.sha256 = digest
+                if self.payload.get("state") in {
+                    "retained-quiescence-unproven",
+                    "retained-owner-exit-required",
+                }:
+                    self._committed_recovery = self._build_committed_recovery_payload()
+                else:
+                    self._committed_recovery = None
+                self._revalidate_bindings()
+            except BaseException as error:
+                primary_error = error
+            unlock_failures: list[tuple[str, BaseException]] = []
             if locked:
-                with contextlib.suppress(OSError):
+                try:
                     fcntl.flock(self.parent_descriptor, fcntl.LOCK_UN)
+                except BaseException as unlock_error:
+                    unlock_failures.append(
+                        ("partial recovery publication unlock failed", unlock_error)
+                    )
+                locked = False
+            if primary_error is not None:
+                _attach_workspace_teardown_failures(
+                    primary_error,
+                    unlock_failures,
+                )
+            else:
+                primary_error = _select_workspace_teardown_failure(unlock_failures)
             _finish_forwarded_signal_mask(
                 signal_owner,
                 primary_error=primary_error,
             )
+            if primary_error is not None:
+                raise primary_error
+        except BaseException as error:
+            self._attach_committed_recovery(error)
+            raise
 
     def bind_process(self, operation: str, binding: object) -> None:
         if not isinstance(binding, _RecoveryProcessIdentity):
@@ -4106,58 +4680,26 @@ class _PartialRecoveryControl:
                 "unsafe workspace process identity was not bound for recovery",
                 status="inconclusive",
             )
-        if self.payload.get("state") == "process-bound":
-            self.payload["active_process"] = {
-                **self.active_process.payload(),
-                "operation": self.active_operation,
-                "process_state": "quiescence-unproven",
-            }
-            self.payload["state"] = "retained-quiescence-unproven"
-            self._publish()
-        self._revalidate_bindings()
-        control = {
-            "path": str(self.path),
-            "sha256": self.sha256,
-            "schema_version": PARTIAL_RECOVERY_SCHEMA_VERSION,
-            "identity": {
-                "device": self.identity[0],
-                "inode": self.identity[1],
-                "uid": self.identity[2],
-            },
-        }
-        owner_process = dict(self.payload["owner_process"])
-        active_process = dict(self.payload["active_process"])
-        recovery = {
-            "command": "recover-partial-workspace",
-            "argv": [
-                "recover-partial-workspace",
-                "--control-file",
-                str(self.path),
-                "--control-sha256",
-                self.sha256,
-            ],
-            "argv_ready": True,
-            "requires_quiescence_proof": True,
-            "ordinary_cleanup_available": False,
-            "instruction": (
-                "Invoke this exact trusted-guard argv after the original prepare "
-                "process exits. The route verifies the owner start identity, exact "
-                "active PID/PGID/start identity and process-group absence, control "
-                "digest/identity, and parent/workspace identities before "
-                "descriptor-bound removal."
-            ),
-        }
-        return {
-            "partial_recovery_control": control,
-            "retained_path": self.payload["worktree"],
-            "parent_identity": dict(self.payload["parent_identity"]),
-            "workspace_identity": dict(self.payload["workspace_identity"]),
-            "workspace_state": dict(self.payload["workspace_state"]),
-            "owner_process": owner_process,
-            "active_process": active_process,
-            "cleanup_unavailable_until_quiescent": True,
-            "recovery": recovery,
-        }
+        try:
+            if self.payload.get("state") == "process-bound":
+                self.payload["active_process"] = {
+                    **self.active_process.payload(),
+                    "operation": self.active_operation,
+                    "process_state": "quiescence-unproven",
+                }
+                self.payload["state"] = "retained-quiescence-unproven"
+                self._publish()
+            self._revalidate_bindings()
+            recovery = self.committed_recovery_payload()
+            if recovery is None:
+                raise ReviewWorkspaceError(
+                    "partial-recovery-control-unsealed",
+                    "partial recovery process control was not durably sealed",
+                )
+            return recovery
+        except BaseException as error:
+            self._attach_committed_recovery(error)
+            raise
 
     def owner_exit_recovery_payload(self) -> dict[str, object]:
         """Seal a workspace for recovery after this owner process exits."""
@@ -4168,47 +4710,20 @@ class _PartialRecoveryControl:
                 "owner-exit recovery requires an armed control with no child process",
                 status="inconclusive",
             )
-        self.payload["state"] = "retained-owner-exit-required"
-        self._publish()
-        self._revalidate_bindings()
-        return {
-            "partial_recovery_control": {
-                "path": str(self.path),
-                "sha256": self.sha256,
-                "schema_version": PARTIAL_RECOVERY_SCHEMA_VERSION,
-                "identity": {
-                    "device": self.identity[0],
-                    "inode": self.identity[1],
-                    "uid": self.identity[2],
-                },
-            },
-            "retained_path": self.payload["worktree"],
-            "parent_identity": dict(self.payload["parent_identity"]),
-            "workspace_identity": dict(self.payload["workspace_identity"]),
-            "workspace_state": dict(self.payload["workspace_state"]),
-            "owner_process": dict(self.payload["owner_process"]),
-            "active_process": None,
-            "cleanup_unavailable_until_quiescent": True,
-            "recovery": {
-                "command": "recover-partial-workspace",
-                "argv": [
-                    "recover-partial-workspace",
-                    "--control-file",
-                    str(self.path),
-                    "--control-sha256",
-                    self.sha256,
-                ],
-                "argv_ready": True,
-                "requires_quiescence_proof": True,
-                "ordinary_cleanup_available": False,
-                "instruction": (
-                    "Invoke this exact trusted-guard argv after the original "
-                    "prepare process exits. The route verifies owner-process "
-                    "absence plus the exact control, parent, workspace, and formal "
-                    "marker identities before descriptor-bound removal."
-                ),
-            },
-        }
+        try:
+            self.payload["state"] = "retained-owner-exit-required"
+            self._publish()
+            self._revalidate_bindings()
+            recovery = self.committed_recovery_payload()
+            if recovery is None:
+                raise ReviewWorkspaceError(
+                    "partial-recovery-control-unsealed",
+                    "owner-exit recovery control was not durably sealed",
+                )
+            return recovery
+        except BaseException as error:
+            self._attach_committed_recovery(error)
+            raise
 
     def unavailable_recovery_payload(
         self,
@@ -4336,11 +4851,75 @@ def retain_workspace_for_owner_exit_recovery(
     root: pathlib.Path,
     expected_parent_identity: tuple[int, int, int],
     expected_workspace_identity: tuple[int, int, int],
+    *,
+    primary_error: BaseException | None = None,
+    signal_owner: ForwardedSignalMaskOwner | None = None,
 ) -> dict[str, object]:
     """Persist an executable parent-private recovery capability for ``root``."""
 
+    owns_signal_owner = signal_owner is None
+    if signal_owner is None:
+        signal_owner = _begin_forwarded_signal_mask()
+    elif not signal_owner.active:
+        raise ReviewWorkspaceError(
+            "partial-recovery-signal-custody-invalid",
+            "owner-exit recovery requires an active forwarded-signal mask owner",
+        )
+    sealed_recovery: list[dict[str, object]] = []
+
+    def attach_sealed_recovery(error: BaseException | None) -> None:
+        if error is None or not sealed_recovery:
+            return
+        recovery = sealed_recovery[0]
+        _mark_partial_workspace_for_retention(error)
+        _record_partial_workspace_recovery(error, recovery)
+        if isinstance(error, ReviewWorkspaceError):
+            error.details.update(recovery)
+
+    try:
+        result = _retain_workspace_for_owner_exit_recovery_under_signal_mask(
+            root,
+            expected_parent_identity,
+            expected_workspace_identity,
+            sealed_recovery=sealed_recovery,
+        )
+    except BaseException as error:
+        attach_sealed_recovery(error)
+        attach_sealed_recovery(primary_error)
+        if owns_signal_owner:
+            try:
+                _finish_forwarded_signal_mask(
+                    signal_owner,
+                    primary_error=error,
+                )
+            except BaseException as finish_error:
+                attach_sealed_recovery(finish_error)
+                raise
+        raise
+    attach_sealed_recovery(primary_error)
+    if owns_signal_owner:
+        try:
+            _finish_forwarded_signal_mask(
+                signal_owner,
+                primary_error=primary_error,
+            )
+        except BaseException as finish_error:
+            attach_sealed_recovery(finish_error)
+            raise
+    return result
+
+
+def _retain_workspace_for_owner_exit_recovery_under_signal_mask(
+    root: pathlib.Path,
+    expected_parent_identity: tuple[int, int, int],
+    expected_workspace_identity: tuple[int, int, int],
+    *,
+    sealed_recovery: list[dict[str, object]],
+) -> dict[str, object]:
     control = _PartialRecoveryControl.create(root)
     retain = False
+    result: dict[str, object] | None = None
+    operation_error: BaseException | None = None
     try:
         observed_parent = _partial_control_identity(
             control.payload,
@@ -4358,11 +4937,33 @@ def retain_workspace_for_owner_exit_recovery(
                 "partial-recovery-workspace-identity-mismatch",
                 "retained workspace differs from the publication rollback binding",
             )
-        payload = control.owner_exit_recovery_payload()
+        result = control.owner_exit_recovery_payload()
+    except BaseException as error:
+        operation_error = error
+    committed_recovery = control.committed_recovery_payload()
+    if committed_recovery is not None:
         retain = True
-        return payload
-    finally:
+        sealed_recovery.append(committed_recovery)
+        result = committed_recovery
+        if operation_error is not None:
+            control._attach_committed_recovery(operation_error)
+    try:
         control.close(retain=retain)
+    except BaseException as close_error:
+        control._attach_committed_recovery(close_error)
+        if operation_error is not None:
+            _inherit_workspace_failure_metadata(operation_error, close_error)
+            _attach_workspace_failure_diagnostic(
+                operation_error,
+                close_error,
+                context="owner-exit recovery control finalization failed",
+            )
+        else:
+            operation_error = close_error
+    if operation_error is not None:
+        raise operation_error
+    assert result is not None
+    return result
 
 
 def _retain_unquiesced_workspace(
@@ -4383,28 +4984,33 @@ def _retain_unquiesced_workspace(
             f"{diagnostic_context} recovery publication failed: "
             f"{type(publication_error).__name__}",
         )
-        try:
-            recovery = control.unavailable_recovery_payload(publication_error)
-        except BaseException as fallback_error:
-            _attach_workspace_diagnostic(
-                error,
-                f"{diagnostic_context} recovery fallback failed: "
-                f"{type(fallback_error).__name__}",
-            )
-            recovery = {
-                "retained_path": str(
-                    control.payload.get("worktree", control.path.parent)
-                ),
-                "cleanup_unavailable_until_quiescent": True,
-                "recovery": {
-                    "command": None,
-                    "argv": None,
-                    "argv_ready": False,
-                    "requires_quiescence_proof": True,
-                    "ordinary_cleanup_available": False,
-                    "unavailable_reason": type(publication_error).__name__,
-                },
-            }
+        recovery = (
+            _partial_workspace_recovery_payload(publication_error)
+            or control.committed_recovery_payload()
+        )
+        if recovery is None:
+            try:
+                recovery = control.unavailable_recovery_payload(publication_error)
+            except BaseException as fallback_error:
+                _attach_workspace_diagnostic(
+                    error,
+                    f"{diagnostic_context} recovery fallback failed: "
+                    f"{type(fallback_error).__name__}",
+                )
+                recovery = {
+                    "retained_path": str(
+                        control.payload.get("worktree", control.path.parent)
+                    ),
+                    "cleanup_unavailable_until_quiescent": True,
+                    "recovery": {
+                        "command": None,
+                        "argv": None,
+                        "argv_ready": False,
+                        "requires_quiescence_proof": True,
+                        "ordinary_cleanup_available": False,
+                        "unavailable_reason": type(publication_error).__name__,
+                    },
+                }
     _record_partial_workspace_recovery(error, recovery)
     return recovery
 
@@ -4426,6 +5032,31 @@ def _build_exact_object_store(
 ) -> str:
     """Normalize the exact reviewed closure into one self-contained pack."""
 
+    signal_owner = _begin_forwarded_signal_mask()
+    primary_error: BaseException | None = None
+    try:
+        return _build_exact_object_store_under_signal_mask(
+            root,
+            source,
+            object_ids,
+            deadline,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _finish_forwarded_signal_mask(
+            signal_owner,
+            primary_error=primary_error,
+        )
+
+
+def _build_exact_object_store_under_signal_mask(
+    root: pathlib.Path,
+    source: _SourceRepository,
+    object_ids: Sequence[str],
+    deadline: float,
+) -> str:
     _check_object_store_deadline(deadline)
     pack_directory = root / ".git/objects/pack"
     pack_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -4479,11 +5110,16 @@ def _build_exact_object_store(
             | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
-        with (
-            os.fdopen(pack_descriptor, "w+b", closefd=True) as pack_stream,
-            os.fdopen(error_descriptor, "w+b", closefd=True) as error_stream,
-        ):
+        with _WorkspaceStreamCloseOwner() as streams:
+            pack_stream = streams.adopt(
+                "exact-pack pack stream close failed",
+                os.fdopen(pack_descriptor, "w+b", closefd=True),
+            )
             pack_descriptor = -1
+            error_stream = streams.adopt(
+                "exact-pack error stream close failed",
+                os.fdopen(error_descriptor, "w+b", closefd=True),
+            )
             error_descriptor = -1
             environment = _git_environment()
             environment.update(
@@ -4705,28 +5341,44 @@ def _build_exact_object_store(
         operation_error = error
         raise
     finally:
-        if pack_descriptor >= 0:
-            os.close(pack_descriptor)
-        if error_descriptor >= 0:
-            os.close(error_descriptor)
+        teardown_failures = _attempt_workspace_descriptor_closes(
+            (
+                ("exact-pack temporary pack descriptor close failed", pack_descriptor),
+                (
+                    "exact-pack temporary error descriptor close failed",
+                    error_descriptor,
+                ),
+            )
+        )
         if operation_error is not None and _partial_workspace_requires_retention(
             operation_error
         ):
             retain_temporary_output = True
         if not retain_temporary_output:
-            temporary_pack.unlink(missing_ok=True)
-            temporary_index.unlink(missing_ok=True)
-            temporary_error.unlink(missing_ok=True)
+            for context, temporary in (
+                ("exact-pack temporary pack removal failed", temporary_pack),
+                ("exact-pack temporary index removal failed", temporary_index),
+                ("exact-pack temporary error removal failed", temporary_error),
+            ):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except BaseException as unlink_error:
+                    teardown_failures.append((context, unlink_error))
         try:
             partial_control.close(retain=retain_temporary_output)
         except BaseException as control_error:
-            if operation_error is None:
-                raise
-            _attach_workspace_diagnostic(
-                operation_error,
-                "partial recovery control finalization failed: "
-                f"{type(control_error).__name__}",
+            teardown_failures.append(
+                ("partial recovery control finalization failed", control_error)
             )
+        if operation_error is not None:
+            _attach_workspace_teardown_failures(
+                operation_error,
+                teardown_failures,
+            )
+        else:
+            teardown_error = _select_workspace_teardown_failure(teardown_failures)
+            if teardown_error is not None:
+                raise teardown_error
 
 
 def _initialize_git_directory(
@@ -6752,9 +7404,32 @@ def _verify_range_object_contents_under_signal_mask(
         for index in range(len(stderr)):
             stderr[index] = 0
 
-        selected_teardown_error = (
-            process_leak or settlement_error or primary_error or release_error
+        selected_teardown_error = next(
+            (
+                error
+                for error in (
+                    process_leak,
+                    settlement_error,
+                    primary_error,
+                    release_error,
+                )
+                if error is not None
+            ),
+            None,
         )
+        labeled_teardown_failures = [
+            (context, error)
+            for context, error in (
+                ("object verifier process leak also occurred", process_leak),
+                (
+                    "object verifier lease settlement also failed",
+                    settlement_error,
+                ),
+                ("object verifier primary operation also failed", primary_error),
+                ("partial recovery process release also failed", release_error),
+            )
+            if error is not None
+        ]
         revalidation_error: BaseException | None = None
         revalidation_original_cause: BaseException | None = None
         finalization_error: BaseException | None = None
@@ -6769,9 +7444,12 @@ def _verify_range_object_contents_under_signal_mask(
                     ),
                 )
             if process_leak is not None:
+                process_leak_predecessor = (
+                    settlement_error if settlement_error is not None else primary_error
+                )
                 _bind_workspace_failure_cause(
                     process_leak,
-                    settlement_error or primary_error,
+                    process_leak_predecessor,
                     context="object verifier process leak had another teardown source",
                 )
             if (
@@ -6808,19 +7486,10 @@ def _verify_range_object_contents_under_signal_mask(
                     else:
                         mark_process_quiescence_unproven(revalidation_error)
                         _mark_partial_workspace_for_retention(revalidation_error)
-                if revalidation_original_cause is not None:
-                    for teardown_error in (
-                        process_leak,
-                        settlement_error,
-                        primary_error,
-                        release_error,
-                    ):
-                        if teardown_error is not None:
-                            _attach_workspace_failure_diagnostic(
-                                revalidation_error,
-                                teardown_error,
-                                context="object verifier teardown also failed",
-                            )
+                _attach_workspace_teardown_failures(
+                    revalidation_error,
+                    labeled_teardown_failures,
+                )
         except BaseException as error:
             finalization_error = error
             raise
@@ -6829,8 +7498,17 @@ def _verify_range_object_contents_under_signal_mask(
             try:
                 partial_control.close(retain=retain_control)
             except BaseException as control_error:
-                selected_error = (
-                    revalidation_error or finalization_error or selected_teardown_error
+                selected_error = next(
+                    (
+                        error
+                        for error in (
+                            revalidation_error,
+                            finalization_error,
+                            selected_teardown_error,
+                        )
+                        if error is not None
+                    ),
+                    None,
                 )
                 if selected_error is None:
                     raise
@@ -9113,6 +9791,8 @@ def recover_partial_workspace(
     control_descriptor = -1
     root_descriptor = -1
     parent_locked = False
+    cleaned: CleanedWorkspace | None = None
+    operation_error: BaseException | None = None
 
     def control_metadata_signature(metadata: os.stat_result) -> tuple[int, ...]:
         return (
@@ -9633,25 +10313,57 @@ def recover_partial_workspace(
             tombstone_status="retained",
             _handoff_signal_mask=signal_owner if defer_signal_handoff else None,
         )
-        if defer_signal_handoff:
-            return cleaned
-        _finish_forwarded_signal_mask(signal_owner, primary_error=None)
-        return cleaned
     except BaseException as error:
-        _finish_forwarded_signal_mask(signal_owner, primary_error=error)
-        raise
-    finally:
-        if parent_locked:
-            with contextlib.suppress(OSError):
-                fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
-        for descriptor in (
-            root_descriptor,
-            control_descriptor,
-            parent_descriptor,
-        ):
-            if descriptor >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
+        operation_error = error
+    teardown_failures: list[tuple[str, BaseException]] = []
+    if parent_locked:
+        try:
+            fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+        except BaseException as unlock_error:
+            teardown_failures.append(
+                ("partial recovery parent unlock failed", unlock_error)
+            )
+        parent_locked = False
+    root_to_close = root_descriptor
+    control_to_close = control_descriptor
+    parent_to_close = parent_descriptor
+    root_descriptor = -1
+    control_descriptor = -1
+    parent_descriptor = -1
+    teardown_failures.extend(
+        _attempt_workspace_descriptor_closes(
+            (
+                (
+                    "partial recovery workspace root descriptor close failed",
+                    root_to_close,
+                ),
+                (
+                    "partial recovery control descriptor close failed",
+                    control_to_close,
+                ),
+                (
+                    "partial recovery parent descriptor close failed",
+                    parent_to_close,
+                ),
+            )
+        )
+    )
+    selected_error = operation_error
+    if selected_error is not None:
+        _attach_workspace_teardown_failures(selected_error, teardown_failures)
+    else:
+        selected_error = _select_workspace_teardown_failure(teardown_failures)
+    if defer_signal_handoff and selected_error is None:
+        assert cleaned is not None
+        return cleaned
+    _finish_forwarded_signal_mask(
+        signal_owner,
+        primary_error=selected_error,
+    )
+    if selected_error is not None:
+        raise selected_error
+    assert cleaned is not None
+    return cleaned
 
 
 def _rename_exclusive(
@@ -10193,16 +10905,21 @@ def prepare_workspace(
             retained_path = recovery_locator.get("retained_path")
             recovery_payload: dict[str, object] = {}
             recovery_error: BaseException | None = None
+            recovery_owner: ForwardedSignalMaskOwner | None = None
             if isinstance(retained_path, str):
+                recovery_owner = _begin_forwarded_signal_mask()
                 try:
                     recovery_payload = retain_workspace_for_owner_exit_recovery(
                         pathlib.Path(retained_path),
                         parent_identity,
                         identity,
+                        primary_error=primary_error,
+                        signal_owner=recovery_owner,
                     )
                 except BaseException as error:
                     recovery_error = error
-            raise ReviewWorkspaceError(
+                    recovery_payload = _partial_workspace_recovery_payload(error) or {}
+            failure = ReviewWorkspaceError(
                 "workspace-publication-rollback-incomplete",
                 "workspace preparation failed and rollback could not be proved",
                 details={
@@ -10230,7 +10947,16 @@ def prepare_workspace(
                         else {}
                     ),
                 },
-            ) from primary_error
+            )
+            if recovery_payload:
+                _mark_partial_workspace_for_retention(failure)
+                _record_partial_workspace_recovery(failure, recovery_payload)
+            if recovery_owner is not None:
+                _finish_forwarded_signal_mask(
+                    recovery_owner,
+                    primary_error=failure,
+                )
+            raise failure from primary_error
         raise
 
 

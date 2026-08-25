@@ -7666,10 +7666,10 @@ def _read_control_prompt(
 
 @dataclass
 class _StructuredSignalState:
-    committed: bool = False
+    committed_returncode: int | None = None
 
-    def commit(self) -> None:
-        self.committed = True
+    def commit(self, returncode: int) -> None:
+        self.committed_returncode = returncode
 
 
 @contextlib.contextmanager
@@ -7695,17 +7695,22 @@ def _structured_forwarded_signals() -> Iterable[_StructuredSignalState]:
             raise ForwardedSignal(pending_signal)
         yield state
     finally:
-        cleanup_mask = block_forwarded_signals()
-        pending_cleanup_signal: signal.Signals | None = None
-        if state.committed:
-            if cleanup_mask is not None:
-                consume_pending_forwarded_signal()
-            restore_signal_mask(
-                cleanup_mask if initial_mask_restored else previous_mask
-            )
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+        committed_returncode = state.committed_returncode
+        if committed_returncode is not None:
+            try:
+                cleanup_mask = block_forwarded_signals()
+                if cleanup_mask is not None:
+                    consume_pending_forwarded_signal()
+                restore_signal_mask(
+                    cleanup_mask if initial_mask_restored else previous_mask
+                )
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
+            except BaseException:
+                _terminal_process_exit(committed_returncode)
         else:
+            cleanup_mask = block_forwarded_signals()
+            pending_cleanup_signal: signal.Signals | None = None
             try:
                 for forwarded, previous in previous_handlers.items():
                     signal.signal(forwarded, previous)
@@ -7715,8 +7720,8 @@ def _structured_forwarded_signals() -> Iterable[_StructuredSignalState]:
                 restore_signal_mask(
                     cleanup_mask if initial_mask_restored else previous_mask
                 )
-        if pending_cleanup_signal is not None:
-            raise ForwardedSignal(pending_cleanup_signal)
+            if pending_cleanup_signal is not None:
+                raise ForwardedSignal(pending_cleanup_signal)
 
 
 def _revalidate_output_parent(target: _OutputTarget) -> None:
@@ -10497,34 +10502,48 @@ def _rollback_unpublished_workspace(
                 pathlib.Path(retained_path),
                 prepared.parent_identity,
                 prepared.workspace_identity,
+                primary_error=primary_error,
+                signal_owner=handoff_owner,
             )
         except BaseException as recovery_error:
-            terminal_error = ReviewWorkspaceError(
-                "workspace-publication-recovery-capability-unavailable",
-                "workspace rollback failed and an executable recovery capability could not be sealed",
-                details={
-                    "primary_reason": _workspace_publication_failure_reason(
-                        primary_error
-                    ),
-                    "cleanup_reason": _workspace_publication_failure_reason(
-                        cleanup_error
-                    ),
-                    "recovery_reason": _workspace_publication_failure_reason(
-                        recovery_error
-                    ),
-                    "retained_path": retained_path,
-                    "parent_identity": {
-                        "device": prepared.parent_identity[0],
-                        "inode": prepared.parent_identity[1],
-                        "uid": prepared.parent_identity[2],
+            recovery_payload = _partial_workspace_recovery_payload(recovery_error)
+            if recovery_payload is not None:
+                terminal_error = _WorkspacePublicationRollbackError(
+                    prepared,
+                    primary_error,
+                    cleanup_error,
+                    recovery_payload,
+                )
+                terminal_error.details["recovery_capability_reason"] = (
+                    _workspace_publication_failure_reason(recovery_error)
+                )
+            else:
+                terminal_error = ReviewWorkspaceError(
+                    "workspace-publication-recovery-capability-unavailable",
+                    "workspace rollback failed and an executable recovery capability could not be sealed",
+                    details={
+                        "primary_reason": _workspace_publication_failure_reason(
+                            primary_error
+                        ),
+                        "cleanup_reason": _workspace_publication_failure_reason(
+                            cleanup_error
+                        ),
+                        "recovery_reason": _workspace_publication_failure_reason(
+                            recovery_error
+                        ),
+                        "retained_path": retained_path,
+                        "parent_identity": {
+                            "device": prepared.parent_identity[0],
+                            "inode": prepared.parent_identity[1],
+                            "uid": prepared.parent_identity[2],
+                        },
+                        "workspace_identity": {
+                            "device": prepared.workspace_identity[0],
+                            "inode": prepared.workspace_identity[1],
+                            "uid": prepared.workspace_identity[2],
+                        },
                     },
-                    "workspace_identity": {
-                        "device": prepared.workspace_identity[0],
-                        "inode": prepared.workspace_identity[1],
-                        "uid": prepared.workspace_identity[2],
-                    },
-                },
-            )
+                )
             _attach_workspace_publication_owner(terminal_error, handoff_owner)
             raise terminal_error from recovery_error
         terminal_error = _WorkspacePublicationRollbackError(
@@ -10637,7 +10656,7 @@ def _finish_workspace_terminal_publication(
     terminal_failure = False
     try:
         consume_pending_forwarded_signal()
-        signal_state.commit()
+        signal_state.commit(returncode)
     except BaseException:
         terminal_failure = True
     try:
@@ -10770,7 +10789,7 @@ def _emit_structured_terminal_failure(
         _emit(payload, stream=sys.stderr)
         sys.stderr.flush()
         consume_pending_forwarded_signal()
-        signal_state.commit()
+        signal_state.commit(returncode)
     except BaseException as error:
         publication_error = error
     finally:
@@ -10818,6 +10837,22 @@ def _workspace_command_failure(
 def _workspace_command_main(args: argparse.Namespace) -> int:
     with _structured_forwarded_signals() as signal_state:
         try:
+            if args.command_name == "codex-git-prefix":
+                worktree = pathlib.Path(args.worktree)
+                git_executable = pathlib.Path(args.git_executable)
+                receipt = sanitized_git_argv_prefix_receipt(
+                    worktree=worktree,
+                    base=args.base,
+                    head=args.head,
+                    git_executable=git_executable,
+                )
+                _revalidate_prefix_receipt_publication_identities(
+                    receipt,
+                    worktree=pathlib.Path(receipt["worktree"]),
+                    git_executable=git_executable,
+                )
+                _emit_workspace_terminal_receipt(receipt, signal_state)
+                return 0
             if args.command_name == "prepare-workspace":
                 prepared = prepare_workspace(
                     pathlib.Path(args.source),
@@ -11022,7 +11057,7 @@ def legacy_short_prefix_compatibility_main(
                 defer_signal_handoff=True,
             )
             _emit_legacy_prefix_receipt(result)
-            signal_state.commit()
+            signal_state.commit(0)
         return 0
     except LegacyPrefixReceiptInconclusive as error:
         _emit(
@@ -11058,30 +11093,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     workspace_command = args.command_name in {
         "cleanup-workspace",
+        "codex-git-prefix",
         "prepare-workspace",
         "recover-partial-workspace",
         "validate-workspace",
     }
-    safety_command = workspace_command or args.command_name == "codex-git-prefix"
+    safety_command = workspace_command
     if workspace_command:
         return _workspace_command_main(args)
     try:
-        if args.command_name == "codex-git-prefix":
-            worktree = pathlib.Path(args.worktree)
-            git_executable = pathlib.Path(args.git_executable)
-            receipt = sanitized_git_argv_prefix_receipt(
-                worktree=worktree,
-                base=args.base,
-                head=args.head,
-                git_executable=git_executable,
-            )
-            _revalidate_prefix_receipt_publication_identities(
-                receipt,
-                worktree=pathlib.Path(receipt["worktree"]),
-                git_executable=git_executable,
-            )
-            _emit(receipt)
-            return 0
         command = list(args.claude_argv)
         if command and command[0] == "--":
             command.pop(0)
@@ -11125,8 +11145,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 deadline_monotonic=deadline,
                 _receipt_emitter=_emit_claude_receipt,
             )
-            signal_state.commit()
-            return 0 if result["status"] == "complete" else 1
+            returncode = 0 if result["status"] == "complete" else 1
+            signal_state.commit(returncode)
+            return returncode
     except _ClaudeControlCleanupError as error:
         snapshot = error.snapshot
         session_env = error.session_env
