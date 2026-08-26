@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-26
 updated: 2026-08-26
 branch: codex/review-journal-portability
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/109
 supersedes: []
 superseded_by:
 ---
@@ -64,6 +64,8 @@ superseded_by:
 
 ## Evidence
 
+- Canonical pull request:
+  `https://github.com/Joey-Tools/codex-review-workflows/pull/109`.
 - Failed private source-sync workflow:
   `Joey-Tools/codex-private-workflows` run `32923728751`, exact workflow head
   `d6e9583549a2b4395d377e96e1954533aa20b5f6`.
