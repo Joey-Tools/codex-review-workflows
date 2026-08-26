@@ -395,6 +395,15 @@ superseded_by:
   and touched-file format checks, source-only compilation, ShellCheck, C
   syntax, core Action YAML validation, three skill validators, project-journal
   validation, JSON parsing, and whitespace checks also passed.
+- PR #110's macOS read-only-install job then failed twice at the same
+  test-only opcode-offset injection even though the production subtree was
+  unchanged from its passing base. The owner-persistence test now interrupts
+  the real deletion API at its semantic successful-return profile event, after
+  the aggregate proof has been published but before the caller can store or
+  transfer it. All original recovery-owner assertions remain intact, while the
+  test no longer depends on CPython specialization, superinstructions, or a
+  particular `STORE_FAST` offset. The focused test passes under both local
+  CPython 3.13.0 and the workflow's exact CPython 3.13.13.
 
 ## Formal Review Evidence
 
