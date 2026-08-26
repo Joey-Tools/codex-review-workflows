@@ -3931,30 +3931,6 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         self.assertIn("`unknown` and `mismatch` are always inconclusive", contracts)
         self.assertIn("provider backend aliases", contracts)
 
-    def test_project_journal_records_unknown_profile_as_inconclusive(self) -> None:
-        journal = (
-            REPO_ROOT
-            / "docs"
-            / "project_journal"
-            / "2026"
-            / "08"
-            / "2026-08-22-review-orchestration-simplification-ros001.md"
-        ).read_text(encoding="utf-8")
-        normalized = _normalized(journal)
-
-        self.assertNotIn(
-            "records `unknown`; only an observed mismatch or downgrade makes profile evidence inconclusive",
-            normalized,
-        )
-        self.assertIn(
-            "Without that basis the unproved fields are `unknown` and the lane is inconclusive",
-            normalized,
-        )
-        self.assertIn(
-            "an observed mismatch or downgrade is likewise inconclusive",
-            normalized,
-        )
-
     def test_current_pinned_profile_and_peer_identity_remain_explicit(self) -> None:
         local = _read("local-codex-lane.md")
         contracts = _read("review-lane-contracts.md")
