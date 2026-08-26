@@ -942,6 +942,63 @@ class ReviewWorkspaceTest(unittest.TestCase):
         finally:
             self.cleanup(prepared)
 
+    @unittest.skipUnless(os.name == "posix", "source authority paths require POSIX")
+    def test_source_authority_binding_uses_canonical_utf8_bytes(self) -> None:
+        source = pathlib.Path("/tmp/source-\u00e9-\u2028")
+        identity = (1, 2, 3)
+        binding = workspace_runtime.build_source_authority_binding(
+            source_worktree=workspace_runtime.source_authority_directory_record(
+                source,
+                identity,
+            ),
+            git_marker=workspace_runtime.source_authority_marker_record(
+                source / ".git",
+                source / ".git",
+                identity,
+                file_type=stat.S_IFDIR,
+                kind="directory",
+                size=None,
+                sha256=None,
+            ),
+            linked_worktree_back_pointer=None,
+            git_common_directory_marker=None,
+            git_admin=workspace_runtime.source_authority_directory_record(
+                source / ".git",
+                identity,
+            ),
+            git_common=workspace_runtime.source_authority_directory_record(
+                source / ".git",
+                identity,
+            ),
+            primary_object_store=(
+                workspace_runtime.source_authority_directory_record(
+                    source / ".git" / "objects",
+                    identity,
+                )
+            ),
+            object_info_path=source / ".git" / "objects" / "info",
+            object_info_identity=None,
+        )
+
+        encoded = workspace_runtime.canonical_source_authority_binding_bytes(binding)
+        expected_path_bytes = "/tmp/source-\u00e9-\u2028".encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+
+        self.assertIn(expected_path_bytes, encoded)
+        self.assertNotIn(b"source-\\u00e9-\\u2028", encoded)
+        self.assertEqual(
+            digest,
+            "86df8269847e28bf45f314ea1c44d5496fa6138986b21a34e017728676ca7ccd",
+        )
+        parsed, parsed_digest = (
+            workspace_runtime.parse_canonical_source_authority_binding_bytes(
+                encoded,
+                digest,
+            )
+        )
+        self.assertEqual(parsed, binding)
+        self.assertEqual(parsed_digest, digest)
+
     def test_prepare_receipt_rejects_tampered_binding_bytes_or_digest(self) -> None:
         destination = self.root / "tampered-authority-receipt-workspace"
         prepared = prepare_workspace(

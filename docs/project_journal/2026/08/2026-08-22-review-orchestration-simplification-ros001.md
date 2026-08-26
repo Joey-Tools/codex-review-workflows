@@ -3,7 +3,7 @@ id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
 status: completed
 created: 2026-08-22
-updated: 2026-08-25
+updated: 2026-08-26
 branch: review-orchestration-simplification
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/108
 supersedes: [20260807-wme001, 20260805-wpe001]
@@ -395,6 +395,15 @@ superseded_by:
   and touched-file format checks, source-only compilation, ShellCheck, C
   syntax, core Action YAML validation, three skill validators, project-journal
   validation, JSON parsing, and whitespace checks also passed.
+- PR #110's macOS read-only-install job then failed twice at the same
+  test-only opcode-offset injection even though the production subtree was
+  unchanged from its passing base. The owner-persistence test now interrupts
+  the real deletion API at its semantic successful-return profile event, after
+  the aggregate proof has been published but before the caller can store or
+  transfer it. All original recovery-owner assertions remain intact, while the
+  test no longer depends on CPython specialization, superinstructions, or a
+  particular `STORE_FAST` offset. The focused test passes under both local
+  CPython 3.13.0 and the workflow's exact CPython 3.13.13.
 
 ## Formal Review Evidence
 
@@ -1941,21 +1950,43 @@ superseded_by:
 - All `32` general contract tests passed. Ruff lint/format and
   `git diff --check` also passed.
 
+### Canonical UTF-8 source-authority correction after private activation review
+
+- The private-overlay activation's fresh GPT-5.6 Sol Ultra reviewer found that
+  `review-source-authority-binding-v1` declared
+  `canonical-json-utf8-v1` while its encoder still used ASCII escaping. A
+  locally valid source path containing non-ASCII text could therefore produce
+  bytes that disagreed with the cross-phase canonical encoding contract and
+  leave a local Codex or Claude lane inconclusive.
+- The source-authority encoder now emits literal UTF-8 with
+  `ensure_ascii=False`, matching the already published canonical encoder
+  definition. The strict UTF-8 path check remains fail closed for surrogate or
+  otherwise non-UTF-8 filesystem paths; no path is replaced or omitted.
+- Regression coverage binds exact bytes, digest, and strict round-trip for a
+  source path containing both `é` and U+2028. Parser and CLI tests continue to
+  reject an ASCII-escaped surrogate fixture as non-canonical input. This is a
+  canonical source fix; the private overlay must advance its source lock and
+  regenerate rather than carrying a hand-edited runtime copy.
+
 ## Next Steps
 
-- Sign the corrected head, rerun exact-head secret admission and one fresh
-  whole-range GPT-5.6 Sol Ultra Codex review under the prior trusted release,
-  and push that stable candidate without merging it.
-- Refresh the private companion's immutable candidate/tree anchors, merge the
-  current private base with a signed merge commit, rerun its complete gates,
-  merge the companion, and confirm the pre-activation private release.
-- Complete PR 108's current-head GitHub lane, CI, final reread, and squash
-  merge. Then merge the generated source-sync PR, confirm the activated
-  private-overlay release, run the local installer, and record the final merge,
-  release, and installation identities here.
+- Deliver the canonical UTF-8 correction through the skill-repository Codex
+  gate and an immutable default-branch commit.
+- Advance the private overlay source lock to that canonical descendant,
+  regenerate the activation branch, and rerun its complete local, GitHub,
+  release, and installation gates.
 
 ## Evidence
 
+- Post-activation canonical UTF-8 correction: `3,217` review-playbook tests
+  completed in `1,948.651` seconds with six conditional skips. The aggregate
+  process reported three environment-only artifacts: a test-supervisor
+  `RLIMIT_FSIZE` collision, one transient macOS ACL command failure, and the
+  known outer-sandbox rejection of nested `sandbox-exec`. Each exact test
+  passed after removing only its demonstrated environmental blocker, including
+  the broker test outside the outer sandbox. Five focused source-authority
+  tests, the broader `source_authority` selection, Ruff lint/format, skill and
+  project-journal validation, and `git diff --check` also passed.
 - Active pre-migration skill:
   `/Users/hoteng/.codex/skills/review-orchestration-playbook/SKILL.md`.
 - Prior WME materialization record:

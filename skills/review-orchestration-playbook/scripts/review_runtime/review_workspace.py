@@ -1753,7 +1753,7 @@ def canonical_source_authority_binding_bytes(
     return json.dumps(
         binding,
         allow_nan=False,
-        ensure_ascii=True,
+        ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")

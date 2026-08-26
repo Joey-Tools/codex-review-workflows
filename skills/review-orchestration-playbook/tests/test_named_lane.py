@@ -13846,10 +13846,12 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         )
         non_utf8_path = json.loads(canonical)
         non_utf8_path["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
-        non_utf8_json = (
-            review_workspace_runtime.canonical_source_authority_binding_bytes(
-                non_utf8_path
-            ).decode("utf-8")
+        non_utf8_json = json.dumps(
+            non_utf8_path,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
         )
         noncanonical = json.dumps(binding, indent=2, sort_keys=True)
         duplicate = canonical.replace(
@@ -13875,7 +13877,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "non-utf8-path",
                 non_utf8_json,
                 hashlib.sha256(non_utf8_json.encode("utf-8")).hexdigest(),
-                "path must be valid UTF-8",
+                "cannot be canonically encoded",
             ),
             ("noncanonical", noncanonical, digest, "not canonical"),
             ("duplicate", duplicate, digest, "duplicate key"),
@@ -13907,9 +13909,13 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         )
         non_utf8 = json.loads(canonical)
         non_utf8["source_worktree"]["path"] = os.fsdecode(b"/tmp/source-\xff")
-        non_utf8_bytes = (
-            review_workspace_runtime.canonical_source_authority_binding_bytes(non_utf8)
-        )
+        non_utf8_bytes = json.dumps(
+            non_utf8,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
         duplicate = canonical.decode("utf-8").replace(
             "{",
             '{"schema_version":"review-source-authority-binding-v1",',

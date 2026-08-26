@@ -5571,42 +5571,50 @@ class TargetedRecoveryTests(unittest.TestCase):
                 digest,
             ) = self._prepare(root)
             shutil.rmtree(worktree)
-            target_offset = _call_followup_offset(
-                runtime._cleanup_worktree,
-                called_name="delete_custodied_roots",
-                following_opname="STORE_FAST",
-                following_argval="deletion_result",
-            )
             interruption = KeyboardInterrupt(
-                "injected production deletion CALL-to-STORE interrupt"
+                "injected production deletion return interrupt"
             )
             injected = False
+            returned_proof: object | None = None
+            returned_owner: CustodiedDeletionResultOwner | None = None
 
-            def interrupt_result_store(
+            def interrupt_delete_return(
                 frame: object,
                 event: str,
-                _argument: object,
-            ) -> object:
-                nonlocal injected
-                if getattr(frame, "f_code", None) is runtime._cleanup_worktree.__code__:
-                    setattr(frame, "f_trace_opcodes", True)
-                    if (
-                        not injected
-                        and event == "opcode"
-                        and getattr(frame, "f_lasti", None) == target_offset
-                    ):
-                        injected = True
-                        raise interruption
-                return interrupt_result_store
+                argument: object,
+            ) -> None:
+                nonlocal injected, returned_owner, returned_proof
+                frame_locals = getattr(frame, "f_locals", {})
+                deletion_owner = frame_locals.get("deletion_owner")
+                if (
+                    not injected
+                    and event == "return"
+                    and isinstance(argument, dict)
+                    and isinstance(deletion_owner, CustodiedDeletionResultOwner)
+                    and getattr(frame, "f_code", None)
+                    is runtime.delete_custodied_roots.__code__
+                ):
+                    injected = True
+                    returned_proof = argument
+                    returned_owner = deletion_owner
+                    raise interruption
 
-            previous_trace = sys.gettrace()
+            previous_profile = sys.getprofile()
             try:
-                sys.settrace(interrupt_result_store)
+                sys.setprofile(interrupt_delete_return)
                 state, _ = self._cleanup(retention, attempt, state, digest)
             finally:
-                sys.settrace(previous_trace)
+                sys.setprofile(previous_profile)
 
             self.assertTrue(injected)
+            self.assertIsInstance(returned_proof, dict)
+            assert isinstance(returned_proof, dict)
+            self.assertIsInstance(returned_owner, CustodiedDeletionResultOwner)
+            assert returned_owner is not None
+            self.assertIs(returned_owner.proof, returned_proof)
+            self.assertTrue(returned_owner.transferred)
+            self.assertTrue(returned_owner.finished)
+            self.assertTrue(returned_proof["exact_names_absent"])
             self.assertEqual(state["worktree_status"], "manual-recovery-required")
             self.assertEqual(state["checkout_settlement"], "outstanding")
             self.assertFalse(registration.registration.exists())
@@ -5616,6 +5624,9 @@ class TargetedRecoveryTests(unittest.TestCase):
             )
             progress = state["checkout_cleanup_progress"]
             self.assertEqual(progress["branch"], "registration-only")
+            self.assertEqual(
+                progress["manifest_sha256"], returned_proof["manifest_sha256"]
+            )
             self.assertTrue(progress["parent_fsync_complete"])
             self.assertTrue(progress["exact_names_absent"])
             ownership = state["cleanup_recovery_evidence"]["deletion_result_ownership"]
