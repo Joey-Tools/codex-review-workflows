@@ -978,6 +978,36 @@ def _require_prefix_receipt_file_policy(metadata: os.stat_result) -> None:
         )
 
 
+def _require_prefix_receipt_owner_private_acl(
+    descriptor: int,
+    *,
+    label: str,
+) -> None:
+    """Reject Darwin ACL grants through an already-bound descriptor.
+
+    UID, mode, and link count do not completely describe access policy on
+    macOS.  The protected property is owner-private access: deny-only ACL
+    entries may further restrict access, but no extended ACL entry may grant
+    another principal additional access.  Linux and other POSIX platforms
+    retain their existing mode-based semantics because their Darwin ACL
+    inventory is empty.
+    """
+
+    try:
+        tag_types = _legacy_extended_acl_tag_types(
+            descriptor,
+            label=f"sanitized Git argv prefix receipt {label}",
+        )
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} extended ACL cannot be inspected"
+        ) from error
+    if any(tag_type != 2 for tag_type in tag_types):
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} has an extended ACL grant"
+        )
+
+
 def _revalidate_open_prefix_receipt(
     *,
     receipt_path: pathlib.Path,
@@ -1022,6 +1052,10 @@ def _revalidate_open_prefix_receipt(
         raise NamedLaneGuardError(
             "sanitized Git argv prefix receipt parent path changed"
         )
+    _require_prefix_receipt_owner_private_acl(
+        parent_descriptor,
+        label="parent",
+    )
     for metadata in (receipt_descriptor_metadata, receipt_path_metadata):
         try:
             _require_prefix_receipt_file_policy(metadata)
@@ -1036,6 +1070,10 @@ def _revalidate_open_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt identity or access policy changed"
             )
+    _require_prefix_receipt_owner_private_acl(
+        receipt_descriptor,
+        label="file",
+    )
     final_signals = _prefix_receipt_content_signals(receipt_descriptor_metadata)
     if (
         final_signals != initial_signals
@@ -1117,6 +1155,10 @@ def validate_published_sanitized_git_argv_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt parent changed before opening"
             )
+        _require_prefix_receipt_owner_private_acl(
+            parent_descriptor,
+            label="parent",
+        )
         lexical = os.stat(
             receipt_file.name,
             dir_fd=parent_descriptor,
@@ -1141,6 +1183,10 @@ def validate_published_sanitized_git_argv_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt changed before reading"
             )
+        _require_prefix_receipt_owner_private_acl(
+            receipt_descriptor,
+            label="file",
+        )
         payload = _read_prefix_receipt_descriptor(receipt_descriptor)
         if len(payload) != opened.st_size:
             raise NamedLaneGuardError(

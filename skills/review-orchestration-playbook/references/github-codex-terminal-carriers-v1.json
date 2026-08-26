@@ -495,6 +495,45 @@
         "check_run_url",
         "provider_clean_assertion"
       ],
+      "merge_status_contract_trust_anchor": [
+        "owner",
+        "status",
+        "profile",
+        "source",
+        "candidate_scope",
+        "trusted_contract"
+      ],
+      "merge_status_trust_anchor_source": [
+        "kind",
+        "identity",
+        "sha256"
+      ],
+      "merge_status_trust_anchor_candidate_scope": [
+        "repository",
+        "base_sha",
+        "head_sha",
+        "relation"
+      ],
+      "merge_status_trusted_contract": [
+        "contract_descriptor",
+        "app_id",
+        "app_slug",
+        "workflow_id",
+        "check_name",
+        "provider_clean_assertion"
+      ],
+      "merge_status_candidate_range_exclusion_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "base_sha",
+        "head_sha",
+        "source",
+        "candidate_commits",
+        "candidate_commit_count",
+        "candidate_commits_sha256"
+      ],
       "reaction_clean_epoch": [
         "owner",
         "status",
@@ -631,6 +670,26 @@
         "finding_state": "unresolved_provider_findings is integer zero for every pass basis",
         "merge_status_scope": "initial_merge_status_scope and final_merge_status_scope are null for non-merge-status bases; for merge-status they are type-preserving equal closed merge_status_scope values that equal the separately frozen parent scope and bind the exact feature head, base ref/tip, unique merge base, subject kind, and check-subject SHA",
         "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, merge-status scope when selected, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal or producer result, the independently selected pass-basis projection, unresolved applicable findings, and both subject-discriminated check/status page sets; they are not digests of report summaries"
+      },
+      "merge_status_contract_trust_anchor": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-merge-status-contract-trust-anchor-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from a contract source outside the candidate range before candidate report, association, merge_status_parent_contract, or complete_pr_snapshot validation; read-only to the consumer and never derived from candidate-head files or any coupled candidate/report input",
+        "source": "closed source identity with kind target-branch-baseline, installed-trusted-release, or parent-fixed-external; identity is the exact UTF-8 source_repository@source_commit:source_path descriptor identity and sha256 equals the independently verified source bytes digest",
+        "candidate_scope": "closed candidate repository plus exact merge-base-to-feature-head range with relation outside-candidate-range; repository, base_sha, and head_sha equal the independent merge_status_scope repository, merge_base_sha, and feature_head_sha",
+        "trusted_contract": "closed stable producer identity containing the exact contract descriptor, App ID/slug, workflow ID, check name, and provider-clean assertion; every field is type-preservingly equal to merge_status_parent_contract and report association while run, attempt, suite, and check-run identities remain dynamic current-evidence bindings",
+        "source_exclusion": "a separate closed parent-owned merge_status_candidate_range_exclusion_receipt binds the exact descriptor source, repository, base_sha, head_sha, and complete byte-sorted base..head commit set; the consumer verifies its digest and mechanically rejects a same-repository source_commit present anywhere in that set; target-branch-baseline additionally requires the descriptor repository and commit to equal the selected repository and current base_tip_sha, while parent-fixed-external additionally uses a source repository distinct from the candidate repository"
+      },
+      "merge_status_candidate_range_exclusion_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-merge-status-candidate-range-exclusion-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from a complete local git rev-list of base_sha..head_sha with lazy fetching disabled before report or contract validation; read-only to the reference consumer and never derived from candidate-head files, report fields, or a coupled candidate input",
+        "scope_binding": "repository, base_sha, and head_sha type-preservingly equal the independent merge_status_scope repository, merge_base_sha, and feature_head_sha; source is the exact closed merge_status_contract descriptor from the separately trusted anchor",
+        "candidate_commits": "the exact complete non-empty byte-sorted unique lowercase 40-hex commit IDs returned for base_sha..head_sha; head_sha occurs exactly once and base_sha is absent",
+        "candidate_commits_sha256": "lowercase SHA-256 over exact commit-id + LF rows in the recorded byte-sorted order; candidate_commit_count is the exact typed list length",
+        "exclusion": "when source.source_repository equals repository, source.source_commit must not occur in candidate_commits; this mechanically rejects the head and every non-head candidate commit while allowing a separately trusted base-side or earlier installed release"
       },
       "reaction_clean_epoch": {
         "owner": "parent-orchestrator",
@@ -818,7 +877,7 @@
       "resolved-inline-awaiting-clean": {
         "status": "pending",
         "completion": "forbidden-until-later-accepted-current-head-terminal-clean",
-        "recovery": "same-head idempotent repository-Action reconcile under github-pr-probes retry policy",
+        "recovery": "same-head repository-Action reconcile only through a candidate-range-external closed trusted recovery contract that binds the exact operation and inputs and explicitly declares that operation idempotent or reentrant under the github-pr-probes retry policy; tuple equality alone never supplies repeat safety",
         "last_reason": "resolved-inline-awaiting-current-head-clean",
         "evidence_kind": "terminal-artifact",
         "branch": "inline-parent-v1",
@@ -841,7 +900,7 @@
         "parent_scope_binding": "report repository, pull request, and head plus the current base/merge/check-subject scope equal independently supplied parent inputs",
         "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
         "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
-        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and exact provider-clean assertion equal the report association",
+        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and exact provider-clean assertion equal the report association, plus a separately frozen merge_status_contract_trust_anchor and merge_status_candidate_range_exclusion_receipt from outside the candidate range; the digest-bound receipt binds the exact source and complete base..head commit set so a same-repository source at any candidate commit is rejected, and neither input can be supplied by candidate-head files",
         "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds equal initial/final current feature-head/base/merge/check-subject scope, complete typed page state, stable canonical snapshot digests, exact stable contract-verified producer-clean selection, exact App/workflow/run/check/producer-contract basis, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
         "provider_clean_assertion": "exact github-codex-provider-clean semantics with scope latest-feature-head for a feature-head subject or current-merge-scope for a github-synthetic-merge subject, and exact true unresolved_findings_required_zero",
         "association": "complete parent-owned binding of this exact check subject and App/workflow/run/check to independently verified producer-contract bytes whose success conclusion itself means GitHub Codex provider clean for the declared scope; a generic successful check or service-start marker is invalid"

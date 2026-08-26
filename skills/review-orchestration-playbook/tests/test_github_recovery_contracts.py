@@ -30,28 +30,35 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             _read(REFERENCES / "github-codex-terminal-carriers-v1.json")
         )
 
-    def test_actions_repeat_is_exact_tuple_idempotent_and_authorized(self) -> None:
+    def test_actions_repeat_requires_external_repeat_safety_contract_and_authorization(
+        self,
+    ) -> None:
         recovery = self.probes.split("## Reconcile Only Recoverable States", 1)[
             1
         ].split("## Retry Schedule And Cost Control", 1)[0]
         normalized = _normalize(recovery)
 
         self.assertIn(
-            "freeze one exact recovery tuple",
+            "obtain one closed parent-owned `recovery_operation_contract`",
             normalized,
         )
-        self.assertIn("repetitions of that same tuple as idempotent", normalized)
-        self.assertIn("no repository-specific idempotency", normalized)
+        self.assertIn("anchored outside the candidate range", normalized)
+        self.assertIn("exact operation as idempotent or reentrant", normalized)
+        self.assertIn(
+            "tuple equality identifies a requested repeat; it does not make an operation idempotent or reentrant",
+            normalized,
+        )
+        self.assertIn("candidate-head workflow or contract bytes cannot", normalized)
         self.assertIn(
             "the current task must still authorize the external mutation", normalized
         )
         self.assertIn("keep the recovery owner in status-only mode", normalized)
         self.assertIn(
-            "report the missing authorization instead of triggering",
+            "report the missing gate instead of triggering",
             normalized,
         )
         self.assertLess(
-            normalized.index("freeze one exact recovery tuple"),
+            normalized.index("obtain one closed parent-owned"),
             normalized.index("illustrative commands"),
         )
         combined = _normalize(
@@ -65,8 +72,11 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             + "\n"
             + self.prompts
         )
-        self.assertNotIn("repository-predeclared", combined)
-        self.assertNotIn("predeclares it as idempotent", combined)
+        self.assertNotIn(
+            "treats repetitions of that same tuple as idempotent", combined
+        )
+        self.assertNotIn("no repository-specific idempotency", combined)
+        self.assertNotIn("same-head idempotent repository-action reconcile", combined)
         for anchor in (
             "single-flight",
             "changed scope",
@@ -156,8 +166,10 @@ class GitHubRecoveryContractTest(unittest.TestCase):
 
         combined = _normalize("\n".join(documents.values()))
         self.assertIn("only a new feature head creates a new", combined)
-        self.assertIn("only an independently authorized exact actions tuple", combined)
-        self.assertIn("never applies to github comment creation", combined)
+        self.assertIn(
+            "only an independently authorized exact actions operation", combined
+        )
+        self.assertIn("never extends to comment creation", combined)
         self.assertNotIn("before every repetition", combined)
 
     def test_retry_schedule_cannot_repeat_comment_creation(self) -> None:
@@ -174,7 +186,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "completely enumerate every page",
             "comment creation is not an idempotent operation",
             "it consumes the epoch's comment-mutation budget",
-            "this exact-tuple idempotence applies only to the actions mutations",
+            "this repeat authority never applies to github comment creation",
             "it never repeats a create-comment post",
             "generic transport retry rule applies to reads and eligible actions mutations only",
         ):

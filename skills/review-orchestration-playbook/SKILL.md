@@ -94,7 +94,21 @@ Before any GitHub-lane action, read [github-codex-evidence-authority.md](referen
 The intended current policy is:
 
 - Use exact `@codex review` on an existing supported `github.com` PR at the frozen current head. An ordinary terminal artifact, reaction, or feature-head-only producer result does not prove provider coverage of the local merge base; base and merge-base coverage remain local PR-readiness facts.
-- Prefer a trustworthy merge/status producer when its independently verified repository contract binds the exact feature head, current base/merge scope, check-subject SHA, App/workflow/run/check identity, and defines success itself as GitHub Codex provider clean. A `feature-head` contract reports only latest-feature-head coverage; a `github-synthetic-merge` contract may report current-merge-scope coverage only while every base/merge/subject binding remains stable. With zero applicable unresolved findings, this basis passes independently and does not require a separate terminal clean comment or review. A generic successful check or service-start marker never qualifies.
+- Prefer a trustworthy merge/status producer when its independently verified
+  repository contract is anchored by parent-owned evidence outside the
+  candidate range, binds the exact feature head, current base/merge scope,
+  check-subject SHA, App/workflow/run/check identity, and defines success
+  itself as GitHub Codex provider clean. A target-branch baseline, an installed
+  trusted release, or another parent-pinned source proved outside the candidate
+  range may supply that anchor; a contract introduced by the candidate head
+  cannot. Require a separate parent-owned, digest-bound receipt for the complete
+  `merge_base..head` commit set and reject any same-repository contract source
+  found anywhere in that set, not only the head. A `feature-head` contract reports only latest-feature-head coverage;
+  a `github-synthetic-merge` contract may report current-merge-scope coverage
+  only while every base/merge/subject binding remains stable. With zero
+  applicable unresolved findings, this basis passes independently and does not
+  require a separate terminal clean comment or review. A generic successful
+  check or service-start marker never qualifies.
 - Otherwise, a trustworthy provider terminal clean comment or review on the latest head, together with no unresolved provider finding in the PR, passes the lane.
 - A complete provider `+1` reaction basis is a fallback when no stronger terminal artifact is available.
 - Only applicable unresolved provider findings block. They require an
@@ -123,15 +137,18 @@ The intended current policy is:
 Only a machine-decidable retryable pending or infrastructure reason enters
 automatic recovery. A stable malformed snapshot, scope contradiction, or
 other non-retryable inconclusive result terminates recovery and is reported
-immediately. For a retryable reason, prefer the smallest associated recovery,
-and keep one exact frozen Actions recovery tuple: repository/PR/head scope,
-dynamically identified Action or workflow, operation, and exact inputs.
-Repeating that same Actions tuple is idempotent for this consumer and needs no
-repository predeclaration; the current task must still authorize the external
-mutation. Issue-comment creation is not part of this idempotent tuple. Keep
-recovery status-only when authorization is absent. A different scope, Action,
-workflow, operation, or input set is a new mutation and requires ordinary
-confirmation.
+immediately. For a retryable reason, prefer the smallest associated recovery.
+Before any repeated Actions mutation, require a closed parent-owned
+`recovery_operation_contract` whose source is independently anchored outside
+the candidate range. It must bind one exact repository/PR/head, dynamically
+identified Action or workflow, ref, operation, and exact inputs, and explicitly
+declare that exact operation idempotent or reentrant. Equality of a frozen
+tuple is an identity check, never proof of safe repetition; a candidate-head
+workflow or contract cannot grant that authority. The current task must also
+authorize the external mutation. Issue-comment creation is never eligible.
+Keep recovery status-only when the trusted contract, exact match, or
+authorization is absent. A different scope, Action, workflow, ref, operation,
+or input set is a new mutation and requires ordinary confirmation.
 Never reconcile an explicit code finding, test failure, or policy failure as
 infrastructure.
 
@@ -205,7 +222,7 @@ Use [pr-readiness.md](references/pr-readiness.md) for the detailed gate. Transpo
 
 Named review consent authorizes only the processors in that named shape and their scoped review input. Read [egress-consent.md](references/egress-consent.md) before exposing repository data to an external processor.
 
-A bare triple request authorizes at most one possibly delivered scoped exact `@codex review` issue-comment POST for one repository/PR/head epoch on an already-existing supported PR. An ambiguous response consumes that write budget: reread and observe provider evidence, but never repeat the comment POST in that epoch. Separately authorized repository Actions may use the idempotent exact-tuple recovery above. A bare triple request does not authorize PR creation, branch mutation, empty commits, merge, or unrelated repository actions. PR repair, delivery, and merge require their own authorization.
+A bare triple request authorizes at most one possibly delivered scoped exact `@codex review` issue-comment POST for one repository/PR/head epoch on an already-existing supported PR. An ambiguous response consumes that write budget: reread and observe provider evidence, but never repeat the comment POST in that epoch. Separately authorized repository Actions may use the contract-qualified exact-operation recovery above. A bare triple request does not authorize PR creation, branch mutation, empty commits, merge, or unrelated repository actions. PR repair, delivery, and merge require their own authorization.
 
 ## Self-Policy Migration
 

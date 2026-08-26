@@ -159,7 +159,12 @@ subject only through the verified producer contract:
    it.
 2. Select a candidate only when its App identity, `details_url`, check suite,
    external ID, or documented repository contract associates it with the
-   GitHub Codex review or merge aggregation.
+   GitHub Codex review or merge aggregation, and the contract has a closed
+   parent-owned source trust anchor outside the candidate range. Candidate-head
+   workflow or contract bytes cannot supply that anchor. Join the anchor to a
+   separate parent-owned receipt containing the complete byte-sorted
+   `merge_base..head` commit set, exact count, and digest; reject a
+   same-repository source commit found anywhere in that set.
 3. If that contract declares `github-synthetic-merge`, independently read the
    current base ref/tip, locally proved unique merge base, PR
    `merge_commit_sha`, and complete check/status collections for that subject.
@@ -169,7 +174,8 @@ subject only through the verified producer contract:
    jobs.
 5. Preserve the App ID/slug, workflow ID, run ID/attempt, check-suite ID, check
    ID/name/URL, feature head, base ref/tip, merge base, subject kind/SHA,
-   status, conclusion, server time, and producer-contract descriptor.
+   status, conclusion, server time, producer-contract descriptor, and its
+   candidate-range-external trust anchor and candidate-range exclusion receipt.
 
 A name substring is a hint for discovery, not proof. A check attached to an
 older head, a generic App success, or a run found only by static name guessing
@@ -177,8 +183,9 @@ is not a valid basis.
 
 When a trustworthy related merge/status check exists, prefer it as the
 positive GitHub-lane basis, while still enumerating unresolved Codex-provider
-findings. Its independently verified contract must define successful completion
-as `github-codex-provider-clean`, require zero unresolved applicable findings,
+findings. Its independently verified contract and candidate-range-external
+source anchor must define successful completion as
+`github-codex-provider-clean`, require zero unresolved applicable findings,
 and declare either `latest-feature-head` or `current-merge-scope`. The former
 does not prove the PR base. The latter additionally requires the exact synthetic
 subject and current base/merge bindings above. Ordinary readiness still
@@ -258,19 +265,25 @@ Never reconcile an explicit review finding that is applicable and unresolved,
 a test failure, lint failure, policy failure, or other substantive negative
 result. Those require resolution, a fix, or an explicit policy decision.
 
-Before an Actions mutation, freeze one exact recovery tuple containing the
-repository, PR, head, dynamically identified Action or workflow, operation,
-and exact inputs. This consumer treats repetitions of that same tuple as
-idempotent; no repository-specific idempotency or reentrancy predeclaration is
-required. The current task must still authorize the external mutation. When
-that authorization is absent, keep the recovery owner in status-only mode,
-poll the scoped evidence on the schedule below, and report the missing
-authorization instead of triggering the workflow.
+Before an Actions mutation, obtain one closed parent-owned
+`recovery_operation_contract` from a source independently anchored outside the
+candidate range. The contract must bind the exact repository, PR, head,
+dynamically identified Action or workflow, ref, operation, and exact inputs,
+and must explicitly classify that exact operation as idempotent or reentrant.
+Accepted source relationships are the exact target-branch baseline, an
+installed trusted release, or another parent-pinned source proved outside the
+candidate range. Candidate-head workflow or contract bytes cannot grant repeat
+authority.
 
-This exact-tuple idempotence applies only to the Actions mutations in this
-section. It never applies to GitHub comment creation; the one-shot
-comment-mutation budget above remains consumed after any possibly delivered
-create-comment call.
+Only after that proof, freeze the exact recovery tuple and join it
+type-preservingly to the contract. Tuple equality identifies a requested
+repeat; it does not make an operation idempotent or reentrant. The current task
+must still authorize the external mutation. When the trusted contract, exact
+join, or authorization is absent, keep the recovery owner in status-only mode,
+poll the scoped evidence on the schedule below, and report the missing gate
+instead of triggering the workflow. This repeat authority never applies to
+GitHub comment creation; the one-shot comment-mutation budget above remains
+consumed after any possibly delivered create-comment call.
 
 After the tuple and authorization are established, choose the smallest
 operation that can recover the machine-decidable retryable state:
@@ -281,7 +294,8 @@ operation that can recover the machine-decidable retryable state:
 3. Dispatch a new run only for missing, stale, or aggregation-only state, and
    only after dynamic discovery proves the exact workflow and required inputs.
 
-Illustrative commands for an already authorized exact-tuple recovery are:
+Illustrative commands for an already authorized, trusted-contract-bound exact
+operation are:
 
 ```bash
 gh run rerun <run-id> --failed --repo <owner/repo>
@@ -289,11 +303,12 @@ gh run rerun <run-id> --repo <owner/repo>
 gh workflow run <workflow-id> --repo <owner/repo> --ref <current-head-branch>
 ```
 
-Repository-specific inputs come from the discovered workflow contract. Never
+Repository-specific inputs come from the trusted recovery contract. Never
 invent input names. Single-flight still applies: wait until the current attempt
-is terminal or proved lost before repeating the same tuple. A different
-repository/PR/head scope, Action, workflow, operation, or input set is not a
-retry of that tuple; stop and obtain ordinary confirmation before mutating it.
+is terminal or proved lost before repeating the same contract-bound tuple. A
+different repository/PR/head scope, Action, workflow, ref, operation, or input
+set is not a retry of that tuple; stop and obtain ordinary confirmation before
+mutating it.
 
 ## Retry Schedule And Cost Control
 
@@ -343,7 +358,7 @@ recovery:
   next_retry_at: RFC3339
   reason_class: retryable-pending | retryable-infrastructure
   last_reason: stable-machine-readable-reason
-  mutation_gate: authorized-exact-repeat | status-only
+  mutation_gate: authorized-contract-bound-repeat | status-only
   rolling_full_run_equivalents: 0
 ```
 
@@ -352,13 +367,16 @@ the active wait crossed an hour.
 
 Persistent monitoring does not expand authorization. A wake may always reread
 scoped evidence; it may repeat an Actions mutation only when the frozen
-recovery tuple is type-preservingly unchanged and the current mutation remains
-authorized. A new scope, Action, workflow, operation, input set, branch or PR
-mutation, destination, or other materially different action requires ordinary
+recovery tuple is type-preservingly unchanged, its candidate-range-external
+trusted recovery contract still matches and explicitly declares the exact
+operation idempotent or reentrant, and the current mutation remains authorized.
+A new scope, Action, workflow, ref, operation, input set, branch or PR mutation,
+destination, or other materially different action requires ordinary
 confirmation.
 
-The schedule may repeat read-only probes and an authorized exact Actions tuple.
-It never repeats a create-comment POST.
+The schedule may repeat read-only probes and an authorized exact Actions
+operation only through its still-valid trusted recovery contract. It never
+repeats a create-comment POST.
 
 ## Active Thread And Automation
 

@@ -1968,13 +1968,78 @@ superseded_by:
   canonical source fix; the private overlay must advance its source lock and
   regenerate rather than carrying a hand-edited runtime copy.
 
+### Canonical follow-up after private-overlay whole-range review
+
+- Canonical PR #110 squash-merged as
+  `a439793df9483943991c258e16f4ddf705736643` with tree
+  `76633f7ac00736ab8309a8f22413839dea04267` after its current-head local and
+  GitHub Codex gates passed. The private overlay then bound that exact source
+  identity and generated PR #181 instead of carrying a divergent copy.
+- A fresh ephemeral GPT-5.6 Sol Ultra review of private PR #181 range
+  `58e44edb8aa57bfe8e18adceac01489f85f2bf19..5f78907def147c231a09a5ff39a705d9d0c8eafa`
+  ran from an independent clean workspace under installed immutable control
+  release `f9e596f458a119fa88b89789c24c2290c37b4857`. Its terminal artifact
+  SHA-256 was
+  `93dbff2dd357d33e8a96da65718dcedba8192cce6df7d2967a75768d16fb768a`.
+- That review found three cross-repository contract gaps, so no private-head
+  clean result is carried forward. First, equality of an Actions
+  repository/PR/head/workflow/ref/operation/input tuple identifies a repeat
+  but cannot make an arbitrary workflow idempotent. Automatic mutation is now
+  limited to the exact Codex reconcile operation that a candidate-range-
+  external, parent-owned closed contract explicitly declares idempotent or
+  reentrant, in addition to current authorization and single-flight. The
+  agreed recovery cadence remains 1, 2, 4, 8, 16, 32, and 60 minutes, then
+  hourly without a fixed attempt limit; at 60 minutes the active thread is
+  informed, Automation wakes that same thread when available, cancellable
+  sleep remains the fallback, and private repositories retain the lower-cost
+  cadence.
+- Second, a merge/status check cannot establish GitHub Codex provider-clean
+  merely because candidate-head bytes introduce a contract that calls an
+  ordinary success clean. The reference schema now requires a separately
+  frozen parent trust anchor outside the candidate range. Its source and
+  stable producer identity join the dynamic App/workflow/run/check evidence;
+  a parent-owned candidate-range commit receipt also prevents a non-head
+  candidate commit from masquerading as an installed trusted release. This is
+  a normative machine-readable reference plus a test consumer; the separate
+  GitHub Action/status/ruleset workstream still owns the production consumer.
+- Third, the published sanitized-Git-prefix receipt consumer checked UID,
+  mode, link count, identity, and content but omitted Darwin extended ACLs.
+  Its protected access-policy property is now owner-private access: the bound
+  parent and receipt descriptors reject allow/grant ACL entries on acquisition
+  and both revalidation passes, while deny-only ACLs remain acceptable and
+  non-Darwin POSIX mode behavior remains unchanged. Real Darwin ACL tests cover
+  initial grants, drift before the first revalidation, drift before the final
+  revalidation, and deny-only entries.
+- The first warning-strict whole-skill run exposed one additional stale copy of
+  the old retry policy in `review-prompt-templates.md` and its matching exact-
+  text test. Both now require the same trusted recovery contract as the active
+  lane/authority documents; no model-facing prompt says that tuple equality
+  creates idempotency. That restricted run otherwise passed 3,220 of 3,222
+  tests with six conditional skips; its other failure was the known outer-
+  sandbox rejection of a nested `sandbox-exec` broker. The exact broker test
+  passed outside that nesting restriction in 2.455 seconds. After the prompt
+  correction, the authoritative non-nested warning-strict run passed all
+  3,222 tests with six conditional skips in 1,650.381 seconds. The 330-test
+  named-lane module, 83-test GitHub/local-contract matrix, Ruff lint/format,
+  JSON parsing, skill validation, project-journal validation, and whitespace
+  checks also passed.
+- The exact GitHub rule name remains **Require branches to be up to date before
+  merging**, distinct from **Require linear history**. If freshness blocks and
+  no merge queue owns the update, merge the current base into the feature
+  branch with a signed merge commit and rerun the complete test, review,
+  GitHub, CI, conversation, policy, and final-reread gates. Intermediate merge
+  commits are valid members of `base..head`; neither this recovery nor the
+  workspace contract requires linear history.
+
 ## Next Steps
 
-- Deliver the canonical UTF-8 correction through the skill-repository Codex
-  gate and an immutable default-branch commit.
-- Advance the private overlay source lock to that canonical descendant,
-  regenerate the activation branch, and rerun its complete local, GitHub,
-  release, and installation gates.
+- Complete focused and full validation of the canonical follow-up, obtain one
+  fresh-context local Codex result plus current-head GitHub Codex evidence, and
+  merge its signed PR.
+- Advance private PR #181 to the resulting canonical merge identity, regenerate
+  rather than hand-edit the overlay, and rerun exact-secret admission, full
+  local tests, fresh local review, GitHub/CI/readiness, package verification,
+  merge, immutable release, local installer, and strict installed-state checks.
 
 ## Evidence
 

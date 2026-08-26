@@ -69,6 +69,12 @@ def _canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _commit_set_sha256(commits: list[str]) -> str:
+    return hashlib.sha256(
+        b"".join(commit.encode("ascii") + b"\n" for commit in commits)
+    ).hexdigest()
+
+
 def _finding_page_records_sha256(
     issue_comments: object,
     reviews: object,
@@ -608,6 +614,8 @@ class _ReportValidator:
         finding_carrier_parent_snapshot: dict[str, object] | None = None,
         finding_range_parent_receipt: dict[str, object] | None = None,
         finding_page_parent_receipt: dict[str, object] | None = None,
+        merge_status_contract_trust_anchor: dict[str, object] | None = None,
+        merge_status_candidate_range_exclusion_receipt: dict[str, object] | None = None,
     ) -> None:
         self.grammar = grammar
         self.grammar_name = grammar["schema"]
@@ -634,6 +642,12 @@ class _ReportValidator:
         )
         self.finding_range_parent_receipt = copy.deepcopy(finding_range_parent_receipt)
         self.finding_page_parent_receipt = copy.deepcopy(finding_page_parent_receipt)
+        self.merge_status_contract_trust_anchor = copy.deepcopy(
+            merge_status_contract_trust_anchor
+        )
+        self.merge_status_candidate_range_exclusion_receipt = copy.deepcopy(
+            merge_status_candidate_range_exclusion_receipt
+        )
         self.provider_identity = copy.deepcopy(grammar["provider_identity"])
         self.reference_classifier = _ReferenceClassifier(grammar)
 
@@ -842,6 +856,7 @@ class _ReportValidator:
             or not self._closed_parent_input(
                 parent_contract, "merge_status_parent_contract"
             )
+            or not self._merge_status_contract_trust_anchor_matches(report)
         ):
             return False
         association = evidence["association"]
@@ -1201,6 +1216,7 @@ class _ReportValidator:
             or report["head_sha"] != parent_scope["feature_head_sha"]
             or parent_contract["owner"] != "parent-orchestrator"
             or parent_contract["status"] != "complete"
+            or not self._merge_status_contract_trust_anchor_matches(report)
         ):
             return False
         if not self._closed(evidence, "merge_status_evidence"):
@@ -1387,6 +1403,115 @@ class _ReportValidator:
         ):
             return False
         return True
+
+    def _merge_status_contract_trust_anchor_matches(
+        self, report: dict[str, object]
+    ) -> bool:
+        anchor = self.merge_status_contract_trust_anchor
+        exclusion_receipt = self.merge_status_candidate_range_exclusion_receipt
+        parent_scope = self.merge_status_parent_scope
+        parent_contract = self.merge_status_parent_contract
+        if (
+            not self._closed_parent_input(anchor, "merge_status_contract_trust_anchor")
+            or not self._closed_parent_input(
+                anchor["source"], "merge_status_trust_anchor_source"
+            )
+            or not self._closed_parent_input(
+                anchor["candidate_scope"],
+                "merge_status_trust_anchor_candidate_scope",
+            )
+            or not self._closed_parent_input(
+                anchor["trusted_contract"], "merge_status_trusted_contract"
+            )
+            or not self._closed_parent_input(
+                exclusion_receipt,
+                "merge_status_candidate_range_exclusion_receipt",
+            )
+            or not self._closed_parent_input(parent_scope, "merge_status_scope")
+            or not self._closed_parent_input(
+                parent_contract, "merge_status_parent_contract"
+            )
+            or anchor["owner"] != "parent-orchestrator"
+            or anchor["status"] != "complete"
+            or anchor["profile"] != "github-codex-merge-status-contract-trust-anchor-v1"
+            or exclusion_receipt["owner"] != "parent-orchestrator"
+            or exclusion_receipt["status"] != "complete"
+            or exclusion_receipt["profile"]
+            != "github-codex-merge-status-candidate-range-exclusion-v1"
+        ):
+            return False
+
+        candidate_scope = anchor["candidate_scope"]
+        expected_candidate_scope = {
+            "repository": report["repository"],
+            "base_sha": parent_scope["merge_base_sha"],
+            "head_sha": report["head_sha"],
+            "relation": "outside-candidate-range",
+        }
+        trusted_contract = anchor["trusted_contract"]
+        expected_trusted_contract = {
+            "contract_descriptor": parent_contract["contract_descriptor"],
+            "app_id": parent_contract["app_id"],
+            "app_slug": parent_contract["app_slug"],
+            "workflow_id": parent_contract["workflow_id"],
+            "check_name": parent_contract["check_name"],
+            "provider_clean_assertion": parent_contract["provider_clean_assertion"],
+        }
+        if not self._type_preserving_equal(
+            candidate_scope, expected_candidate_scope
+        ) or not self._type_preserving_equal(
+            trusted_contract, expected_trusted_contract
+        ):
+            return False
+
+        descriptor = trusted_contract["contract_descriptor"]
+        source = anchor["source"]
+        candidate_commits = exclusion_receipt["candidate_commits"]
+        if (
+            not self._closed(descriptor, "merge_status_contract")
+            or not isinstance(source["identity"], str)
+            or source["identity"]
+            != (
+                f"{descriptor['source_repository']}@"
+                f"{descriptor['source_commit']}:{descriptor['source_path']}"
+            )
+            or source["sha256"] != descriptor["source_sha256"]
+            or not isinstance(source["sha256"], str)
+            or SHA256.fullmatch(source["sha256"]) is None
+            or exclusion_receipt["repository"] != report["repository"]
+            or exclusion_receipt["base_sha"] != parent_scope["merge_base_sha"]
+            or exclusion_receipt["head_sha"] != report["head_sha"]
+            or not self._type_preserving_equal(exclusion_receipt["source"], descriptor)
+            or not isinstance(candidate_commits, list)
+            or not candidate_commits
+            or any(not self._full_sha(commit) for commit in candidate_commits)
+            or candidate_commits != sorted(candidate_commits)
+            or len(candidate_commits) != len(set(candidate_commits))
+            or report["head_sha"] not in candidate_commits
+            or parent_scope["merge_base_sha"] in candidate_commits
+            or not isinstance(exclusion_receipt["candidate_commit_count"], int)
+            or isinstance(exclusion_receipt["candidate_commit_count"], bool)
+            or exclusion_receipt["candidate_commit_count"] != len(candidate_commits)
+            or exclusion_receipt["candidate_commits_sha256"]
+            != _commit_set_sha256(candidate_commits)
+            or (
+                descriptor["source_repository"] == report["repository"]
+                and descriptor["source_commit"] in candidate_commits
+            )
+        ):
+            return False
+
+        source_kind = source["kind"]
+        if source_kind == "target-branch-baseline":
+            return (
+                descriptor["source_repository"] == report["repository"]
+                and descriptor["source_commit"] == parent_scope["base_tip_sha"]
+            )
+        if source_kind == "installed-trusted-release":
+            return True
+        if source_kind == "parent-fixed-external":
+            return descriptor["source_repository"] != report["repository"]
+        return False
 
     @staticmethod
     def _clean_evidence_url_matches_scope(
@@ -2588,6 +2713,60 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "unresolved_findings_required_zero": True,
             },
         }
+        cls.merge_status_contract_trust_anchor = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "profile": "github-codex-merge-status-contract-trust-anchor-v1",
+            "source": {
+                "kind": "parent-fixed-external",
+                "identity": (
+                    "octo/review-gate@"
+                    "2222222222222222222222222222222222222222:"
+                    "contracts/github-codex-merge-status-v1.json"
+                ),
+                "sha256": (
+                    "3333333333333333333333333333333333333333333333333333333333333333"
+                ),
+            },
+            "candidate_scope": {
+                "repository": "octo/review-fixture",
+                "base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                "relation": "outside-candidate-range",
+            },
+            "trusted_contract": {
+                "contract_descriptor": copy.deepcopy(
+                    cls.merge_status_parent_contract["contract_descriptor"]
+                ),
+                "app_id": 15368,
+                "app_slug": "github-actions",
+                "workflow_id": 901,
+                "check_name": "Codex Review Merge Gate",
+                "provider_clean_assertion": copy.deepcopy(
+                    cls.merge_status_parent_contract["provider_clean_assertion"]
+                ),
+            },
+        }
+        candidate_commits = sorted(
+            [
+                cls.merge_status_parent_scope["feature_head_sha"],
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ]
+        )
+        cls.merge_status_candidate_range_exclusion_receipt = {
+            "owner": "parent-orchestrator",
+            "status": "complete",
+            "profile": "github-codex-merge-status-candidate-range-exclusion-v1",
+            "repository": cls.merge_status_parent_scope["repository"],
+            "base_sha": cls.merge_status_parent_scope["merge_base_sha"],
+            "head_sha": cls.merge_status_parent_scope["feature_head_sha"],
+            "source": copy.deepcopy(
+                cls.merge_status_parent_contract["contract_descriptor"]
+            ),
+            "candidate_commits": candidate_commits,
+            "candidate_commit_count": len(candidate_commits),
+            "candidate_commits_sha256": _commit_set_sha256(candidate_commits),
+        }
         merge_evidence = copy.deepcopy(
             cls.grammar["report_bases"]["merge_status"]["evidence"]
         )
@@ -2654,6 +2833,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.top_level_finding_carrier_snapshot,
             cls.finding_range_parent_receipt,
             cls.finding_page_parent_receipt,
+            cls.merge_status_contract_trust_anchor,
+            cls.merge_status_candidate_range_exclusion_receipt,
         )
         cls.inline_finding_report_validator = _ReportValidator(
             cls.grammar,
@@ -2668,6 +2849,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.inline_finding_carrier_snapshot,
             cls.finding_range_parent_receipt,
             cls.inline_finding_page_parent_receipt,
+            cls.merge_status_contract_trust_anchor,
+            cls.merge_status_candidate_range_exclusion_receipt,
         )
         cls.reaction_report_validator = _ReportValidator(
             cls.grammar,
@@ -2682,6 +2865,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.top_level_finding_carrier_snapshot,
             cls.finding_range_parent_receipt,
             cls.finding_page_parent_receipt,
+            cls.merge_status_contract_trust_anchor,
+            cls.merge_status_candidate_range_exclusion_receipt,
         )
         cls.merge_report_validator = _ReportValidator(
             cls.grammar,
@@ -2696,6 +2881,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.top_level_finding_carrier_snapshot,
             cls.finding_range_parent_receipt,
             cls.finding_page_parent_receipt,
+            cls.merge_status_contract_trust_anchor,
+            cls.merge_status_candidate_range_exclusion_receipt,
         )
         cls.no_pr_report_validator = _ReportValidator(
             cls.grammar,
@@ -2710,6 +2897,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.top_level_finding_carrier_snapshot,
             cls.finding_range_parent_receipt,
             cls.finding_page_parent_receipt,
+            cls.merge_status_contract_trust_anchor,
+            cls.merge_status_candidate_range_exclusion_receipt,
         )
 
     def _validator_for_selection(
@@ -2728,6 +2917,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.top_level_finding_carrier_snapshot,
             self.finding_range_parent_receipt,
             self.finding_page_parent_receipt,
+            self.merge_status_contract_trust_anchor,
+            self.merge_status_candidate_range_exclusion_receipt,
         )
 
     def _validator_with_complete_snapshot(
@@ -2737,6 +2928,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         terminal_identity: dict[str, object] | None = None,
         reaction_epoch: dict[str, object] | None = None,
         merge_contract: dict[str, object] | None = None,
+        merge_anchor: dict[str, object] | None = None,
+        merge_exclusion_receipt: dict[str, object] | None = None,
     ) -> _ReportValidator:
         return _ReportValidator(
             self.grammar,
@@ -2763,7 +2956,46 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.top_level_finding_carrier_snapshot,
             self.finding_range_parent_receipt,
             self.finding_page_parent_receipt,
+            (
+                merge_anchor
+                if merge_anchor is not None
+                else self.merge_status_contract_trust_anchor
+            ),
+            (
+                merge_exclusion_receipt
+                if merge_exclusion_receipt is not None
+                else self.merge_status_candidate_range_exclusion_receipt
+            ),
         )
+
+    def _merge_anchor_for_contract(
+        self, parent_contract: dict[str, object]
+    ) -> dict[str, object]:
+        anchor = copy.deepcopy(self.merge_status_contract_trust_anchor)
+        descriptor = copy.deepcopy(parent_contract["contract_descriptor"])
+        anchor["source"]["identity"] = (
+            f"{descriptor['source_repository']}@{descriptor['source_commit']}:"
+            f"{descriptor['source_path']}"
+        )
+        anchor["source"]["sha256"] = descriptor["source_sha256"]
+        anchor["trusted_contract"] = {
+            "contract_descriptor": descriptor,
+            "app_id": parent_contract["app_id"],
+            "app_slug": parent_contract["app_slug"],
+            "workflow_id": parent_contract["workflow_id"],
+            "check_name": parent_contract["check_name"],
+            "provider_clean_assertion": copy.deepcopy(
+                parent_contract["provider_clean_assertion"]
+            ),
+        }
+        return anchor
+
+    def _merge_exclusion_receipt_for_contract(
+        self, parent_contract: dict[str, object]
+    ) -> dict[str, object]:
+        receipt = copy.deepcopy(self.merge_status_candidate_range_exclusion_receipt)
+        receipt["source"] = copy.deepcopy(parent_contract["contract_descriptor"])
+        return receipt
 
     def _validator_with_finding_snapshot(
         self,
@@ -2798,6 +3030,8 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 if page_receipt is not None
                 else self.finding_page_parent_receipt
             ),
+            self.merge_status_contract_trust_anchor,
+            self.merge_status_candidate_range_exclusion_receipt,
         )
 
     def _clean_snapshot_for_evidence(
@@ -3018,6 +3252,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "merge_status_basis_selection",
                 "merge_status_scope",
                 "merge_status_parent_contract",
+                "merge_status_contract_trust_anchor",
+                "merge_status_trust_anchor_source",
+                "merge_status_trust_anchor_candidate_scope",
+                "merge_status_trusted_contract",
+                "merge_status_candidate_range_exclusion_receipt",
                 "reaction_clean_epoch",
                 "resolved_inline_snapshot",
                 "finding_carrier_snapshot",
@@ -3198,6 +3437,50 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
         )
         self.assertIn(
+            "separately frozen merge_status_contract_trust_anchor",
+            report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
+        )
+        self.assertIn(
+            "merge_status_candidate_range_exclusion_receipt",
+            report_schema["basis_rules"]["merge-status"]["parent_contract_input"],
+        )
+        self.assertEqual(
+            set(
+                report_schema["parent_input_profiles"][
+                    "merge_status_contract_trust_anchor"
+                ]
+            ),
+            {
+                "owner",
+                "status",
+                "profile",
+                "source",
+                "candidate_scope",
+                "trusted_contract",
+            },
+        )
+        trust_anchor_rule = report_schema["parent_input_rules"][
+            "merge_status_contract_trust_anchor"
+        ]
+        exclusion_rule = report_schema["parent_input_rules"][
+            "merge_status_candidate_range_exclusion_receipt"
+        ]
+        self.assertIn("complete local git rev-list", exclusion_rule["trust_boundary"])
+        self.assertIn("commit-id + LF", exclusion_rule["candidate_commits_sha256"])
+        self.assertIn("non-head candidate commit", exclusion_rule["exclusion"])
+        self.assertEqual(trust_anchor_rule["owner"], "parent-orchestrator")
+        self.assertEqual(
+            trust_anchor_rule["profile"],
+            "github-codex-merge-status-contract-trust-anchor-v1",
+        )
+        self.assertIn(
+            "outside the candidate range", trust_anchor_rule["trust_boundary"]
+        )
+        self.assertIn(
+            "never derived from candidate-head files",
+            trust_anchor_rule["trust_boundary"],
+        )
+        self.assertIn(
             "equal initial/final current feature-head/base/merge/check-subject scope",
             report_schema["basis_rules"]["merge-status"][
                 "parent_complete_snapshot_input"
@@ -3367,6 +3650,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "parent's frozen\nscope inputs",
             "service-start marker cannot become a merge-status pass",
             "parent-owned `merge_status_parent_contract` record",
+            "`merge_status_contract_trust_anchor`",
+            "outside the candidate range",
+            "Candidate-head content cannot create, amend, or self-prove",
             "exact UTF-8 byte identity",
             "does not require a second terminal clean\ncomment or review",
             "feature-head-only contract",
@@ -4176,10 +4462,24 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 merge_contract=descriptor_contract,
             ).validate(descriptor_merge)
         )
+        rebuilt_descriptor_snapshot = self._merge_snapshot_for_report(
+            descriptor_merge, "2"
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                rebuilt_descriptor_snapshot,
+                merge_contract=descriptor_contract,
+            ).validate(descriptor_merge)
+        )
+        descriptor_anchor = self._merge_anchor_for_contract(descriptor_contract)
         self.assertTrue(
             self._validator_with_complete_snapshot(
-                self._merge_snapshot_for_report(descriptor_merge, "2"),
+                rebuilt_descriptor_snapshot,
                 merge_contract=descriptor_contract,
+                merge_anchor=descriptor_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    descriptor_contract
+                ),
             ).validate(descriptor_merge)
         )
 
@@ -4203,10 +4503,21 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 merge_contract=alternate_contract,
             ).validate(alternate_merge)
         )
+        rebuilt_alternate_snapshot = self._merge_snapshot_for_report(
+            alternate_merge, "f"
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                rebuilt_alternate_snapshot,
+                merge_contract=alternate_contract,
+            ).validate(alternate_merge)
+        )
+        alternate_anchor = self._merge_anchor_for_contract(alternate_contract)
         self.assertTrue(
             self._validator_with_complete_snapshot(
-                self._merge_snapshot_for_report(alternate_merge, "f"),
+                rebuilt_alternate_snapshot,
                 merge_contract=alternate_contract,
+                merge_anchor=alternate_anchor,
             ).validate(alternate_merge)
         )
 
@@ -4718,6 +5029,187 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 )
                 self.assertFalse(validator.validate(report))
 
+    def test_merge_status_requires_candidate_range_external_trust_anchor(
+        self,
+    ) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        snapshot = copy.deepcopy(self.merge_complete_pr_parent_snapshot)
+        self.assertTrue(self.merge_report_validator.validate(report))
+
+        missing_anchor_validator = _ReportValidator(
+            self.grammar,
+            self.selected_parent_selection_outcome,
+            self.direct_positive_parent_scope,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+            snapshot,
+            merge_status_contract_trust_anchor=None,
+        )
+        self.assertFalse(missing_anchor_validator.validate(report))
+
+        mutations = {
+            "owner": lambda anchor: anchor.update(owner="candidate"),
+            "status": lambda anchor: anchor.update(status="incomplete"),
+            "profile": lambda anchor: anchor.update(profile="open-profile"),
+            "source-kind": lambda anchor: anchor["source"].update(
+                kind="candidate-head"
+            ),
+            "source-identity": lambda anchor: anchor["source"].update(
+                identity="candidate-controlled"
+            ),
+            "source-digest": lambda anchor: anchor["source"].update(sha256="f" * 64),
+            "candidate-repository": lambda anchor: anchor["candidate_scope"].update(
+                repository="octo/other"
+            ),
+            "candidate-base": lambda anchor: anchor["candidate_scope"].update(
+                base_sha="1" * 40
+            ),
+            "candidate-head": lambda anchor: anchor["candidate_scope"].update(
+                head_sha="1" * 40
+            ),
+            "candidate-relation": lambda anchor: anchor["candidate_scope"].update(
+                relation="inside-candidate-range"
+            ),
+            "trusted-workflow": lambda anchor: anchor["trusted_contract"].update(
+                workflow_id=999
+            ),
+            "trusted-check-name": lambda anchor: anchor["trusted_contract"].update(
+                check_name="Candidate Check"
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(anchor_mutation=name):
+                anchor = copy.deepcopy(self.merge_status_contract_trust_anchor)
+                mutate(anchor)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(
+                        snapshot, merge_anchor=anchor
+                    ).validate(report)
+                )
+
+        receipt_mutations = {
+            "source": lambda receipt: receipt["source"].update(
+                source_path="candidate-controlled.json"
+            ),
+            "digest": lambda receipt: receipt.update(candidate_commits_sha256="f" * 64),
+            "count": lambda receipt: receipt.update(candidate_commit_count=1),
+            "order": lambda receipt: receipt["candidate_commits"].reverse(),
+        }
+        for name, mutate in receipt_mutations.items():
+            with self.subTest(exclusion_receipt_mutation=name):
+                receipt = copy.deepcopy(
+                    self.merge_status_candidate_range_exclusion_receipt
+                )
+                mutate(receipt)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(
+                        snapshot, merge_exclusion_receipt=receipt
+                    ).validate(report)
+                )
+
+        candidate_report = copy.deepcopy(report)
+        candidate_contract = copy.deepcopy(self.merge_status_parent_contract)
+        candidate_descriptor = {
+            "source_repository": candidate_report["repository"],
+            "source_commit": candidate_report["head_sha"],
+            "source_path": ".github/workflows/codex-review.yml",
+            "source_sha256": "6" * 64,
+        }
+        candidate_contract["contract_descriptor"] = copy.deepcopy(candidate_descriptor)
+        candidate_report["evidence"]["association"]["contract"] = copy.deepcopy(
+            candidate_descriptor
+        )
+        candidate_anchor = self._merge_anchor_for_contract(candidate_contract)
+        candidate_anchor["source"]["kind"] = "installed-trusted-release"
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(candidate_report, "6"),
+                merge_contract=candidate_contract,
+                merge_anchor=candidate_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    candidate_contract
+                ),
+            ).validate(candidate_report)
+        )
+
+        non_head_report = copy.deepcopy(report)
+        non_head_contract = copy.deepcopy(self.merge_status_parent_contract)
+        non_head_descriptor = {
+            "source_repository": non_head_report["repository"],
+            "source_commit": "dddddddddddddddddddddddddddddddddddddddd",
+            "source_path": ".github/releases/codex-review-contract.json",
+            "source_sha256": "6" * 64,
+        }
+        non_head_contract["contract_descriptor"] = copy.deepcopy(non_head_descriptor)
+        non_head_report["evidence"]["association"]["contract"] = copy.deepcopy(
+            non_head_descriptor
+        )
+        non_head_anchor = self._merge_anchor_for_contract(non_head_contract)
+        non_head_anchor["source"]["kind"] = "installed-trusted-release"
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(non_head_report, "6"),
+                merge_contract=non_head_contract,
+                merge_anchor=non_head_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    non_head_contract
+                ),
+            ).validate(non_head_report)
+        )
+
+        prior_report = copy.deepcopy(report)
+        prior_contract = copy.deepcopy(self.merge_status_parent_contract)
+        prior_descriptor = {
+            "source_repository": prior_report["repository"],
+            "source_commit": self.merge_status_parent_scope["merge_base_sha"],
+            "source_path": ".github/releases/codex-review-contract.json",
+            "source_sha256": "5" * 64,
+        }
+        prior_contract["contract_descriptor"] = copy.deepcopy(prior_descriptor)
+        prior_report["evidence"]["association"]["contract"] = copy.deepcopy(
+            prior_descriptor
+        )
+        prior_anchor = self._merge_anchor_for_contract(prior_contract)
+        prior_anchor["source"]["kind"] = "installed-trusted-release"
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(prior_report, "5"),
+                merge_contract=prior_contract,
+                merge_anchor=prior_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    prior_contract
+                ),
+            ).validate(prior_report)
+        )
+
+        baseline_report = copy.deepcopy(report)
+        baseline_contract = copy.deepcopy(self.merge_status_parent_contract)
+        baseline_descriptor = {
+            "source_repository": baseline_report["repository"],
+            "source_commit": self.merge_status_parent_scope["base_tip_sha"],
+            "source_path": ".github/codex-review-contract.json",
+            "source_sha256": "7" * 64,
+        }
+        baseline_contract["contract_descriptor"] = copy.deepcopy(baseline_descriptor)
+        baseline_report["evidence"]["association"]["contract"] = copy.deepcopy(
+            baseline_descriptor
+        )
+        baseline_anchor = self._merge_anchor_for_contract(baseline_contract)
+        baseline_anchor["source"]["kind"] = "target-branch-baseline"
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(baseline_report, "7"),
+                merge_contract=baseline_contract,
+                merge_anchor=baseline_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    baseline_contract
+                ),
+            ).validate(baseline_report)
+        )
+
     def test_merge_status_feature_head_and_synthetic_subject_branches_are_closed(
         self,
     ) -> None:
@@ -4753,6 +5245,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             feature_contract,
             None,
             feature_snapshot,
+            merge_status_contract_trust_anchor=self._merge_anchor_for_contract(
+                feature_contract
+            ),
+            merge_status_candidate_range_exclusion_receipt=(
+                self._merge_exclusion_receipt_for_contract(feature_contract)
+            ),
         )
         self.assertTrue(feature_validator.validate(feature_report))
         split_feature_pages = copy.deepcopy(feature_snapshot)
@@ -4770,6 +5268,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             feature_contract,
             None,
             split_feature_pages,
+            merge_status_contract_trust_anchor=self._merge_anchor_for_contract(
+                feature_contract
+            ),
+            merge_status_candidate_range_exclusion_receipt=(
+                self._merge_exclusion_receipt_for_contract(feature_contract)
+            ),
         )
         self.assertFalse(split_feature_validator.validate(feature_report))
         mislabeled_feature = copy.deepcopy(feature_report)

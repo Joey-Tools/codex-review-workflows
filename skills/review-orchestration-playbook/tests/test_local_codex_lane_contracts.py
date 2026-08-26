@@ -3956,12 +3956,14 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "exact typed GraphQL thread resolution",
             "later trustworthy provider correction",
             "machine-decidable transient pending or infrastructure reason",
-            "Repetition of that exact tuple is idempotent without a repository predeclaration",
-            "current authorization for the external mutation",
+            "require a closed parent-owned `recovery_operation_contract` anchored outside the candidate range",
+            "explicitly declares that exact operation idempotent or reentrant",
+            "tuple identifies the attempted repeat but never proves repeat safety",
+            "current mutation authorization and single-flight are still required",
             "at most one possibly delivered exact `@codex review` issue-comment POST",
             "An ambiguous POST outcome consumes the comment-mutation budget",
             "never repeat the comment POST in that epoch",
-            "Only the separately authorized exact repository-Action tuple is idempotently repeatable",
+            "Only the separately authorized exact repository-Action operation whose candidate-range-external trusted contract explicitly declares it idempotent or reentrant is repeatable",
             "neither alone changes code, creates a head, or invalidates stable local reviews",
             "If resolving a finding changes code",
         ):
@@ -3975,7 +3977,19 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "never repeat the comment post in that epoch", normalized_prompts.lower()
         )
         self.assertIn("never authorizes another post", normalized_prompts.lower())
-        self.assertIn("needs no repository predeclaration", normalized_prompts.lower())
+        self.assertIn(
+            "`recovery_operation_contract` anchored outside the candidate range",
+            normalized_prompts.lower(),
+        )
+        self.assertIn(
+            "explicitly declares that operation idempotent or reentrant",
+            normalized_prompts.lower(),
+        )
+        self.assertIn(
+            "tuple equality identifies a repeat; it never creates repeat safety",
+            normalized_prompts.lower(),
+        )
+        self.assertIn("leaves recovery read-only", normalized_prompts.lower())
         self.assertIn("changed scope", normalized_prompts.lower())
         self.assertIn("ordinary confirmation", normalized_prompts.lower())
 
@@ -3987,6 +4001,8 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "same exact `@codex review` POST may be repeated",
             "idempotent delivery retry",
             "repository-predeclared",
+            "needs no repository predeclaration",
+            "repetition of that same tuple is idempotent",
         ):
             self.assertNotIn(retired, contracts + "\n" + prompts)
 

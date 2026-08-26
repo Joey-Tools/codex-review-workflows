@@ -1243,6 +1243,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("github-synthetic-merge", normalized)
         self.assertIn("check_subject_sha", normalized)
         self.assertIn("generic successful check", normalized)
+        self.assertIn("trust anchor", normalized)
+        self.assertIn("outside the candidate range", normalized)
+        self.assertIn("candidate-head contract bytes", normalized)
+        self.assertIn("merge_status_candidate_range_exclusion_receipt", authority)
+        self.assertIn("non-head candidate commit", normalized)
+        self.assertIn("does not provide a production merge-status consumer", normalized)
         self.assertIn(
             "no positive basis bypasses the complete unresolved-finding scan",
             normalized,
@@ -1282,6 +1288,11 @@ class RepositoryContractTest(unittest.TestCase):
             "same active thread",
             "never create a new conversation",
             "identifiers only",
+            "`recovery_operation_contract`",
+            "idempotent or reentrant",
+            "tuple equality",
+            "outside the candidate range",
+            "candidate-head workflow or contract bytes",
         ):
             self.assertIn(anchor, normalized)
         self.assertIn("There is no retry-count ceiling", probes)
@@ -1297,6 +1308,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Never reconcile an explicit review finding", probes)
         self.assertIn("Do not hard-code a workflow filename", probes)
         self.assertIn("cancel pending automation", probes.lower())
+        self.assertNotIn(
+            "treats repetitions of that same tuple as idempotent", normalized
+        )
+        self.assertNotIn("no repository-specific idempotency", normalized)
 
     def test_base_machine_schema_and_old_github_receipt_policy_are_retired(
         self,

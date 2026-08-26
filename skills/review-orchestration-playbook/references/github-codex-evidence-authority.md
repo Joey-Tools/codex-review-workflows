@@ -384,8 +384,13 @@ Evaluate the following bases in order:
 
 The first basis is preferred when it exists because repositories commonly
 aggregate the review into a merge-oriented check. Association requires an
-independently parent-verified repository contract; never guess a workflow,
-check name, App identity, check subject, or producer semantics. The raw evidence
+independently parent-verified repository contract plus a closed parent-owned
+trust anchor whose source is outside the candidate range; never guess a
+workflow, check name, App identity, check subject, producer semantics, or
+source authority. The trust anchor may bind the exact current target-branch
+baseline, an installed trusted release, or another parent-pinned source proved
+outside the candidate range. Candidate-head contract bytes are review input,
+not producer authority. The raw evidence
 must bind exact App, workflow, run, attempt, check suite, check run, check name,
 status, conclusion, feature head, and check-subject identities to that contract.
 The contract itself must say that `completed` / `success` means GitHub Codex
@@ -491,8 +496,10 @@ a malformed join, or an unstable snapshot cannot use this basis.
 `resolved-inline-awaiting-clean` never completes the lane and never satisfies
 the required latest-current-head terminal-clean conjunction. Because the
 terminal artifact also excludes reaction fallback, recovery may reconcile the
-same head by idempotently rerunning the repository Action under the retry
-policy to obtain a later accepted clean comment or review.
+same head only when a candidate-range-external closed trusted recovery contract
+explicitly declares the exact repository Action operation idempotent or
+reentrant under the retry policy. Otherwise recovery remains read-only while
+awaiting a later accepted clean comment or review.
 
 An `APPROVED` review is not clean when an associated provider inline comment
 contains a finding. A clean body never overrides an unresolved thread finding.
@@ -621,8 +628,10 @@ observation may remain pending while another read is meaningful, but reaction
 fallback cannot use an unproved request identity. Without an independently
 accepted terminal basis, exhausted observation becomes `inconclusive` with
 `last_reason: request-delivery-unproven`. Only an independently authorized
-exact Actions tuple may use idempotent reconcile and backoff; that authority
-never extends to comment creation.
+exact Actions operation whose closed trusted recovery contract is anchored
+outside the candidate range and explicitly declares the operation idempotent
+or reentrant may use reconcile mutation and backoff; an equal tuple alone is
+not enough, and this authority never extends to comment creation.
 
 Any visible duplicate remains part of the same logical review lane and is
 reported as an audit warning. An observed duplicate never authorizes another
@@ -641,7 +650,10 @@ Absent evidence, transport failure, a timeout, a cancelled or skipped run,
 free-form provider failure prose, or unknown identity is not a pass. Keep the
 lane `pending` only while typed GitHub state or a documented repository
 contract supplies a machine-decidable retryable pending or infrastructure
-reason. A stable malformed snapshot, scope contradiction, unknown
+reason. A state-changing retry additionally requires the exact operation's
+closed trusted recovery contract to be anchored outside the candidate range
+and to declare that operation idempotent or reentrant; without it, polling
+remains read-only. A stable malformed snapshot, scope contradiction, unknown
 free-form-only failure, or other non-retryable inconclusive state terminates
 recovery and is reported immediately as `inconclusive`. Recovery policy is
 defined in [github-pr-probes.md](github-pr-probes.md).
@@ -664,7 +676,7 @@ required checks can still block overall PR readiness.
 
 ## Required Report
 
-Record compact, reproducible evidence. The normative executable shape is
+Record compact, reproducible evidence. The normative machine-readable reference shape is
 `required_report_schema` in the version-1 consumer resource above; the forms
 below are its human-readable projection. The PR-bound common envelope is:
 
@@ -834,11 +846,31 @@ evidence:
 ```
 
 Before accepting this shape, the consumer receives a separate closed
-parent-owned `merge_status_parent_contract` record; it must not derive that
-record from the report being validated. The record carries the four contract
+parent-owned `merge_status_parent_contract` record, a separately frozen closed
+`merge_status_contract_trust_anchor`, and a separate closed parent-owned
+`merge_status_candidate_range_exclusion_receipt`; it must not derive any of
+these inputs from the report being validated. The contract record carries the four contract
 descriptor strings (`source_repository`, `source_commit`, `source_path`, and
 `source_sha256`), trusted App ID and slug, exact workflow/run/attempt, check
-suite/name/run ID and URL, and exact closed provider-clean assertion. Compare
+suite/name/run ID and URL, and the exact closed provider-clean assertion. The
+anchor repeats the stable descriptor/App/workflow/check/assertion identity,
+freezes the candidate repository plus `merge_base_sha..feature_head_sha`, and
+uses one exact source relation: current target-branch baseline, installed
+trusted release outside the candidate range, or parent-pinned source outside
+the candidate range. The exclusion receipt joins the exact descriptor source
+to the candidate repository and `merge_base_sha..feature_head_sha`, records the
+complete byte-sorted unique commit-ID set for that range, and binds it with the
+exact typed count and SHA-256 of `commit-id + LF` rows. The reference consumer
+recomputes that digest and rejects a same-repository source commit found
+anywhere in the recorded range, including a non-head candidate commit. The
+target-baseline variant additionally requires the descriptor's repository and
+commit to equal the selected repository and exact current base tip. A
+separately trusted same-repository installed release at the base or earlier may
+pass because `base..head` excludes the base. This is a normative machine-readable
+reference and test contract; this repository does not provide a production
+merge-status consumer. Candidate-head content cannot create, amend, or self-prove
+these parent inputs.
+Compare
 every descriptor string by exact UTF-8 byte identity with the independently
 verified record and compare every remaining field type-preservingly. Coupled
 edits to the report's contract, App, run, check, assertion, or stable
@@ -912,6 +944,9 @@ This contract does not:
 - infer clean from silence, request count, `eyes`, or a generic successful
   check;
 - treat human resolution as provider-lane resolution;
-- treat non-idempotent comment creation as an idempotent Actions tuple;
+- infer repeat safety merely from equality of an Actions tuple;
+- accept candidate-head contract bytes as a merge-status or reconcile trust
+  anchor;
+- treat non-idempotent comment creation as a repeatable Actions operation;
 - define repository workflow files, status-check names, or rulesets; or
 - turn retries or duplicate requests into additional reviewers.

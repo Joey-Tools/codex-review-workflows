@@ -772,12 +772,17 @@ warning within the same logical review lane; it never authorizes another POST
 or counts as an additional lane. Provider evidence and
 workflow reconciliation follow
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
-For an authorized Actions recovery, freeze repository/PR/head, the dynamically
-identified Action or workflow, operation, and exact inputs. Repetition of that
-same tuple is idempotent and needs no repository predeclaration, but remains
-single-flight. A changed scope, Action, workflow, operation, or input set is a
-new mutation and requires ordinary confirmation. Never reconcile a substantive
-finding, test failure, or policy failure as infrastructure.
+For an authorized Actions recovery, first require a closed parent-owned
+`recovery_operation_contract` anchored outside the candidate range. It binds
+the exact repository/PR/head, dynamically identified Action or workflow, ref,
+operation, and inputs and explicitly declares that operation idempotent or
+reentrant. Freeze that exact tuple and join it type-preservingly to the trusted
+contract. Tuple equality identifies a repeat; it never creates repeat safety.
+Current mutation authorization and single-flight still apply. A missing,
+stale, candidate-sourced, or mismatched contract leaves recovery read-only. A
+changed scope, Action, workflow, ref, operation, or input set is a new mutation
+and requires ordinary confirmation. Never reconcile a substantive finding,
+test failure, or policy failure as infrastructure.
 
 ## Parent Classification
 
