@@ -772,17 +772,32 @@ warning within the same logical review lane; it never authorizes another POST
 or counts as an additional lane. Provider evidence and
 workflow reconciliation follow
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
-For an authorized Actions recovery, first require a closed parent-owned
-`recovery_operation_contract` anchored outside the candidate range. It binds
-the exact repository/PR/head, dynamically identified Action or workflow, ref,
-operation, and inputs and explicitly declares that operation idempotent or
-reentrant. Freeze that exact tuple and join it type-preservingly to the trusted
-contract. Tuple equality identifies a repeat; it never creates repeat safety.
-Current mutation authorization and single-flight still apply. A missing,
-stale, candidate-sourced, or mismatched contract leaves recovery read-only. A
-changed scope, Action, workflow, ref, operation, or input set is a new mutation
-and requires ordinary confirmation. Never reconcile a substantive finding,
-test failure, or policy failure as infrastructure.
+For an authorized Actions recovery, first validate the closed parent-owned
+`github-codex-recovery-operation-two-phase-v1` reference schema. Its preflight binds the
+exact repository/PR/frozen head, candidate-range-external source, candidate
+exclusion receipt, operation intent/inputs, trusted producer-implementation
+receipt, and complete dependency-edge resolution receipt. Existing-run reruns must retain and match their original
+`GITHUB_SHA`/`GITHUB_REF`; a generic branch-ref dispatch is forbidden. A new
+dispatch needs an immutable workflow plus closure-bound `expected_head_sha`
+live-PR-head gate before every side effect, joined to the actual closure entry.
+That resolution receipt exactly covers every canonical closure entry with
+parser/source digests, complete references, and bijective full-entry edges; its
+digest belongs to the stable snapshot. The separate completion receipt joins
+the preflight digest to a separate authenticated parent-owned platform
+observation for exact query endpoint, delivery/returned ID, closed run
+object/digest, and run/head/workflow/ref/job identities. Completion fields
+cannot self-attest. Tuple equality never creates repeat safety, and mutation authorization
+remains separate. Stop mutations at provider/contract caps while hourly
+status-only monitoring may continue without a time ceiling. Never reconcile a
+substantive finding, test failure, policy failure, or comment creation as
+infrastructure.
+Guarded dispatch is eligible only with API version `2026-03-10`, exact POST
+endpoint and semantic `{ref, inputs: inputs_object}` body, HTTP 200, and closed `{workflow_run_id, run_url, html_url}`
+response/digest whose canonical ID and URLs join delivery and observation.
+Older or detail-free responses are status-only; never use correlation tokens.
+Project the sorted unique name/value intent list into a nonempty inputs object
+and digest the RFC 8785 semantic body; never digest the list representation or
+claim unrecorded transport bytes.
 
 ## Parent Classification
 

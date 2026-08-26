@@ -103,7 +103,17 @@ The intended current policy is:
   range may supply that anchor; a contract introduced by the candidate head
   cannot. Require a separate parent-owned, digest-bound receipt for the complete
   `merge_base..head` commit set and reject any same-repository contract source
-  found anywhere in that set, not only the head. A `feature-head` contract reports only latest-feature-head coverage;
+  found anywhere in that set, not only the head. Also require a parent-owned
+  producer-implementation receipt that joins the exact run/check identities to
+  platform-authenticated workflow SHA/ref/job identity and a complete immutable
+  closure of every workflow, reusable action, and script capable of deciding
+  clean. A separate parent-owned anchored resolver must emit records that
+  exactly cover every canonical closure entry, bind parser/source digests and
+  complete discovered references, and project one full-entry edge per
+  reference; bind its receipt digest into the stable snapshot basis.
+  Candidate-range implementation bytes, an unbound actual run, or an
+  external App without equivalent provider-authenticated immutable identity
+  cannot pass. A `feature-head` contract reports only latest-feature-head coverage;
   a `github-synthetic-merge` contract may report current-merge-scope coverage
   only while every base/merge/subject binding remains stable. With zero
   applicable unresolved findings, this basis passes independently and does not
@@ -138,24 +148,49 @@ Only a machine-decidable retryable pending or infrastructure reason enters
 automatic recovery. A stable malformed snapshot, scope contradiction, or
 other non-retryable inconclusive result terminates recovery and is reported
 immediately. For a retryable reason, prefer the smallest associated recovery.
-Before any repeated Actions mutation, require a closed parent-owned
-`recovery_operation_contract` whose source is independently anchored outside
-the candidate range. It must bind one exact repository/PR/head, dynamically
-identified Action or workflow, ref, operation, and exact inputs, and explicitly
-declare that exact operation idempotent or reentrant. Equality of a frozen
-tuple is an identity check, never proof of safe repetition; a candidate-head
-workflow or contract cannot grant that authority. The current task must also
-authorize the external mutation. Issue-comment creation is never eligible.
-Keep recovery status-only when the trusted contract, exact match, or
-authorization is absent. A different scope, Action, workflow, ref, operation,
-or input set is a new mutation and requires ordinary confirmation.
+Before any Actions mutation, validate a closed parent-owned
+`github-codex-recovery-operation-preflight-v1` reference contract. It binds one
+exact repository/PR/frozen head, source trust anchor, candidate-range exclusion
+receipt, dynamically identified workflow/run/ref/operation/inputs, and trusted
+producer-implementation receipt identity plus a complete resolved dependency
+edge receipt, and independently declares the exact operation idempotent or
+reentrant. Existing-run reruns are eligible only when
+the platform-authenticated original head, ref, workflow SHA, and run/check
+identity match; GitHub reruns retain the original `GITHUB_SHA` and `GITHUB_REF`.
+Never use generic `gh workflow run --ref <current-head-branch>` as a head
+binding. A new dispatch requires an immutable workflow closure whose resolved
+dependency edges bind the actual gate implementation, plus a closure-bound
+`expected_head_sha` gate that rereads the live PR head and aborts before any
+side effect on mismatch. The preflight contains no returned or observed run
+fields. After dispatch, separately validate a completion receipt with profile
+`github-codex-recovery-operation-completion-v1` that joins the preflight digest
+to a separate closed parent-owned authenticated platform observation. That
+observation binds the exact API query endpoint, proved delivery and returned
+run, closed run object/digest, and actual repository, head, workflow SHA/ref,
+run ref, and job-workflow identity. Completion fields cannot self-attest.
+For guarded dispatch, v1 accepts only the exact REST contract with
+`X-GitHub-Api-Version: 2026-03-10`, the exact POST endpoint and semantic body,
+HTTP 200, and
+a closed `{workflow_run_id, run_url, html_url}` response with canonical digest
+and URLs/ID joined to delivery and observation. Older or detail-free responses
+remain status-only; there is no correlation-token alternative.
+The semantic body is exactly `{ref, inputs}` where `inputs` is the unique object
+projection of the sorted name/value intent list, never that list itself; v1
+guarded dispatch always sends the nonempty inputs object. Its digest is RFC 8785
+canonical JSON, not a claim about unrecorded transport byte serialization.
+Equality of a tuple never
+creates repeat safety.
+Current mutation authorization remains separate. Issue-comment creation is
+never eligible. Missing proof leaves recovery status-only.
 Never reconcile an explicit code finding, test failure, or policy failure as
 infrastructure.
 
 While that exact reason remains machine-decidably retryable, use one
 single-flight recovery schedule: 1, 2, 4, 8, 16, 32, then 60 minutes, followed
-by hourly retries without a fixed attempt limit. Report to the user when the
-delay first reaches 60 minutes and keep recovery pending. Apply the
+by hourly monitoring without a time limit. Report to the user when the delay
+first reaches 60 minutes and keep recovery pending. Mutation attempts stop at
+the platform/provider or stricter contract cap, including GitHub's total rerun
+maximum of 50; monitoring remains hourly afterward. Apply the
 repository's private-run cost budget; when it is exhausted, poll status only
 until a low-frequency retry is allowed. Public repositories may retry more
 freely within the same authorization boundary. Prefer an Automation that

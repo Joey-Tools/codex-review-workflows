@@ -3956,14 +3956,14 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "exact typed GraphQL thread resolution",
             "later trustworthy provider correction",
             "machine-decidable transient pending or infrastructure reason",
-            "require a closed parent-owned `recovery_operation_contract` anchored outside the candidate range",
-            "explicitly declares that exact operation idempotent or reentrant",
-            "tuple identifies the attempted repeat but never proves repeat safety",
-            "current mutation authorization and single-flight are still required",
+            "validate the versioned closed parent-owned `github-codex-recovery-operation-two-phase-v1` reference schema",
+            "existing-run reruns retain and must match their original `GITHUB_SHA`/`GITHUB_REF`",
+            "generic branch-ref dispatch is forbidden",
+            "status-only hourly monitoring, which has no time ceiling",
             "at most one possibly delivered exact `@codex review` issue-comment POST",
             "An ambiguous POST outcome consumes the comment-mutation budget",
             "never repeat the comment POST in that epoch",
-            "Only the separately authorized exact repository-Action operation whose candidate-range-external trusted contract explicitly declares it idempotent or reentrant is repeatable",
+            "Only a separately authorized exact repository-Action operation accepted by the versioned recovery contract",
             "neither alone changes code, creates a head, or invalidates stable local reviews",
             "If resolving a finding changes code",
         ):
@@ -3978,20 +3978,19 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         )
         self.assertIn("never authorizes another post", normalized_prompts.lower())
         self.assertIn(
-            "`recovery_operation_contract` anchored outside the candidate range",
+            "`github-codex-recovery-operation-two-phase-v1` reference schema",
             normalized_prompts.lower(),
         )
         self.assertIn(
-            "explicitly declares that operation idempotent or reentrant",
+            "existing-run reruns must retain and match their original",
             normalized_prompts.lower(),
         )
         self.assertIn(
-            "tuple equality identifies a repeat; it never creates repeat safety",
+            "tuple equality never creates repeat safety",
             normalized_prompts.lower(),
         )
-        self.assertIn("leaves recovery read-only", normalized_prompts.lower())
-        self.assertIn("changed scope", normalized_prompts.lower())
-        self.assertIn("ordinary confirmation", normalized_prompts.lower())
+        self.assertIn("status-only monitoring", normalized_prompts.lower())
+        self.assertIn("separate completion receipt", normalized_prompts.lower())
 
         for retired in (
             "Explicit provider findings block.",

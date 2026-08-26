@@ -3,7 +3,7 @@ id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
 status: completed
 created: 2026-08-22
-updated: 2026-08-26
+updated: 2026-08-27
 branch: review-orchestration-simplification
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/108
 supersedes: [20260807-wme001, 20260805-wpe001]
@@ -2023,6 +2023,38 @@ superseded_by:
   named-lane module, 83-test GitHub/local-contract matrix, Ruff lint/format,
   JSON parsing, skill validation, project-journal validation, and whitespace
   checks also passed.
+- Signed checkpoint `8d62cbc22c6078f3f3b5e8b5f7ac29dd2a2790a0`
+  then received a completely fresh, ephemeral GPT-5.6 Sol Ultra review of
+  `a439793df9483943991c258e16f4ddf705736643..8d62cbc22c6078f3f3b5e8b5f7ac29dd2a2790a0`
+  from an independent workspace prepared by immutable control release
+  `f9e596f458a119fa88b89789c24c2290c37b4857`. Materialize and every
+  pre/post validation agreed on two commits, one parent edge, parent-graph
+  SHA-256
+  `e89fcd746f44d76afc770661daccd6e414c246e08a166e0281ea21f379f774b2`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 8,343-byte prompt SHA-256 was
+  `632ca52e7a3215e8f798900c850eeb4c9ef7522052a44478ed8746e88399e3a3`;
+  the terminal artifact SHA-256 was
+  `6bd08a31a31ce5911cd126e43a1f72143327be139e36cfec595571778b7f497c`
+  after 497,693 reviewer tokens. A first outer-sandbox launch failed before
+  model startup because Codex could not open its state database; it produced
+  no terminal artifact and does not count as a lane.
+- The valid review found three more GitHub contract gaps, so `8d62cbc` is not
+  a clean checkpoint. A merge-status pass still bound a trusted declaration
+  without proving which workflow revision and transitive producer code the
+  actual run executed. The guarded recovery text still illustrated
+  `workflow_dispatch` against a mutable feature-branch ref, which cannot
+  atomically bind the frozen head. Finally, `recovery_operation_contract`
+  remained prose rather than a versioned closed schema and reference consumer.
+  The remediation therefore binds actual producer implementation evidence,
+  removes unguarded mutable-ref dispatch, admits an existing-run rerun only
+  after its original head and implementation are bound, requires an immutable
+  trusted guarded-dispatch implementation with a pre-side-effect exact-head
+  check for new runs, and adds a closed machine-readable recovery contract
+  plus candidate-range exclusion and negative tests. GitHub's documented
+  maximum of 50 reruns limits state-changing rerun attempts; monitoring itself
+  may continue hourly without a fixed limit.
 - The exact GitHub rule name remains **Require branches to be up to date before
   merging**, distinct from **Require linear history**. If freshness blocks and
   no merge queue owns the update, merge the current base into the feature
@@ -2030,6 +2062,74 @@ superseded_by:
   GitHub, CI, conversation, policy, and final-reread gates. Intermediate merge
   commits are valid members of `base..head`; neither this recovery nor the
   workspace contract requires linear history.
+- The `8d62cbc` findings were closed through parent-owned evidence rather than
+  another candidate assertion. A preferred merge/status pass now joins the
+  exact dynamic App/workflow/run/check identities to platform-authenticated
+  run and job workflow identities, parsed workflow references, and a complete
+  immutable implementation closure. A separately anchored dependency resolver
+  records one exact source-resolution result for every canonical
+  repository/commit/path/kind/blob entry, including an explicit empty
+  reference list, and derives the complete edge set in both directions. The
+  stable PR snapshot binds both implementation and resolution receipt digests.
+  Candidate-range workflow or dependency bytes, root-only closure omission,
+  self-declared `complete`, forged raw references, and identical blobs at
+  distinct paths all fail closed. An external App without equivalent
+  provider-authenticated immutable implementation identity cannot use the
+  merge/status basis and falls back to terminal provider evidence.
+- Resolver source trust is relation-specific rather than merely "not in the PR
+  range." A target-branch baseline must be the exact current base tip, a
+  parent-fixed external source must be in another repository, and an installed
+  trusted release must carry an independent parent-owned manifest/provenance
+  receipt. This prevents a same-repository off-range commit created by a
+  candidate author from becoming its own resolver authority.
+- GitHub recovery is a closed two-phase contract. The preflight contains no
+  returned-run or observed-run fields and binds the exact repository, PR,
+  frozen head, operation intent, repeat-safety declaration, trusted producer
+  implementation, resolved dependency closure, and a closure-bound
+  pre-side-effect `expected_head_sha` gate. An existing-run rerun additionally
+  joins the original platform run, `GITHUB_SHA`, `GITHUB_REF`, workflow SHA/ref,
+  and job workflow identity; GitHub's rerun preserves those original values.
+  The completion receipt cannot authorize a mutation retroactively and is
+  accepted only when a separate parent-owned authenticated platform
+  observation joins the accepted preflight and exact operation identity.
+- Guarded new dispatch deliberately targets GitHub's current documented REST
+  contract instead of guessing a run from time or similar metadata. Under API
+  version `2026-03-10`, the exact workflow-dispatch POST must return HTTP 200
+  with a closed `workflow_run_id`, `run_url`, and `html_url` response. The
+  delivery receipt binds that response, canonical URLs, the exact endpoint,
+  semantic request body `{ref, inputs}` and its RFC 8785 digest, and an
+  independently frozen expected receipt digest. The observation queries the
+  returned `run_url` and every completion field joins that exact run. A 204
+  response, an older/detail-free API, a mutable-ref-only claim, malformed wire
+  body, changed URL/ID, or coupled substitution remains status-only. This
+  preserves automatic recovery when GitHub supplies atomic run details without
+  turning approximate discovery into authority.
+- Repeat safety and mutation authority remain separate. Equality of an
+  operation tuple identifies a requested repeat but does not make arbitrary
+  Actions idempotent or reentrant. Only a candidate-range-external closed
+  recovery contract may declare repeat safety, and the current task must still
+  authorize the mutation. Mutation attempts stop at provider or contract caps,
+  including GitHub's total rerun maximum of 50; read-only monitoring continues
+  on the `1/2/4/8/16/32/60` minute then hourly schedule without a terminal time
+  ceiling. Private repositories retain cost throttling, public repositories may
+  retry more freely within the same authority, Automation wakes the active
+  thread when available, and cancellable hourly waiting remains the fallback.
+- No new instruction, tombstone, or navigation points at the retired
+  supplied-diff review helper. The active skill describes only the clean
+  independent workspace and current local/GitHub lane contracts; unadvertised
+  compatibility internals remain outside named review shapes.
+- Four rounds of coupled-mutation audit progressively rejected forged
+  producer references, root-only and empty-edge closure claims, fake source
+  anchors, arbitrary existing-run refs, unbound gate entries, pre/post phase
+  conflation, substituted dispatch runs, incomplete REST response envelopes,
+  and the internal-list-versus-API-object request-body mismatch. The final
+  independent focused audit returned `CLEAN`; the combined contract/carrier/
+  recovery/local-lane matrix passed all 86 tests. The authoritative outer-
+  environment warning-strict whole-skill suite then passed all 3,225 tests with
+  six conditional skips in 1,487.224 seconds. The GitHub Action/status/ruleset
+  thread remains responsible for the production producer and consumer; this
+  workstream supplies its closed skill-facing evidence contract and test-only
+  reference validators without claiming they are the deployed integration.
 
 ## Next Steps
 
@@ -2077,8 +2177,9 @@ superseded_by:
   tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`81` focused policy, distribution, carrier, report, and self-policy
-  contracts).
+  matrix (`86` focused policy, distribution, carrier, report, recovery, and
+  self-policy contracts), followed by the complete `3,225`-test suite with six
+  conditional skips in `1,487.224` seconds.
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
   parse; source-only Python compile; Ruff lint; Markdown relative-link check;

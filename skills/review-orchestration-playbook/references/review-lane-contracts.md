@@ -643,7 +643,17 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   parent-owned receipt binds the exact source to the complete digest-bound
   `merge_base..head` commit set; the reference consumer rejects a
   same-repository source at any member of that set, including a non-head
-  candidate commit. With zero applicable
+  candidate commit. A separate parent-owned implementation receipt joins the
+  exact dynamic run/check identities to platform-authenticated workflow
+  SHA/ref/job identity and a complete immutable transitive closure of every
+  workflow, reusable action, and script capable of deciding clean. Candidate
+  bytes cannot close that set by assertion: a separate anchored parent-owned
+  resolver supplies exact canonical-entry coverage records and a bijective
+  full-entry dependency-edge projection, and the stable snapshot binds its
+  independent receipt digest. Candidate
+  implementation bytes, an unbound actual run, or an external App without
+  equivalent provider-authenticated immutable identity makes merge-status
+  unavailable. With zero applicable
   unresolved findings it passes without a second terminal clean artifact.
   Generic successful checks and service-start markers do not qualify.
 - A trustworthy terminal clean provider comment/review at the latest head plus
@@ -667,17 +677,33 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   infrastructure reason. A stable malformed snapshot, scope contradiction, or
   other non-retryable inconclusive state stops recovery; code findings, test
   failures, and policy failures are never reconciled as infrastructure.
-- Before a repeated mutation, require a closed parent-owned
-  `recovery_operation_contract` anchored outside the candidate range. It binds
-  the exact repository/PR/head, dynamically identified Action or workflow,
-  ref, operation, and inputs and explicitly declares that exact operation
-  idempotent or reentrant. A type-preservingly equal tuple identifies the
-  attempted repeat but never proves repeat safety, and candidate-head workflow
-  bytes cannot supply the contract. Current mutation authorization and
-  single-flight are still required. A missing, stale, candidate-sourced, or
-  mismatched contract leaves recovery as read-only status polling; a changed
-  scope, Action, workflow, ref, operation, or input set requires ordinary
-  confirmation.
+- Before a mutation, validate the versioned closed parent-owned
+  `github-codex-recovery-operation-two-phase-v1` reference schema. Its preflight binds the
+  exact repository/PR/frozen head, source anchor, candidate-range exclusion,
+  operation intent and inputs, trusted producer-implementation identity, and
+  complete dependency-edge resolution receipt, while
+  declaring repeat safety independently of authorization. Existing-run reruns
+  retain and must match their original `GITHUB_SHA`/`GITHUB_REF`; mutation
+  attempts stop at the provider or contract cap. Generic branch-ref dispatch is
+  forbidden. A dispatch is eligible only with a closure-bound
+  `expected_head_sha` pre-side-effect live-PR-head gate joined to the actual
+  closure entry. Its separate completion receipt joins the preflight digest to
+  a separate authenticated parent-owned platform observation binding the exact
+  query endpoint, delivery/returned ID, closed run object/digest, actual head,
+  workflow SHA/ref, run ref, and job identity; completion fields do not
+  self-attest.
+  Guarded-dispatch v1 requires API version `2026-03-10`, exact POST endpoint
+  and semantic `{ref, inputs: inputs_object}` body, HTTP 200, and a closed
+  `{workflow_run_id, run_url, html_url}` response/digest whose ID and canonical
+  URLs join delivery and observation. Older or detail-free responses remain
+  status-only; no correlation-token alternative is accepted.
+  `inputs_object` is the unique nonempty object projection of the sorted
+  name/value intent list. The digest covers RFC 8785 semantic JSON, not the list
+  or unrecorded transport bytes.
+  Missing or mismatched proof leaves
+  status-only hourly monitoring, which has no time ceiling. Current mutation
+  authorization and single-flight remain separate; comment creation is never
+  repeatable.
 
 The evidence authority owns exact identities, pagination, terminal selection, reaction fallback, retry state, and report fields.
 
@@ -705,9 +731,10 @@ observation while recovery can make progress, and eventually report
 `inconclusive` / `request-delivery-unproven`; never repeat the comment POST in
 that epoch. A visible duplicate is an
 audit warning within the same logical lane and never authorizes another write.
-Only the separately authorized exact repository-Action operation whose
-candidate-range-external trusted contract explicitly declares it idempotent or
-reentrant is repeatable under the recovery policy.
+Only a separately authorized exact repository-Action operation accepted by the
+versioned recovery contract's frozen-head, implementation, operation-kind, and
+repeat-safety gates may mutate under the recovery policy. Mutation attempts
+stop at provider/contract caps; status-only monitoring may continue hourly.
 
 ## Outcome Vocabulary
 

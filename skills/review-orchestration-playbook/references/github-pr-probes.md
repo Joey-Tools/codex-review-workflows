@@ -171,11 +171,17 @@ subject only through the verified producer contract:
    If it declares `feature-head`, require the subject SHA to equal
    `headRefOid` and make no base-coverage claim.
 4. Follow the associated run URL or API identity to the exact workflow run and
-   jobs.
+   jobs. For GitHub Actions, retain platform-authenticated `workflow_sha`,
+   `workflow_ref`, and every job workflow identity. Independently enumerate the
+   immutable workflow blob plus every transitive local or reusable
+   workflow/action/script dependency capable of deciding clean. For an external
+   App, require equivalent provider-authenticated immutable implementation
+   identity and complete closure or make merge-status unavailable.
 5. Preserve the App ID/slug, workflow ID, run ID/attempt, check-suite ID, check
    ID/name/URL, feature head, base ref/tip, merge base, subject kind/SHA,
    status, conclusion, server time, producer-contract descriptor, and its
-   candidate-range-external trust anchor and candidate-range exclusion receipt.
+   candidate-range-external trust anchor, candidate-range exclusion receipt,
+   and producer-implementation receipt digest.
 
 A name substring is a hint for discovery, not proof. A check attached to an
 older head, a generic App success, or a run found only by static name guessing
@@ -186,7 +192,13 @@ positive GitHub-lane basis, while still enumerating unresolved Codex-provider
 findings. Its independently verified contract and candidate-range-external
 source anchor must define successful completion as
 `github-codex-provider-clean`, require zero unresolved applicable findings,
-and declare either `latest-feature-head` or `current-merge-scope`. The former
+declare either `latest-feature-head` or `current-merge-scope`, and bind the
+actual run to the candidate-range-external immutable implementation closure.
+Require a separate anchored parent-owned resolver and resolution receipt whose
+records exactly cover every canonical closure entry with parser/source digests
+and complete discovered references, and whose full-entry edges are the exact
+bijective reference projection. Bind its digest into the stable snapshot.
+Candidate-controlled workflow/dependency bytes or an unbound run cannot pass. The former
 does not prove the PR base. The latter additionally requires the exact synthetic
 subject and current base/merge bindings above. Ordinary readiness still
 validates base and merge base locally. A generic successful check or
@@ -266,49 +278,86 @@ a test failure, lint failure, policy failure, or other substantive negative
 result. Those require resolution, a fix, or an explicit policy decision.
 
 Before an Actions mutation, obtain one closed parent-owned
-`recovery_operation_contract` from a source independently anchored outside the
-candidate range. The contract must bind the exact repository, PR, head,
-dynamically identified Action or workflow, ref, operation, and exact inputs,
-and must explicitly classify that exact operation as idempotent or reentrant.
-Accepted source relationships are the exact target-branch baseline, an
-installed trusted release, or another parent-pinned source proved outside the
-candidate range. Candidate-head workflow or contract bytes cannot grant repeat
-authority.
+`recovery_operation_preflight` from a source independently anchored outside the
+candidate range and validate it against
+`github-codex-recovery-operation-two-phase-v1` in
+`github-codex-terminal-carriers-v1.json`. This is a machine-readable reference
+and test-only validator contract; the production GitHub consumer belongs to the
+separate Actions/status implementation. The contract binds the exact
+repository, PR, frozen head, dynamically identified workflow/run/ref,
+operation intent, exact inputs, trusted producer-implementation receipt
+identity, complete dependency-edge resolution receipt, and candidate-range
+exclusion receipt, and explicitly classifies that operation as
+idempotent or reentrant independently of mutation authorization. Accepted
+source relationships are the exact target-branch baseline, an installed
+trusted release, or another parent-pinned source proved outside the candidate
+range. Candidate-head workflow or contract bytes cannot grant repeat authority.
 
-Only after that proof, freeze the exact recovery tuple and join it
-type-preservingly to the contract. Tuple equality identifies a requested
-repeat; it does not make an operation idempotent or reentrant. The current task
-must still authorize the external mutation. When the trusted contract, exact
-join, or authorization is absent, keep the recovery owner in status-only mode,
-poll the scoped evidence on the schedule below, and report the missing gate
-instead of triggering the workflow. This repeat authority never applies to
-GitHub comment creation; the one-shot comment-mutation budget above remains
-consumed after any possibly delivered create-comment call.
+Only after that proof, freeze the exact recovery operation and join it
+type-preservingly to the contract. Equality identifies a requested repeat; it
+does not make an operation idempotent or reentrant. The current task must still
+authorize the external mutation. When the trusted contract, exact join, or
+authorization is absent, keep the recovery owner in status-only mode, poll the
+scoped evidence on the schedule below, and report the missing gate instead of
+triggering the workflow. This repeat authority never applies to GitHub comment
+creation; the one-shot comment-mutation budget above remains consumed after any
+possibly delivered create-comment call.
 
-After the tuple and authorization are established, choose the smallest
+After the contract and authorization are established, choose the smallest
 operation that can recover the machine-decidable retryable state:
 
-1. Retry failed jobs when the associated run exists and only jobs failed.
-2. Rerun the full associated run for a run-level infrastructure failure or a
-   broken aggregate that cannot be repaired by failed-job rerun.
-3. Dispatch a new run only for missing, stale, or aggregation-only state, and
-   only after dynamic discovery proves the exact workflow and required inputs.
+1. Retry failed jobs only on an exact existing run whose
+   platform-authenticated head, ref, workflow SHA, implementation closure, and
+   run/check identities equal the frozen contract. GitHub reruns retain that
+   run's original `GITHUB_SHA` and `GITHUB_REF`; do not substitute a live branch
+   ref.
+2. Rerun the full exact existing run under the same binding for a run-level
+   infrastructure failure or broken aggregate. Stop mutation attempts at the
+   provider or contract cap; GitHub's total rerun limit is 50. Hourly monitoring
+   remains unlimited after mutation eligibility is exhausted.
+3. A new `workflow_dispatch` is eligible only when the trusted immutable
+   workflow revision contains a closure-bound pre-side-effect gate accepting
+   exact `expected_head_sha`, rereading the live selected-PR head, and aborting
+   before every side effect on mismatch. `workflow_dispatch.ref` accepts a
+   branch or tag name, so it is never proof of the frozen head. After dispatch,
+   bind the returned run ID and platform-observed actual head and workflow SHA
+   before treating the run as the same operation. Without machine proof of all
+   these properties, remain status-only. Preflight contains no returned or
+   observed run fields. After mutation, validate the separately closed
+   `github-codex-recovery-operation-completion-v1` receipt by joining its
+   preflight digest to a separate closed parent-owned authenticated platform
+   observation binding the exact query endpoint, proved delivery/returned ID,
+   closed run object/digest, and actual repository/head/workflow SHA/workflow
+   ref/run ref/job-workflow identity. Completion fields cannot self-attest.
+   Guarded-dispatch v1 additionally requires exact API version `2026-03-10`,
+   the exact POST endpoint and semantic request body, HTTP 200, and the closed
+   three-field response `{workflow_run_id, run_url, html_url}` plus its
+   canonical digest. The run ID and canonical API/HTML URLs must exactly join
+   delivery, observation, and completion. An older API or response without
+   returned run details is status-only; no correlation-token path exists.
+   Derive the semantic API body uniquely as `{ref: operation.ref, inputs:
+   inputs_object}`, where `inputs_object` maps the sorted unique name/value
+   intent list into an object. Guarded v1 always sends this nonempty object.
+   Digest its RFC 8785 canonical JSON; do not digest the internal list or claim
+   exact transmitted bytes without a separate serialization receipt.
+   Completion never retroactively authorizes mutation.
 
 Illustrative commands for an already authorized, trusted-contract-bound exact
-operation are:
+existing-run operation are:
 
 ```bash
 gh run rerun <run-id> --failed --repo <owner/repo>
 gh run rerun <run-id> --repo <owner/repo>
-gh workflow run <workflow-id> --repo <owner/repo> --ref <current-head-branch>
 ```
 
-Repository-specific inputs come from the trusted recovery contract. Never
-invent input names. Single-flight still applies: wait until the current attempt
-is terminal or proved lost before repeating the same contract-bound tuple. A
-different repository/PR/head scope, Action, workflow, ref, operation, or input
-set is not a retry of that tuple; stop and obtain ordinary confirmation before
-mutating it.
+The generic `gh workflow run --ref <current-head-branch>` pattern is forbidden.
+Repository-specific inputs and any guarded-dispatch invocation come only from
+the validated trusted recovery contract; never invent input names.
+Single-flight still applies: wait until the current attempt is terminal or
+proved lost before repeating the same contract-bound operation. A different
+repository/PR/head scope, workflow, run, ref, operation, input set,
+implementation receipt, or post-dispatch identity is not a retry of that
+operation; stop and obtain ordinary confirmation before mutating it.
 
 ## Retry Schedule And Cost Control
 
@@ -327,9 +376,12 @@ Use exponential backoff in minutes:
 1, 2, 4, 8, 16, 32, 60, 60, 60, ...
 ```
 
-There is no retry-count ceiling while the same reason remains
+There is no time ceiling on status-only monitoring while the same reason remains
 machine-decidably retryable. At 60 minutes, report the continuing delay to the
-user and then retry hourly without a terminal time ceiling. Reset the schedule
+user and then monitor hourly without a terminal time ceiling. An Actions
+mutation occurs at a scheduled wake only while its exact contract remains
+eligible and below the platform/provider or stricter contract cap; mutation
+attempts stop at that cap while hourly observation continues. Reset the schedule
 only after meaningful progress, such as a new run, new provider artifact,
 changed check conclusion, or new head. Crossing an hour is a reporting and
 cadence transition, not a reason to stop or declare the lane inconclusive;
@@ -342,7 +394,8 @@ proportionally when reliable job-cost data exists, otherwise conservatively as
 one. When the budget is exhausted, perform status-only hourly checks until the
 window recovers. Do not spend private Action minutes on repeated runs during a
 known service degradation. This budget throttles Action-consuming mutations;
-it never terminates status-only monitoring or imposes a retry-count ceiling.
+it never terminates status-only monitoring. It does not override a platform or
+contract mutation-attempt cap.
 
 Public repositories do not use the private-minute budget and may retry more
 frequently within the same backoff, single-flight, repository-contract, and
@@ -366,17 +419,13 @@ Do not convert a retryable recovery into `pass` or `inconclusive` merely because
 the active wait crossed an hour.
 
 Persistent monitoring does not expand authorization. A wake may always reread
-scoped evidence; it may repeat an Actions mutation only when the frozen
-recovery tuple is type-preservingly unchanged, its candidate-range-external
-trusted recovery contract still matches and explicitly declares the exact
-operation idempotent or reentrant, and the current mutation remains authorized.
-A new scope, Action, workflow, ref, operation, input set, branch or PR mutation,
-destination, or other materially different action requires ordinary
-confirmation.
-
-The schedule may repeat read-only probes and an authorized exact Actions
-operation only through its still-valid trusted recovery contract. It never
-repeats a create-comment POST.
+scoped evidence; it may repeat an Actions mutation only while the versioned
+recovery contract still binds the frozen head, exact operation, trusted
+implementation, expected-head gate when applicable, post-run identity, and
+repeat-safety declaration, the current mutation remains authorized, and the
+provider/contract attempt cap has not been reached. Any drift requires ordinary
+confirmation or status-only monitoring. The schedule never repeats a
+create-comment POST.
 
 ## Active Thread And Automation
 

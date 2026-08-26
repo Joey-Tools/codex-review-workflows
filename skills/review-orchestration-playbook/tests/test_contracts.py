@@ -1288,14 +1288,19 @@ class RepositoryContractTest(unittest.TestCase):
             "same active thread",
             "never create a new conversation",
             "identifiers only",
-            "`recovery_operation_contract`",
+            "`recovery_operation_preflight`",
+            "dependency-edge resolution receipt",
+            "completion receipt",
             "idempotent or reentrant",
-            "tuple equality",
+            "equality identifies a requested repeat",
             "outside the candidate range",
             "candidate-head workflow or contract bytes",
+            "expected_head_sha",
+            "total rerun limit is 50",
         ):
             self.assertIn(anchor, normalized)
-        self.assertIn("There is no retry-count ceiling", probes)
+        self.assertIn("no time ceiling on status-only monitoring", probes)
+        self.assertIn("mutation attempts stop at that cap", _normalize(probes))
         self.assertIn("At 60 minutes, report", probes)
         self.assertIn("For the first 60 minutes", probes)
         self.assertIn(

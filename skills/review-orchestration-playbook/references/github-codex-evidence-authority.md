@@ -390,7 +390,21 @@ workflow, check name, App identity, check subject, producer semantics, or
 source authority. The trust anchor may bind the exact current target-branch
 baseline, an installed trusted release, or another parent-pinned source proved
 outside the candidate range. Candidate-head contract bytes are review input,
-not producer authority. The raw evidence
+not producer authority. A separate closed parent-owned producer-implementation
+receipt joins the exact dynamic run/check identities to platform-authenticated
+`workflow_sha`, `workflow_ref`, and job workflow identity plus a complete
+immutable closure of the workflow blob and every transitive local or reusable
+workflow/action/script dependency capable of deciding clean. Every
+same-repository closure commit must be outside the complete candidate range. A
+separate parent-owned resolver-source anchor and dependency-resolution receipt
+must exactly cover every canonical closure entry, including parser/source
+digest and complete discovered-reference records, and bijectively project
+references to full-entry edges. Blob-only identity, root-only closure, or an
+unjustified empty edge set cannot pass; the stable snapshot binds the separate
+resolution receipt digest. A
+non-Actions App requires equivalent provider-authenticated immutable
+implementation identity and closure; otherwise merge-status is unavailable and
+terminal-clean fallback remains. The raw evidence
 must bind exact App, workflow, run, attempt, check suite, check run, check name,
 status, conclusion, feature head, and check-subject identities to that contract.
 The contract itself must say that `completed` / `success` means GitHub Codex
@@ -496,9 +510,29 @@ a malformed join, or an unstable snapshot cannot use this basis.
 `resolved-inline-awaiting-clean` never completes the lane and never satisfies
 the required latest-current-head terminal-clean conjunction. Because the
 terminal artifact also excludes reaction fallback, recovery may reconcile the
-same head only when a candidate-range-external closed trusted recovery contract
-explicitly declares the exact repository Action operation idempotent or
-reentrant under the retry policy. Otherwise recovery remains read-only while
+same head only when the versioned closed
+`github-codex-recovery-operation-two-phase-v1` reference schema first accepts a
+preflight binding the frozen head, trusted producer implementation, complete
+resolved dependency-edge closure, exact existing run or guarded-dispatch
+intent, and independently declared repeat safety. Existing-run reruns retain their
+original platform-authenticated SHA/ref; dispatch needs the trusted
+pre-side-effect `expected_head_sha` live-PR gate whose implementation entry is
+joined to that closure. A separate completion receipt then joins the preflight
+digest to a separate closed parent-owned authenticated platform observation
+for the exact query endpoint, proved delivery/returned ID, closed run object
+and digest, and run/head/workflow/ref/job identities. Completion fields cannot
+self-attest.
+Guarded dispatch is mutation-eligible only under API version `2026-03-10` with
+the exact POST endpoint and semantic body, HTTP 200, and closed
+`{workflow_run_id, run_url, html_url}` response and canonical digest. The ID
+and canonical URLs join the frozen delivery receipt and later observation.
+Older/detail-free dispatch responses are status-only; correlation tokens are
+not an accepted v1 substitute.
+The body is exactly `{ref, inputs: inputs_object}`; `inputs_object` is the
+unique object projection of the sorted name/value intent list and is nonempty
+for guarded v1. The body digest uses RFC 8785 semantic JSON and never the
+internal list representation or unrecorded transmitted bytes.
+Otherwise recovery remains read-only while
 awaiting a later accepted clean comment or review.
 
 An `APPROVED` review is not clean when an associated provider inline comment
@@ -628,10 +662,11 @@ observation may remain pending while another read is meaningful, but reaction
 fallback cannot use an unproved request identity. Without an independently
 accepted terminal basis, exhausted observation becomes `inconclusive` with
 `last_reason: request-delivery-unproven`. Only an independently authorized
-exact Actions operation whose closed trusted recovery contract is anchored
-outside the candidate range and explicitly declares the operation idempotent
-or reentrant may use reconcile mutation and backoff; an equal tuple alone is
-not enough, and this authority never extends to comment creation.
+exact Actions operation accepted by the versioned recovery contract may mutate;
+generic branch-ref dispatch is forbidden, mutation attempts stop at the
+provider/contract cap, and hourly read-only monitoring may continue without a
+time ceiling. An equal tuple alone is not enough, and this authority never
+extends to comment creation.
 
 Any visible duplicate remains part of the same logical review lane and is
 reported as an audit warning. An observed duplicate never authorizes another
@@ -650,10 +685,10 @@ Absent evidence, transport failure, a timeout, a cancelled or skipped run,
 free-form provider failure prose, or unknown identity is not a pass. Keep the
 lane `pending` only while typed GitHub state or a documented repository
 contract supplies a machine-decidable retryable pending or infrastructure
-reason. A state-changing retry additionally requires the exact operation's
-closed trusted recovery contract to be anchored outside the candidate range
-and to declare that operation idempotent or reentrant; without it, polling
-remains read-only. A stable malformed snapshot, scope contradiction, unknown
+reason. A state-changing retry additionally requires the exact operation to
+pass the versioned recovery contract's frozen-head, implementation, source,
+repeat-safety, and operation-kind gates; without it, polling remains read-only.
+A stable malformed snapshot, scope contradiction, unknown
 free-form-only failure, or other non-retryable inconclusive state terminates
 recovery and is reported immediately as `inconclusive`. Recovery policy is
 defined in [github-pr-probes.md](github-pr-probes.md).
@@ -847,9 +882,10 @@ evidence:
 
 Before accepting this shape, the consumer receives a separate closed
 parent-owned `merge_status_parent_contract` record, a separately frozen closed
-`merge_status_contract_trust_anchor`, and a separate closed parent-owned
-`merge_status_candidate_range_exclusion_receipt`; it must not derive any of
-these inputs from the report being validated. The contract record carries the four contract
+`merge_status_contract_trust_anchor`, a separate closed parent-owned
+`merge_status_candidate_range_exclusion_receipt`, and a closed parent-owned
+`merge_status_producer_implementation_receipt`; it must not derive any of these
+inputs from the report being validated. The contract record carries the four contract
 descriptor strings (`source_repository`, `source_commit`, `source_path`, and
 `source_sha256`), trusted App ID and slug, exact workflow/run/attempt, check
 suite/name/run ID and URL, and the exact closed provider-clean assertion. The
@@ -870,8 +906,14 @@ pass because `base..head` excludes the base. This is a normative machine-readabl
 reference and test contract; this repository does not provide a production
 merge-status consumer. Candidate-head content cannot create, amend, or self-prove
 these parent inputs.
-Compare
-every descriptor string by exact UTF-8 byte identity with the independently
+The implementation receipt binds the exact run, attempt, suite, and check-run
+IDs to platform-authenticated workflow SHA/ref/job identity and a digest-bound
+complete immutable implementation closure. Its receipt digest is included in
+the stable merge-status basis selection. Candidate-controlled workflow or
+dependency bytes, coupled edits to the report and receipts, or an actual run
+whose implementation is unbound cannot pass. These are reference-schema and
+test-only checks; the production Actions/status consumer remains outside this
+repository. Compare every descriptor string by exact UTF-8 byte identity with the independently
 verified record and compare every remaining field type-preservingly. Coupled
 edits to the report's contract, App, run, check, assertion, or stable
 association identities therefore fail even when the edited report remains
