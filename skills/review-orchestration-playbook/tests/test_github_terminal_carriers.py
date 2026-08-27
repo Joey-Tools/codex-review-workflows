@@ -744,6 +744,7 @@ class _ReportValidator:
             or report["head_sha"] != selection["head_sha"]
         ):
             return False
+
         if selection["outcome"] == "selected-pr":
             return self._positive_int(selection["pull_request"]) and self._full_sha(
                 selection["head_sha"]
@@ -1648,6 +1649,18 @@ class _ReportValidator:
         keys = [entry_key(entry) for entry in entries]
         if keys != sorted(keys) or len(keys) != len(set(keys)):
             return False
+        root_workflow_entries = (
+            [
+                entry
+                for entry in entries
+                if entry["kind"] == "workflow"
+                and entry["repository"] == receipt["workflow_repository"]
+                and entry["commit"] == receipt["workflow_sha"]
+                and entry["path"] == receipt["workflow_path"]
+            ]
+            if receipt["provider_kind"] == "github-actions"
+            else []
+        )
         candidate_commits = exclusion["candidate_commits"]
         if any(
             entry["repository"] == report["repository"]
@@ -1661,6 +1674,8 @@ class _ReportValidator:
                 receipt["attestation_source"] == "github-actions-api"
                 and parent_contract["app_slug"] == "github-actions"
                 and self._repository(receipt["workflow_repository"])
+                and receipt["workflow_repository"] == receipt["repository"]
+                and receipt["workflow_repository"] == report["repository"]
                 and self._safe_contract_path(receipt["workflow_path"])
                 and self._full_sha(receipt["workflow_sha"])
                 and ref_identity_matches(
@@ -1675,14 +1690,19 @@ class _ReportValidator:
                 and receipt["workflow_ref_identity"]["resolved_commit"]
                 == receipt["workflow_sha"]
                 and receipt["workflow_ref_identity"]["ref"] == receipt["run_ref"]
-                and receipt["external_implementation_id"] is None
-                and any(
-                    entry["kind"] == "workflow"
-                    and entry["repository"] == receipt["workflow_repository"]
-                    and entry["commit"] == receipt["workflow_sha"]
-                    and entry["path"] == receipt["workflow_path"]
-                    for entry in entries
+                and receipt["workflow_ref_identity"]["entry"]["kind"] == "workflow"
+                and len(root_workflow_entries) == 1
+                and self._type_preserving_equal(
+                    receipt["workflow_ref_identity"]["entry"],
+                    root_workflow_entries[0],
                 )
+                and (
+                    receipt["job_workflow_ref_identity"]["repository"]
+                    == report["repository"]
+                    or receipt["job_workflow_ref_identity"]["entry"]["kind"]
+                    == "reusable-workflow"
+                )
+                and receipt["external_implementation_id"] is None
             )
         if receipt["provider_kind"] == "external-app":
             return (
@@ -3144,7 +3164,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         implementation_closure = sorted(
             [
                 {
-                    "repository": "octo/review-gate",
+                    "repository": "octo/review-fixture",
                     "commit": "2222222222222222222222222222222222222222",
                     "path": ".github/workflows/codex-review.yml",
                     "blob_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
@@ -3153,8 +3173,22 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 {
                     "repository": "octo/review-gate",
                     "commit": "2222222222222222222222222222222222222222",
-                    "path": "scripts/decide-clean.sh",
+                    "path": ".github/workflows/reusable-review.yml",
                     "blob_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                    "kind": "reusable-workflow",
+                },
+                {
+                    "repository": "octo/review-gate",
+                    "commit": "2222222222222222222222222222222222222222",
+                    "path": "actions/verify/action.yml",
+                    "blob_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+                    "kind": "action",
+                },
+                {
+                    "repository": "octo/review-gate",
+                    "commit": "2222222222222222222222222222222222222222",
+                    "path": "scripts/verify.sh",
+                    "blob_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
                     "kind": "script",
                 },
             ],
@@ -3180,14 +3214,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "check_suite_id": cls.merge_status_parent_contract["check_suite_id"],
             "check_run_id": cls.merge_status_parent_contract["check_run_id"],
             "workflow_id": cls.merge_status_parent_contract["workflow_id"],
-            "workflow_repository": "octo/review-gate",
+            "workflow_repository": "octo/review-fixture",
             "workflow_path": ".github/workflows/codex-review.yml",
             "workflow_sha": "2222222222222222222222222222222222222222",
             "workflow_ref": (
-                "octo/review-gate/.github/workflows/codex-review.yml@refs/heads/feature/review"
+                "octo/review-fixture/.github/workflows/codex-review.yml@refs/heads/feature/review"
             ),
             "workflow_ref_identity": {
-                "repository": "octo/review-gate",
+                "repository": "octo/review-fixture",
                 "path": ".github/workflows/codex-review.yml",
                 "ref": "refs/heads/feature/review",
                 "resolved_commit": "2" * 40,
@@ -3195,15 +3229,15 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "entry_sha256": _canonical_json_sha256(implementation_closure[0]),
             },
             "job_workflow_ref": (
-                "octo/review-gate/.github/workflows/codex-review.yml@refs/heads/feature/review"
+                "octo/review-gate/.github/workflows/reusable-review.yml@refs/heads/feature/review"
             ),
             "job_workflow_ref_identity": {
                 "repository": "octo/review-gate",
-                "path": ".github/workflows/codex-review.yml",
+                "path": ".github/workflows/reusable-review.yml",
                 "ref": "refs/heads/feature/review",
                 "resolved_commit": "2" * 40,
-                "entry": copy.deepcopy(implementation_closure[0]),
-                "entry_sha256": _canonical_json_sha256(implementation_closure[0]),
+                "entry": copy.deepcopy(implementation_closure[1]),
+                "entry_sha256": _canonical_json_sha256(implementation_closure[1]),
             },
             "external_implementation_id": None,
             "implementation_closure_complete": True,
@@ -3235,7 +3269,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             cls.merge_status_dependency_resolver_anchor
         )
         workflow_entry = implementation_closure[0]
-        script_entry = implementation_closure[1]
+        reusable_entry = implementation_closure[1]
+        transitive_action_entry = implementation_closure[2]
+        transitive_script_entry = implementation_closure[3]
         resolution_records = [
             {
                 "source_entry": copy.deepcopy(workflow_entry),
@@ -3243,17 +3279,46 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "source_sha256": workflow_entry["blob_sha256"],
                 "discovered_references": [
                     {
-                        "reference": "scripts/decide-clean.sh",
-                        "target_entry": copy.deepcopy(script_entry),
+                        "reference": (
+                            "octo/review-gate/.github/workflows/reusable-review.yml"
+                            "@refs/heads/feature/review"
+                        ),
+                        "target_entry": copy.deepcopy(reusable_entry),
                     }
                 ],
                 "discovered_reference_count": 1,
                 "record_sha256": "",
             },
             {
-                "source_entry": copy.deepcopy(script_entry),
+                "source_entry": copy.deepcopy(reusable_entry),
                 "parser_profile": "github-actions-dependency-resolver-v1",
-                "source_sha256": script_entry["blob_sha256"],
+                "source_sha256": reusable_entry["blob_sha256"],
+                "discovered_references": [
+                    {
+                        "reference": "./actions/verify",
+                        "target_entry": copy.deepcopy(transitive_action_entry),
+                    }
+                ],
+                "discovered_reference_count": 1,
+                "record_sha256": "",
+            },
+            {
+                "source_entry": copy.deepcopy(transitive_action_entry),
+                "parser_profile": "github-actions-dependency-resolver-v1",
+                "source_sha256": transitive_action_entry["blob_sha256"],
+                "discovered_references": [
+                    {
+                        "reference": "../../scripts/verify.sh",
+                        "target_entry": copy.deepcopy(transitive_script_entry),
+                    }
+                ],
+                "discovered_reference_count": 1,
+                "record_sha256": "",
+            },
+            {
+                "source_entry": copy.deepcopy(transitive_script_entry),
+                "parser_profile": "github-actions-dependency-resolver-v1",
+                "source_sha256": transitive_script_entry["blob_sha256"],
                 "discovered_references": [],
                 "discovered_reference_count": 0,
                 "record_sha256": "",
@@ -3266,9 +3331,22 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         resolution_edges = [
             {
                 "source_entry": copy.deepcopy(workflow_entry),
-                "reference": "scripts/decide-clean.sh",
-                "target_entry": copy.deepcopy(script_entry),
-            }
+                "reference": (
+                    "octo/review-gate/.github/workflows/reusable-review.yml"
+                    "@refs/heads/feature/review"
+                ),
+                "target_entry": copy.deepcopy(reusable_entry),
+            },
+            {
+                "source_entry": copy.deepcopy(reusable_entry),
+                "reference": "./actions/verify",
+                "target_entry": copy.deepcopy(transitive_action_entry),
+            },
+            {
+                "source_entry": copy.deepcopy(transitive_action_entry),
+                "reference": "../../scripts/verify.sh",
+                "target_entry": copy.deepcopy(transitive_script_entry),
+            },
         ]
         cls.merge_status_dependency_resolution_receipt = {
             "owner": "parent-orchestrator",
@@ -3597,6 +3675,88 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         receipt["implementation_receipt_sha256"] = implementation_receipt[
             "receipt_sha256"
         ]
+        receipt["receipt_sha256"] = _receipt_sha256(receipt)
+        return receipt
+
+    def _coupled_merge_resolution_for_entry_changes(
+        self,
+        implementation_receipt: dict[str, object],
+        *,
+        replacements: tuple[tuple[dict[str, object], dict[str, object]], ...] = (),
+        additions: tuple[tuple[dict[str, object], dict[str, object]], ...] = (),
+    ) -> dict[str, object]:
+        """Rebuild complete resolution evidence after closure-entry changes."""
+
+        receipt = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+
+        def substitute(entry: dict[str, object]) -> dict[str, object]:
+            for original, replacement in replacements:
+                if entry == original:
+                    return copy.deepcopy(replacement)
+            return copy.deepcopy(entry)
+
+        for record in receipt["records"]:
+            record["source_entry"] = substitute(record["source_entry"])
+            record["source_sha256"] = record["source_entry"]["blob_sha256"]
+            for reference in record["discovered_references"]:
+                reference["target_entry"] = substitute(reference["target_entry"])
+            record["record_sha256"] = _canonical_json_sha256(
+                {key: value for key, value in record.items() if key != "record_sha256"}
+            )
+        for edge in receipt["edges"]:
+            edge["source_entry"] = substitute(edge["source_entry"])
+            edge["target_entry"] = substitute(edge["target_entry"])
+
+        for template_entry, added_entry in additions:
+            template_record = next(
+                record
+                for record in receipt["records"]
+                if record["source_entry"] == template_entry
+            )
+            added_record = copy.deepcopy(template_record)
+            added_record["source_entry"] = copy.deepcopy(added_entry)
+            added_record["source_sha256"] = added_entry["blob_sha256"]
+            added_record["record_sha256"] = _canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in added_record.items()
+                    if key != "record_sha256"
+                }
+            )
+            receipt["records"].append(added_record)
+            receipt["edges"].extend(
+                {
+                    "source_entry": copy.deepcopy(added_entry),
+                    "reference": reference["reference"],
+                    "target_entry": copy.deepcopy(reference["target_entry"]),
+                }
+                for reference in added_record["discovered_references"]
+            )
+
+        def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
+            return (
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+
+        receipt["records"].sort(key=lambda record: entry_key(record["source_entry"]))
+        receipt["edges"].sort(
+            key=lambda edge: (
+                *entry_key(edge["source_entry"]),
+                edge["reference"],
+                *entry_key(edge["target_entry"]),
+            )
+        )
+        receipt["implementation_receipt_sha256"] = implementation_receipt[
+            "receipt_sha256"
+        ]
+        receipt["record_count"] = len(receipt["records"])
+        receipt["records_sha256"] = _canonical_json_sha256(receipt["records"])
+        receipt["edge_count"] = len(receipt["edges"])
+        receipt["edges_sha256"] = _canonical_json_sha256(receipt["edges"])
         receipt["receipt_sha256"] = _receipt_sha256(receipt)
         return receipt
 
@@ -4748,9 +4908,236 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self._validator_with_complete_snapshot(drifted).validate(report)
         )
 
+    def test_merge_status_root_identity_is_closed_under_coupled_rehash(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        original_root = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt["workflow_ref_identity"][
+                "entry"
+            ]
+        )
+
+        def validator_for(
+            implementation: dict[str, object],
+            resolution: dict[str, object],
+            digest_character: str,
+        ) -> _ReportValidator:
+            snapshot = self._merge_snapshot_for_report(
+                report,
+                digest_character,
+                implementation,
+            )
+            for phase in ("initial", "final"):
+                snapshot[f"{phase}_basis_selection"]["merge_status"][
+                    "producer_dependency_resolution_receipt_sha256"
+                ] = resolution["receipt_sha256"]
+            return self._validator_with_complete_snapshot(
+                snapshot,
+                merge_implementation_receipt=implementation,
+                merge_resolution_receipt=resolution,
+            )
+
+        for index, root_kind in enumerate(("action", "script"), start=1):
+            with self.subTest(root_kind=root_kind):
+                implementation = copy.deepcopy(
+                    self.merge_status_producer_implementation_receipt
+                )
+                attacked_root = copy.deepcopy(original_root)
+                attacked_root["kind"] = root_kind
+                implementation["implementation_closure"] = [
+                    (
+                        copy.deepcopy(attacked_root)
+                        if entry == original_root
+                        else copy.deepcopy(entry)
+                    )
+                    for entry in implementation["implementation_closure"]
+                ]
+                implementation["implementation_closure"].sort(
+                    key=lambda entry: (
+                        entry["repository"],
+                        entry["commit"],
+                        entry["path"],
+                        entry["kind"],
+                        entry["blob_sha256"],
+                    )
+                )
+                implementation["workflow_ref_identity"]["entry"] = copy.deepcopy(
+                    attacked_root
+                )
+                implementation["workflow_ref_identity"]["entry_sha256"] = (
+                    _canonical_json_sha256(attacked_root)
+                )
+                implementation["implementation_closure_sha256"] = (
+                    _canonical_json_sha256(implementation["implementation_closure"])
+                )
+                implementation["receipt_sha256"] = _receipt_sha256(implementation)
+                resolution = self._coupled_merge_resolution_for_entry_changes(
+                    implementation,
+                    replacements=((original_root, attacked_root),),
+                )
+                validator = validator_for(implementation, resolution, str(index))
+                self.assertTrue(
+                    validator._merge_status_dependency_resolution_matches(report)
+                )
+                self.assertFalse(
+                    validator._merge_status_producer_implementation_matches(report)
+                )
+                self.assertFalse(validator.validate(report))
+
+        implementation = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        duplicate_root = copy.deepcopy(original_root)
+        duplicate_root["blob_sha256"] = "a" * 64
+        implementation["implementation_closure"].append(duplicate_root)
+        implementation["implementation_closure"].sort(
+            key=lambda entry: (
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        implementation["implementation_closure_count"] = len(
+            implementation["implementation_closure"]
+        )
+        implementation["implementation_closure_sha256"] = _canonical_json_sha256(
+            implementation["implementation_closure"]
+        )
+        implementation["receipt_sha256"] = _receipt_sha256(implementation)
+        resolution = self._coupled_merge_resolution_for_entry_changes(
+            implementation,
+            additions=((original_root, duplicate_root),),
+        )
+        validator = validator_for(implementation, resolution, "3")
+        self.assertTrue(validator._merge_status_dependency_resolution_matches(report))
+        self.assertFalse(
+            validator._merge_status_producer_implementation_matches(report)
+        )
+        self.assertFalse(validator.validate(report))
+
     def test_merge_status_snapshot_requires_two_subject_bound_page_sets(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
         self.assertTrue(self.merge_report_validator.validate(report))
+        self.assertNotEqual(
+            self.merge_status_producer_implementation_receipt[
+                "job_workflow_ref_identity"
+            ]["repository"],
+            report["repository"],
+        )
+        self.assertEqual(
+            self.merge_status_producer_implementation_receipt[
+                "job_workflow_ref_identity"
+            ]["entry"]["kind"],
+            "reusable-workflow",
+        )
+        self.assertTrue(
+            {"action", "script"}
+            <= {
+                entry["kind"]
+                for entry in self.merge_status_producer_implementation_receipt[
+                    "implementation_closure"
+                ]
+                if entry["repository"] != report["repository"]
+            }
+        )
+
+        external_root = copy.deepcopy(self.merge_status_producer_implementation_receipt)
+        root_entry = external_root["implementation_closure"][0]
+        root_entry["repository"] = "octo/external-root"
+        external_root.update(
+            workflow_repository="octo/external-root",
+            workflow_ref=(
+                "octo/external-root/.github/workflows/codex-review.yml"
+                "@refs/heads/feature/review"
+            ),
+        )
+        external_root["workflow_ref_identity"].update(
+            repository="octo/external-root",
+            entry=copy.deepcopy(root_entry),
+            entry_sha256=_canonical_json_sha256(root_entry),
+        )
+        external_root["implementation_closure"].sort(
+            key=lambda entry: (
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        external_root["implementation_closure_sha256"] = _canonical_json_sha256(
+            external_root["implementation_closure"]
+        )
+        external_root["receipt_sha256"] = _receipt_sha256(external_root)
+        external_resolution = copy.deepcopy(
+            self.merge_status_dependency_resolution_receipt
+        )
+        original_root = self.merge_status_producer_implementation_receipt[
+            "implementation_closure"
+        ][0]
+        attacked_root = external_root["workflow_ref_identity"]["entry"]
+        for record in external_resolution["records"]:
+            if record["source_entry"] == original_root:
+                record["source_entry"] = copy.deepcopy(attacked_root)
+                record["source_sha256"] = attacked_root["blob_sha256"]
+            for reference in record["discovered_references"]:
+                if reference["target_entry"] == original_root:
+                    reference["target_entry"] = copy.deepcopy(attacked_root)
+            record["record_sha256"] = _canonical_json_sha256(
+                {key: value for key, value in record.items() if key != "record_sha256"}
+            )
+        external_resolution["records"].sort(
+            key=lambda record: (
+                record["source_entry"]["repository"],
+                record["source_entry"]["commit"],
+                record["source_entry"]["path"],
+                record["source_entry"]["kind"],
+                record["source_entry"]["blob_sha256"],
+            )
+        )
+        for edge in external_resolution["edges"]:
+            if edge["source_entry"] == original_root:
+                edge["source_entry"] = copy.deepcopy(attacked_root)
+            if edge["target_entry"] == original_root:
+                edge["target_entry"] = copy.deepcopy(attacked_root)
+        external_resolution["edges"].sort(
+            key=lambda edge: (
+                edge["source_entry"]["repository"],
+                edge["source_entry"]["commit"],
+                edge["source_entry"]["path"],
+                edge["source_entry"]["kind"],
+                edge["source_entry"]["blob_sha256"],
+                edge["reference"],
+                edge["target_entry"]["repository"],
+                edge["target_entry"]["commit"],
+                edge["target_entry"]["path"],
+                edge["target_entry"]["kind"],
+                edge["target_entry"]["blob_sha256"],
+            )
+        )
+        external_resolution["implementation_receipt_sha256"] = external_root[
+            "receipt_sha256"
+        ]
+        external_resolution["records_sha256"] = _canonical_json_sha256(
+            external_resolution["records"]
+        )
+        external_resolution["edges_sha256"] = _canonical_json_sha256(
+            external_resolution["edges"]
+        )
+        external_resolution["receipt_sha256"] = _receipt_sha256(external_resolution)
+        external_snapshot = self._merge_snapshot_for_report(report, "5", external_root)
+        for phase in ("initial", "final"):
+            external_snapshot[f"{phase}_basis_selection"]["merge_status"][
+                "producer_dependency_resolution_receipt_sha256"
+            ] = external_resolution["receipt_sha256"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                external_snapshot,
+                merge_implementation_receipt=external_root,
+                merge_resolution_receipt=external_resolution,
+            ).validate(report)
+        )
 
         missing_selected_status_page = copy.deepcopy(
             self.merge_complete_pr_parent_snapshot

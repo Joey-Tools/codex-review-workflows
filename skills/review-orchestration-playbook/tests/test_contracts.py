@@ -1290,13 +1290,14 @@ class RepositoryContractTest(unittest.TestCase):
             "identifiers only",
             "`recovery_operation_preflight`",
             "dependency-edge resolution receipt",
-            "completion receipt",
             "idempotent or reentrant",
             "equality identifies a requested repeat",
             "outside the candidate range",
             "candidate-head workflow or contract bytes",
-            "expected_head_sha",
             "total rerun limit is 50",
+            "manual dispatch",
+            "ordinary producer/status contract",
+            "root workflow repository",
         ):
             self.assertIn(anchor, normalized)
         self.assertIn("no time ceiling on status-only monitoring", probes)

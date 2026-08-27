@@ -2048,11 +2048,14 @@ superseded_by:
   atomically bind the frozen head. Finally, `recovery_operation_contract`
   remained prose rather than a versioned closed schema and reference consumer.
   The remediation therefore binds actual producer implementation evidence,
-  removes unguarded mutable-ref dispatch, admits an existing-run rerun only
-  after its original head and implementation are bound, requires an immutable
-  trusted guarded-dispatch implementation with a pre-side-effect exact-head
-  check for new runs, and adds a closed machine-readable recovery contract
-  plus candidate-range exclusion and negative tests. GitHub's documented
+  removes automatic new dispatch from authoritative recovery, admits an
+  existing-run rerun only after its original head and implementation are
+  bound, and adds a closed machine-readable recovery contract plus
+  candidate-range exclusion and negative tests. A manually confirmed dispatch
+  and its receipts remain status-only because branch/tag dispatch has no
+  documented atomic expected-SHA or `If-Match` precondition; a later run/check
+  can count only through an independent ordinary producer/status contract.
+  GitHub's documented
   maximum of 50 reruns limits state-changing rerun attempts; monitoring itself
   may continue hourly without a fixed limit.
 - The exact GitHub rule name remains **Require branches to be up to date before
@@ -2082,28 +2085,23 @@ superseded_by:
   trusted release must carry an independent parent-owned manifest/provenance
   receipt. This prevents a same-repository off-range commit created by a
   candidate author from becoming its own resolver authority.
-- GitHub recovery is a closed two-phase contract. The preflight contains no
-  returned-run or observed-run fields and binds the exact repository, PR,
-  frozen head, operation intent, repeat-safety declaration, trusted producer
-  implementation, resolved dependency closure, and a closure-bound
-  pre-side-effect `expected_head_sha` gate. An existing-run rerun additionally
-  joins the original platform run, `GITHUB_SHA`, `GITHUB_REF`, workflow SHA/ref,
-  and job workflow identity; GitHub's rerun preserves those original values.
-  The completion receipt cannot authorize a mutation retroactively and is
-  accepted only when a separate parent-owned authenticated platform
-  observation joins the accepted preflight and exact operation identity.
-- Guarded new dispatch deliberately targets GitHub's current documented REST
-  contract instead of guessing a run from time or similar metadata. Under API
-  version `2026-03-10`, the exact workflow-dispatch POST must return HTTP 200
-  with a closed `workflow_run_id`, `run_url`, and `html_url` response. The
-  delivery receipt binds that response, canonical URLs, the exact endpoint,
-  semantic request body `{ref, inputs}` and its RFC 8785 digest, and an
-  independently frozen expected receipt digest. The observation queries the
-  returned `run_url` and every completion field joins that exact run. A 204
-  response, an older/detail-free API, a mutable-ref-only claim, malformed wire
-  body, changed URL/ID, or coupled substitution remains status-only. This
-  preserves automatic recovery when GitHub supplies atomic run details without
-  turning approximate discovery into authority.
+- GitHub authoritative recovery is a closed two-phase contract whose accepted
+  union contains only full and failed-jobs reruns of an exact existing run. The
+  preflight binds the repository, PR, frozen head, operation intent,
+  repeat-safety declaration, trusted producer implementation, resolved
+  dependency closure, and original platform run observation. The rerun joins
+  the original `GITHUB_SHA`, `GITHUB_REF`, workflow SHA/ref, and job workflow
+  identity; GitHub preserves those values. The completion receipt cannot
+  authorize a mutation retroactively and is accepted only when separate
+  parent-owned authenticated exact-attempt/current-run observations join the
+  accepted preflight and operation identity.
+- A new workflow dispatch remains outside that accepted union even when the
+  REST response returns a run ID and URLs: the branch/tag ref still has no
+  documented pre-POST atomic expected-SHA comparison, so post-creation identity
+  checks cannot prevent an already-started substituted workflow from causing
+  side effects. A separately caller-confirmed manual dispatch and its receipt
+  are status-only; any later current-head check must qualify independently
+  through the ordinary producer/status contract.
 - The final fresh-context review exposed four additional recovery-boundary
   gaps that focused self-tests had not found: target repository identity did
   not cross every receipt boundary; the recovery resolver could still omit a
@@ -2150,12 +2148,24 @@ superseded_by:
   fresh-context review correctly found four stronger coupled attacks; each
   original attack author then re-ran its probe against the repaired contract
   and returned `CLEAN`. A later formal pass additionally established that
-  guarded dispatch shares the same closed final current-run identity and
-  acquisition transaction as rerun, recovery consumes the canonical closed
-  producer-entry profile (`action`, not an invented kind), and the external-App
-  union nulls both raw and parsed workflow identities. Coupled final-window,
-  malformed-entry, and provider-union attacks now fail mechanically. The
-  focused contract/carrier/recovery/local-lane matrix now passes all 90 tests.
+  recovery consumes the canonical closed producer-entry profile (`action`, not
+  an invented kind), and the external-App union nulls both raw and parsed
+  workflow identities. The subsequent formal review removed automatic new
+  dispatch from the accepted recovery union and bound the trusted root workflow
+  repository to the operation/contract repository; cross-repository reusable
+  workflow identity remains valid only as the job identity. Coupled
+  final-window, malformed-entry, provider-union, root-repository, and manual-
+  dispatch authority attacks now fail mechanically. The focused
+  contract/carrier/recovery/local-lane matrix passes all 90 tests after this
+  downgrade and repository-binding revision.
+- The same formal review found that the Darwin published-receipt ACL check had
+  implemented a stricter property than its owner-private contract by rejecting
+  a redundant allow entry for the exact file owner. The live descriptor-bound
+  check now resolves an owner UUID only when an allow entry exists, accepts
+  deny entries and exact-owner allows, and rejects any allow for another
+  principal plus every unknown, malformed, or uninspectable entry. Stronger
+  control-object contracts that intentionally require an empty ACL remain
+  unchanged.
   The GitHub Action/status/ruleset thread remains
   responsible for the production producer and consumer; this workstream
   supplies its closed skill-facing evidence contract and test-only reference

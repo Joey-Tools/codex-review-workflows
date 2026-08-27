@@ -776,10 +776,14 @@ For an authorized Actions recovery, first validate the closed parent-owned
 `github-codex-recovery-operation-two-phase-v1` reference schema. Its preflight binds the
 exact repository/PR/frozen head, candidate-range-external source, candidate
 exclusion receipt, operation intent/inputs, trusted producer-implementation
-receipt, and complete dependency-edge resolution receipt. Existing-run reruns must retain and match their original
-`GITHUB_SHA`/`GITHUB_REF`; a generic branch-ref dispatch is forbidden. A new
-dispatch needs an immutable workflow plus closure-bound `expected_head_sha`
-live-PR-head gate before every side effect, joined to the actual closure entry.
+receipt, and complete dependency-edge resolution receipt. Existing-run reruns
+must retain and match their original `GITHUB_SHA`/`GITHUB_REF`. The trusted
+root workflow repository equals the operation and contract repository; a
+cross-repository job identity must be a reusable workflow. A new
+`workflow_dispatch` is outside the accepted recovery union because the API
+accepts a branch/tag ref and documents no atomic expected-SHA or `If-Match`
+precondition on the POST. An explicitly caller-confirmed manual dispatch remains
+status-only and supplies no recovery or pass authority.
 That resolution receipt exactly covers every canonical closure entry with
 parser/source digests, complete references, and bijective full-entry edges; its
 digest belongs to the stable snapshot. The separate completion receipt joins
@@ -802,14 +806,8 @@ both post observations, response/acquisition ordering, and platform
 attempt replay or a possible intervening rerun is status-only.
 status-only monitoring may continue without a time ceiling. Never reconcile a
 substantive finding, test failure, policy failure, or comment creation as
-infrastructure.
-Guarded dispatch is eligible only with API version `2026-03-10`, exact POST
-endpoint and semantic `{ref, inputs: inputs_object}` body, HTTP 200, and closed `{workflow_run_id, run_url, html_url}`
-response/digest whose canonical ID and URLs join delivery and observation.
-Older or detail-free responses are status-only; never use correlation tokens.
-Project the sorted unique name/value intent list into a nonempty inputs object
-and digest the RFC 8785 semantic body; never digest the list representation or
-claim unrecorded transport bytes.
+infrastructure. Any later status from a manual dispatch is consumed only
+through an independent ordinary producer/status contract.
 
 ## Parent Classification
 

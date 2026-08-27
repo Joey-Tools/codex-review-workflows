@@ -797,7 +797,7 @@
         "profile": "github-codex-merge-status-producer-implementation-v1",
         "trust_boundary": "frozen from platform-authenticated run and job metadata plus an independently enumerated immutable implementation closure before report validation; read-only to this reference consumer and never derived from candidate report or candidate-head bytes",
         "run_binding": "repository, workflow_id, run_id, run_attempt, check_suite_id, and check_run_id type-preservingly equal the independent selected run/check identities; github-actions additionally binds exact platform-authenticated workflow_sha, workflow_ref, and job_workflow_ref",
-        "github_actions": "provider_kind github-actions requires attestation_source github-actions-api, exact non-null workflow repository/path/full SHA/ref/job ref, null external_implementation_id, and closed parsed identities for workflow_ref and job_workflow_ref. Each raw string canonically reconstructs from repository/path@ref; each parsed identity binds resolved_commit plus the exact full canonical closure entry and its digest. Root workflow identity equals workflow_repository/path/workflow_sha and its ref equals run_ref; job identity equals an exact closure entry",
+        "github_actions": "provider_kind github-actions requires attestation_source github-actions-api, exact non-null workflow repository/path/full SHA/ref/job ref, null external_implementation_id, and closed parsed identities for workflow_ref and job_workflow_ref. Each raw string canonically reconstructs from repository/path@ref; each parsed identity binds resolved_commit plus the exact full canonical closure entry and its digest. The root workflow repository equals the receipt and report repository, its identity entry is kind workflow and equals workflow_repository/path/workflow_sha, and its ref equals run_ref. Job identity equals an exact closure entry; when its repository is external, that entry is kind reusable-workflow",
         "external_app": "provider_kind external-app requires attestation_source provider-authenticated-api, a nonempty immutable external_implementation_id, null workflow_repository, workflow_path, workflow_sha, workflow_ref, workflow_ref_identity, job_workflow_ref, and job_workflow_ref_identity, plus an equivalent complete immutable provider implementation closure; otherwise merge-status is unavailable",
         "implementation_closure": "complete non-empty byte-key-sorted unique closed entries for the workflow blob and every transitive local or reusable workflow/action/script dependency capable of deciding clean; each entry binds repository, immutable commit, safe path, blob SHA-256, and kind workflow, reusable-workflow, action, or script",
         "candidate_exclusion": "join every same-candidate-repository closure entry to the separately complete candidate-range exclusion receipt and reject any entry whose commit occurs in base..head; candidate-controlled workflow or dependency bytes cannot pass",
@@ -1123,16 +1123,7 @@
         "unique_run_id",
         "receipt_sha256"
       ],
-      "dispatch_response": [
-        "workflow_run_id",
-        "run_url",
-        "html_url"
-      ],
-      "dispatch_request_body": [
-        "ref",
-        "inputs"
-      ],
-      "platform_dispatch_run_object": [
+      "platform_run_object": [
         "id",
         "repository",
         "run_attempt",
@@ -1222,7 +1213,7 @@
         "candidate_commit_count",
         "candidate_commits_sha256"
       ],
-      "operation_intent": [
+      "existing_run_rerun_operation_intent": [
         "repository",
         "kind",
         "workflow_id",
@@ -1230,21 +1221,11 @@
         "pre_run_attempt",
         "expected_run_attempt",
         "ref",
-        "inputs",
-        "expected_head_gate"
+        "inputs"
       ],
       "input": [
         "name",
         "value"
-      ],
-      "expected_head_gate": [
-        "status",
-        "input_name",
-        "expected_head_sha",
-        "live_head_source",
-        "pre_side_effect",
-        "mismatch_behavior",
-        "implementation_entry_sha256"
       ],
       "repeat_safety": [
         "declaration",
@@ -1328,14 +1309,13 @@
       "owner_status_profile": "preflight is exact owner parent-orchestrator, status complete, and profile github-codex-recovery-operation-preflight-v1; completion is a separate exact profile github-codex-recovery-operation-completion-v1",
       "source": "descriptor and trust anchor are exact, closed, digest-bound, parent-owned, and joined to repository/base/head; the complete candidate-range exclusion receipt rejects a same-repository source_commit anywhere in base..head, including a non-head candidate commit",
       "scope": "repository is exact owner/name, pull_request is a positive typed integer, and head_sha is a full lowercase SHA. Producer receipt, implementation identity, operation intent, preflight, delivery, observation query and run object, completion, and every derived endpoint or URL type-preservingly bind that same repository; a coupled cross-repository rehash is invalid",
-      "operation_kinds": "version 1 accepts existing-run-rerun-full, existing-run-rerun-failed-jobs, and guarded-dispatch; comment creation and every other rerun mode are forbidden",
+      "operation_kinds": "the closed version-1 union has exactly two accepted arms: existing-run-rerun-full and existing-run-rerun-failed-jobs. New workflow_dispatch, manual-workflow-dispatch, comment creation, debug/job reruns, ambiguous legacy reruns, and every other operation kind are outside the authoritative recovery contract and are status-only",
       "existing_run_rerun": "preflight binds a separate authenticated pre-mutation run observation and exact repository, workflow_id, run_id, run_ref, frozen head, workflow SHA/ref, job workflow identity, and run_attempt to the full independently validated trusted producer receipt. Full rerun uses POST /repos/{repository}/actions/runs/{run_id}/rerun; failed-jobs rerun uses POST /repos/{repository}/actions/runs/{run_id}/rerun-failed-jobs; each requires API 2026-03-10 and HTTP 201. The post-mutation GET targets /repos/{repository}/actions/runs/{run_id}/attempts/{pre_attempt+1}, occurs no earlier than the POST server time, and proves exact run_attempt pre_attempt+1 plus the canonical previous_attempt_url; a current-run snapshot, unchanged attempt, skipped attempt, stale observation, ambiguous mode, or cross-mode endpoint is status-only",
-      "guarded_dispatch": "preflight has no returned or observed run fields; it requires the immutable trusted implementation closure, a complete dependency-edge resolution receipt, and a verified expected_head_sha gate whose implementation entry is the closure-bound workflow entry. Only after preflight acceptance may mutation occur. Completion separately binds the preflight digest, returned run ID, and platform-authenticated actual repository/head/workflow/ref/job identities. Mutable branch or tag ref alone never suffices",
-      "inputs": "each existing-run rerun mode has an exact empty intent list and no transmitted POST body; guarded-dispatch has an exact expected_head_sha input equal to the frozen head",
+      "inputs": "each accepted existing-run rerun arm has an exact empty intent list and no transmitted POST body",
       "repeat_safety": "declaration is idempotent or reentrant, operation_identity_sha256 binds the RFC 8785 canonical operation record, and authorization_independent is exact true; this proves repeat safety only and never supplies mutation authorization",
-      "implementation": "implementation receipt identity type-preservingly equals an independently validated github-codex-merge-status-producer-implementation-v1 receipt; the separately supplied parent-owned dependency-resolution receipt uses a separately supplied exact resolver provenance anchor. Target-baseline resolver source is exact base_tip in the candidate repository, parent-fixed external source is in a different repository, and installed release source has independently fixed manifest provenance; every same-repository resolver commit in base..head is rejected. Repository shape and safe canonical path are mandatory. Every exact repository/commit/path/kind/blob closure entry has one sorted unique complete reference record and reference-to-edge bijection. Missing, duplicate, stale, candidate-controlled, unresolved, unbound, or drifted evidence is status-only",
+      "implementation": "implementation receipt identity type-preservingly equals an independently validated github-codex-merge-status-producer-implementation-v1 receipt. Its trusted root workflow repository equals the recovery operation and contract repository; an external reusable workflow may appear only as the exact job-workflow identity, never as the root workflow identity. The separately supplied parent-owned dependency-resolution receipt uses a separately supplied exact resolver provenance anchor. Target-baseline resolver source is exact base_tip in the candidate repository, parent-fixed external source is in a different repository, and installed release source has independently fixed manifest provenance; every same-repository resolver commit in base..head is rejected. Repository shape and safe canonical path are mandatory. Every exact repository/commit/path/kind/blob closure entry has one sorted unique complete reference record and reference-to-edge bijection. Missing, duplicate, stale, candidate-controlled, unresolved, unbound, or drifted evidence is status-only",
       "two_phase": "preflight_sha256 canonically binds the complete preflight excluding itself; completion_sha256 canonically binds the complete completion excluding itself. Completion cannot retroactively authorize mutation and is accepted only after an accepted preflight",
-      "platform_observation": "completion consumes separate closed parent-owned authenticated exact-attempt and post-mutation current-run observations plus a closed acquisition-transaction receipt joining pre-observation, delivery, both post GET digests, and response/acquisition ordering. Both rerun and guarded-dispatch require exact/current observations to share the complete frozen repository/run/attempt/head/workflow/ref/job identity, independently valid run_started_at/updated_at endpoint intervals, and a common run_started_at no earlier than the POST boundary; guarded dispatch additionally requires attempt 1 and null previous_attempt_url. Existing rerun requires exact n+1 in both post observations and current run_attempt n+1; a re-stamped historical attempt cannot pass, and any possible intervening concurrent rerun or final-window drift is status-only. Guarded-dispatch v1 requires exact X-GitHub-Api-Version 2026-03-10, POST endpoint, exact semantic request body {ref,inputs}, HTTP 200, and a closed workflow_run_id/run_url/html_url response with canonical digest; inputs is the unique nonempty object projection of the sorted name/value intent list and request_body_sha256 is RFC 8785 canonical JSON SHA-256 of that semantic object, never the internal list or an unrecorded transport byte claim. workflow_run_id and canonical API/HTML URLs join returned_run_id, unique_run_id, and both post observations. Older or detail-free dispatch responses are status-only and no correlation-token alternative is accepted. Every completion field joins external receipts; no returned or observed completion field or transaction may self-attest",
+      "platform_observation": "completion consumes separate closed parent-owned authenticated exact-attempt and post-mutation current-run observations plus a closed acquisition-transaction receipt joining pre-observation, delivery, both post GET digests, and response/acquisition ordering. The observations share the complete frozen repository/run/attempt/head/workflow/ref/job identity, independently valid run_started_at/updated_at endpoint intervals, and a common run_started_at no earlier than the POST boundary. Accepted existing-run rerun requires exact n+1 in both post observations and current run_attempt n+1; a re-stamped historical attempt cannot pass, and any possible intervening concurrent rerun or final-window drift is status-only. Every completion field joins external receipts; no returned or observed completion field or transaction may self-attest",
       "monitoring": "status-only monitoring keeps the 1,2,4,8,16,32,60 minute then hourly cadence without a time ceiling; mutation attempts stop at the platform/provider cap or stricter contract limit"
     }
   },

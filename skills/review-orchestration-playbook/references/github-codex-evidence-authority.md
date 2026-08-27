@@ -513,11 +513,12 @@ terminal artifact also excludes reaction fallback, recovery may reconcile the
 same head only when the versioned closed
 `github-codex-recovery-operation-two-phase-v1` reference schema first accepts a
 preflight binding the frozen head, trusted producer implementation, complete
-resolved dependency-edge closure, exact existing run or guarded-dispatch
-intent, and independently declared repeat safety. Existing-run reruns retain their
-original platform-authenticated SHA/ref; dispatch needs the trusted
-pre-side-effect `expected_head_sha` live-PR gate whose implementation entry is
-joined to that closure. A separate completion receipt then joins the preflight
+resolved dependency-edge closure, one exact existing-run rerun intent, and
+independently declared repeat safety. The trusted root workflow repository
+must equal the recovery operation and contract repository; an external reusable
+workflow may appear only as the exact job-workflow identity. Existing-run
+reruns retain their original platform-authenticated SHA/ref. A separate
+completion receipt then joins the preflight
 digest to a separate closed parent-owned authenticated platform observation
 for the exact query endpoint, proved delivery/returned ID, closed run object
 and digest, and run/head/workflow/ref/job identities. Completion fields cannot
@@ -535,16 +536,12 @@ same identity and current `run_attempt == n+1`. A separately closed transaction
 joins pre-observation, 201 delivery, both post observations, GitHub response
 dates, acquisition times, and platform `run_started_at`/`updated_at`.
 Historical-attempt replay or a possible intervening rerun is status-only.
-Guarded dispatch is mutation-eligible only under API version `2026-03-10` with
-the exact POST endpoint and semantic body, HTTP 200, and closed
-`{workflow_run_id, run_url, html_url}` response and canonical digest. The ID
-and canonical URLs join the frozen delivery receipt and later observation.
-Older/detail-free dispatch responses are status-only; correlation tokens are
-not an accepted v1 substitute.
-The body is exactly `{ref, inputs: inputs_object}`; `inputs_object` is the
-unique object projection of the sorted name/value intent list and is nonempty
-for guarded v1. The body digest uses RFC 8785 semantic JSON and never the
-internal list representation or unrecorded transmitted bytes.
+A new `workflow_dispatch` is outside the accepted recovery union because its
+branch/tag `ref` is mutable and the POST has no atomic expected-SHA comparison.
+An explicitly caller-confirmed manual dispatch and its receipts remain
+status-only and cannot satisfy recovery. A later current-head run/check can
+count only through an independent ordinary producer/status contract; the
+dispatch never provides clean/pass authority by itself.
 Otherwise recovery remains read-only while
 awaiting a later accepted clean comment or review.
 
@@ -674,12 +671,13 @@ delivery cannot be proved, use `request_policy.status: unknown`; read-only
 observation may remain pending while another read is meaningful, but reaction
 fallback cannot use an unproved request identity. Without an independently
 accepted terminal basis, exhausted observation becomes `inconclusive` with
-`last_reason: request-delivery-unproven`. Only an independently authorized
-exact Actions operation accepted by the versioned recovery contract may mutate;
-generic branch-ref dispatch is forbidden, mutation attempts stop at the
-provider/contract cap, and hourly read-only monitoring may continue without a
-time ceiling. An equal tuple alone is not enough, and this authority never
-extends to comment creation.
+`last_reason: request-delivery-unproven`. Only an independently authorized exact
+Actions operation accepted by the versioned recovery contract may enter
+authoritative automatic recovery. A separately caller-confirmed manual dispatch
+remains status-only; generic branch-ref dispatch is forbidden as automatic
+recovery. Mutation attempts stop at the provider/contract cap, and hourly
+read-only monitoring may continue without a time ceiling. An equal tuple alone
+is not enough, and this authority never extends to comment creation.
 
 Any visible duplicate remains part of the same logical review lane and is
 reported as an audit warning. An observed duplicate never authorizes another

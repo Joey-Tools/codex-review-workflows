@@ -277,7 +277,8 @@ Never reconcile an explicit review finding that is applicable and unresolved,
 a test failure, lint failure, policy failure, or other substantive negative
 result. Those require resolution, a fix, or an explicit policy decision.
 
-Before an Actions mutation, obtain one closed parent-owned
+Before an Actions mutation intended to enter authoritative automatic recovery,
+obtain one closed parent-owned
 `recovery_operation_preflight` from a source independently anchored outside the
 candidate range and validate it against
 `github-codex-recovery-operation-two-phase-v1` in
@@ -293,13 +294,15 @@ source relationships are the exact target-branch baseline, an installed
 trusted release, or another parent-pinned source proved outside the candidate
 range. Candidate-head workflow or contract bytes cannot grant repeat authority.
 
-Only after that proof, freeze the exact recovery operation and join it
+Only after that proof, freeze the exact authoritative recovery operation and join it
 type-preservingly to the contract. Equality identifies a requested repeat; it
 does not make an operation idempotent or reentrant. The current task must still
 authorize the external mutation. When the trusted contract, exact join, or
 authorization is absent, keep the recovery owner in status-only mode, poll the
 scoped evidence on the schedule below, and report the missing gate instead of
-triggering the workflow. This repeat authority never applies to GitHub comment
+triggering an automatic recovery operation. A separately caller-confirmed
+manual dispatch remains status-only under step 3 below and does not inherit
+this repeat authority. This repeat authority never applies to GitHub comment
 creation; the one-shot comment-mutation budget above remains consumed after any
 possibly delivered create-comment call.
 
@@ -327,32 +330,15 @@ operation that can recover the machine-decidable retryable state:
    transaction joins all four receipts, GitHub response dates, acquisition
    times, and platform `run_started_at`/`updated_at`; a historical attempt
    re-read or possible intervening rerun remains status-only.
-3. A new `workflow_dispatch` is eligible only when the trusted immutable
-   workflow revision contains a closure-bound pre-side-effect gate accepting
-   exact `expected_head_sha`, rereading the live selected-PR head, and aborting
-   before every side effect on mismatch. `workflow_dispatch.ref` accepts a
-   branch or tag name, so it is never proof of the frozen head. After dispatch,
-   bind the returned run ID and platform-observed actual head and workflow SHA
-   before treating the run as the same operation. Without machine proof of all
-   these properties, remain status-only. Preflight contains no returned or
-   observed run fields. After mutation, validate the separately closed
-   `github-codex-recovery-operation-completion-v1` receipt by joining its
-   preflight digest to a separate closed parent-owned authenticated platform
-   observation binding the exact query endpoint, proved delivery/returned ID,
-   closed run object/digest, and actual repository/head/workflow SHA/workflow
-   ref/run ref/job-workflow identity. Completion fields cannot self-attest.
-   Guarded-dispatch v1 additionally requires exact API version `2026-03-10`,
-   the exact POST endpoint and semantic request body, HTTP 200, and the closed
-   three-field response `{workflow_run_id, run_url, html_url}` plus its
-   canonical digest. The run ID and canonical API/HTML URLs must exactly join
-   delivery, observation, and completion. An older API or response without
-   returned run details is status-only; no correlation-token path exists.
-   Derive the semantic API body uniquely as `{ref: operation.ref, inputs:
-   inputs_object}`, where `inputs_object` maps the sorted unique name/value
-   intent list into an object. Guarded v1 always sends this nonempty object.
-   Digest its RFC 8785 canonical JSON; do not digest the internal list or claim
-   exact transmitted bytes without a separate serialization receipt.
-   Completion never retroactively authorizes mutation.
+3. Do not use a new `workflow_dispatch` as authoritative automatic recovery.
+   Its `ref` selects a branch or tag, and the POST documents no atomic
+   expected-SHA or `If-Match` comparison with the live PR head; a later
+   in-workflow gate
+   cannot close the dispatch race. The caller may explicitly confirm one manual
+   dispatch, but the operation and its receipts remain status-only and cannot
+   supply pass authority or satisfy the recovery contract. Any later current-
+   head status is consumed only through an independent ordinary producer/status
+   contract.
 
 Illustrative commands for an already authorized, trusted-contract-bound exact
 existing-run operation are:
@@ -362,9 +348,8 @@ gh run rerun <run-id> --failed --repo <owner/repo>
 gh run rerun <run-id> --repo <owner/repo>
 ```
 
-The generic `gh workflow run --ref <current-head-branch>` pattern is forbidden.
-Repository-specific inputs and any guarded-dispatch invocation come only from
-the validated trusted recovery contract; never invent input names.
+The generic `gh workflow run --ref <current-head-branch>` pattern is forbidden
+for automatic recovery. Do not synthesize repository-specific dispatch inputs.
 Single-flight still applies: wait until the current attempt is terminal or
 proved lost before repeating the same contract-bound operation. A different
 repository/PR/head scope, workflow, run, ref, operation, input set,
@@ -401,7 +386,8 @@ losing the retryable classification is.
 
 For private repositories, default to a rolling budget of four full-run
 equivalents per 24 hours unless repository policy defines another budget.
-Count a full rerun or new dispatch as one equivalent; count failed-job reruns
+Count a full rerun or explicitly confirmed manual dispatch as one equivalent;
+count failed-job reruns
 proportionally when reliable job-cost data exists, otherwise conservatively as
 one. When the budget is exhausted, perform status-only hourly checks until the
 window recovers. Do not spend private Action minutes on repeated runs during a
@@ -418,7 +404,7 @@ Keep recovery visibly pending:
 ```yaml
 recovery:
   status: pending
-  phase: observe | rerun-failed | rerun-full | dispatch | status-only
+  phase: observe | rerun-failed | rerun-full | manual-dispatch-status-only | status-only
   attempt: 1
   next_retry_at: RFC3339
   reason_class: retryable-pending | retryable-infrastructure
@@ -433,7 +419,7 @@ the active wait crossed an hour.
 Persistent monitoring does not expand authorization. A wake may always reread
 scoped evidence; it may repeat an Actions mutation only while the versioned
 recovery contract still binds the frozen head, exact operation, trusted
-implementation, expected-head gate when applicable, post-run identity, and
+implementation, existing-run identity and attempt lineage, and
 repeat-safety declaration, the current mutation remains authorized, and the
 provider/contract attempt cap has not been reached. Any drift requires ordinary
 confirmation or status-only monitoring. The schedule never repeats a

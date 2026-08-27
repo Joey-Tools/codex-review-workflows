@@ -148,7 +148,8 @@ Only a machine-decidable retryable pending or infrastructure reason enters
 automatic recovery. A stable malformed snapshot, scope contradiction, or
 other non-retryable inconclusive result terminates recovery and is reported
 immediately. For a retryable reason, prefer the smallest associated recovery.
-Before any Actions mutation, validate a closed parent-owned
+Before any Actions mutation intended to enter authoritative automatic
+recovery, validate a closed parent-owned
 `github-codex-recovery-operation-preflight-v1` reference contract. It binds one
 exact repository/PR/frozen head, source trust anchor, candidate-range exclusion
 receipt, dynamically identified workflow/run/ref/operation/inputs, and trusted
@@ -175,34 +176,18 @@ historical attempt re-read after a new POST or any possible intervening rerun
 is status-only. An ambiguous mode, current-run-only snapshot, unchanged/skipped attempt,
 debug rerun, cross-mode endpoint, or stale receipt remains status-only.
 Never use generic `gh workflow run --ref <current-head-branch>` as a head
-binding. A new dispatch requires an immutable workflow closure whose resolved
-dependency edges bind the actual gate implementation, plus a closure-bound
-`expected_head_sha` gate that rereads the live PR head and aborts before any
-side effect on mismatch. The preflight contains no returned or observed run
-fields. After dispatch, separately validate a completion receipt with profile
-`github-codex-recovery-operation-completion-v1` that joins the preflight digest
-to a separate closed parent-owned authenticated platform observation. That
-observation binds the exact API query endpoint, proved delivery and returned
-run, closed run object/digest, and actual repository, head, workflow SHA/ref,
-run ref, and job-workflow identity. Completion fields cannot self-attest.
-For both rerun and guarded dispatch, the final current-run observation must
-repeat the complete frozen exact-observation identity, use an independently
-valid endpoint time interval, and join the same closed acquisition transaction.
-Guarded dispatch requires attempt 1 with null `previous_attempt_url`; any
-final-window drift, arbitrary transaction rehash, or possible concurrent run
-leaves recovery status-only.
-For guarded dispatch, v1 accepts only the exact REST contract with
-`X-GitHub-Api-Version: 2026-03-10`, the exact POST endpoint and semantic body,
-HTTP 200, and
-a closed `{workflow_run_id, run_url, html_url}` response with canonical digest
-and URLs/ID joined to delivery and observation. Older or detail-free responses
-remain status-only; there is no correlation-token alternative.
-The semantic body is exactly `{ref, inputs}` where `inputs` is the unique object
-projection of the sorted name/value intent list, never that list itself; v1
-guarded dispatch always sends the nonempty inputs object. Its digest is RFC 8785
-canonical JSON, not a claim about unrecorded transport byte serialization.
-Equality of a tuple never
-creates repeat safety.
+binding. A new `workflow_dispatch` cannot enter the authoritative automatic
+recovery contract: GitHub accepts only a mutable branch or tag as `ref`, and
+the dispatch POST has no atomic expected-SHA compare with the live PR head.
+Even a workflow-level `expected_head_sha` check cannot close that race. The
+caller may explicitly confirm one manual dispatch, but the dispatch operation and its
+receipts remain status-only and cannot satisfy recovery. A later current-head
+run/check can count only through an independent ordinary producer/status
+contract; the dispatch never supplies pass authority by itself. The machine-readable
+recovery union therefore contains only the two exact existing-run rerun modes.
+Their trusted root workflow repository must equal the recovery repository;
+an external reusable workflow may appear only through the exact job-workflow
+identity. Equality of a tuple never creates repeat safety.
 Current mutation authorization remains separate. Issue-comment creation is
 never eligible. Missing proof leaves recovery status-only.
 Never reconcile an explicit code finding, test failure, or policy failure as

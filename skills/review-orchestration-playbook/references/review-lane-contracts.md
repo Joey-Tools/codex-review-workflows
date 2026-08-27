@@ -430,7 +430,12 @@ validation against the independently supplied frozen scope, then rereads the
 same open file descriptor and proves that the path still names that object
 under the same access policy. Directory-entry churn and leaf `mtime`/`ctime`
 changes trigger revalidation and an exact-byte reread; they are not by
-themselves mutation evidence. Success stdout is the exact same closed
+themselves mutation evidence. On Darwin, the live check enumerates each
+descriptor-bound extended-ACL access tag and principal UUID. Deny entries and
+allow entries for the exact object owner preserve the owner-private property;
+an allow entry for any other principal, an unknown tag or qualifier, or an
+inspection failure is `blocked-safety`.
+Success stdout is the exact same closed
 `sanitized-git-argv-prefix-receipt-v2` object, not a new acknowledgement
 schema. Retain that stdout as parent-private prelaunch evidence and require
 exact object equality with the already selected issuer receipt; do not expose
@@ -684,12 +689,16 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   complete dependency-edge resolution receipt, while
   declaring repeat safety independently of authorization. Existing-run reruns
   retain and must match their original `GITHUB_SHA`/`GITHUB_REF`; mutation
-  attempts stop at the provider or contract cap. Generic branch-ref dispatch is
-  forbidden. A dispatch is eligible only with a closure-bound
-  `expected_head_sha` pre-side-effect live-PR-head gate joined to the actual
-  closure entry. Its separate completion receipt joins the preflight digest to
-  a separate authenticated parent-owned platform observation binding the exact
-  query endpoint, delivery/returned ID, closed run object/digest, actual head,
+  attempts stop at the provider or contract cap. The trusted root workflow
+  repository equals the operation and contract repository; a cross-repository
+  job identity must be a reusable workflow. A new `workflow_dispatch` is
+  outside the accepted automatic-recovery union because the API accepts a
+  branch/tag ref and documents no atomic expected-SHA or `If-Match`
+  precondition on the POST. An explicitly caller-confirmed manual dispatch is
+  status-only and supplies no recovery or pass authority. The existing-run
+  completion receipt joins the preflight digest to a separate authenticated
+  parent-owned platform observation binding the exact query endpoint,
+  delivery/run ID, closed run object/digest, actual head,
   workflow SHA/ref, run ref, and job identity; completion fields do not
   self-attest.
   Existing-run mode is exactly full or failed-jobs. Bind an independent
@@ -703,15 +712,9 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   the same identity plus current `run_attempt == n+1`. One closed transaction
   joins pre-observation, 201 POST, both post observations, response/acquisition
   ordering, and platform `run_started_at`/`updated_at`; historical-attempt
-  replay or a possible intervening rerun is status-only.
-  Guarded-dispatch v1 requires API version `2026-03-10`, exact POST endpoint
-  and semantic `{ref, inputs: inputs_object}` body, HTTP 200, and a closed
-  `{workflow_run_id, run_url, html_url}` response/digest whose ID and canonical
-  URLs join delivery and observation. Older or detail-free responses remain
-  status-only; no correlation-token alternative is accepted.
-  `inputs_object` is the unique nonempty object projection of the sorted
-  name/value intent list. The digest covers RFC 8785 semantic JSON, not the list
-  or unrecorded transport bytes.
+  replay or a possible intervening rerun is status-only. Any later status from
+  a manual dispatch is consumed only through an independent ordinary
+  producer/status contract.
   Missing or mismatched proof leaves
   status-only hourly monitoring, which has no time ceiling. Current mutation
   authorization and single-flight remain separate; comment creation is never
