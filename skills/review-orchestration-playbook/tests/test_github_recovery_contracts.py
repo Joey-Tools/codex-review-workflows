@@ -240,6 +240,21 @@ def _receipt_sha256(receipt: dict[str, object]) -> str:
     )
 
 
+def _type_preserving_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return set(left) == set(right) and all(
+            _type_preserving_equal(left[key], right[key]) for key in left
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _type_preserving_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
 def _timestamp(value: object) -> datetime.datetime | None:
     if not isinstance(value, str) or not value.endswith("Z"):
         return None
@@ -295,6 +310,13 @@ class _RecoveryContractValidator:
             isinstance(value, int)
             and not isinstance(value, bool)
             and 0 < value <= MAX_SAFE_INTEGER
+        )
+
+    def _same_positive_int(self, *values: object) -> bool:
+        return (
+            bool(values)
+            and all(self._positive_int(value) for value in values)
+            and all(value == values[0] for value in values[1:])
         )
 
     @staticmethod
@@ -621,9 +643,19 @@ class _RecoveryContractValidator:
             != len(producer["implementation_closure"])
             or producer["implementation_closure_sha256"]
             != _canonical_sha256(producer["implementation_closure"])
-            or implementation != expected_implementation_identity
-            or edges_receipt != self.expected_dependency_resolution_receipt
-            or before != self.expected_pre_mutation_observation
+            or not self._same_positive_int(
+                implementation["workflow_id"], producer["workflow_id"]
+            )
+            or not self._same_positive_int(implementation["run_id"], producer["run_id"])
+            or not _type_preserving_equal(
+                implementation, expected_implementation_identity
+            )
+            or not _type_preserving_equal(
+                edges_receipt, self.expected_dependency_resolution_receipt
+            )
+            or not _type_preserving_equal(
+                before, self.expected_pre_mutation_observation
+            )
             or implementation["profile"]
             != "github-codex-merge-status-producer-implementation-v1"
             or SHA256.fullmatch(implementation["receipt_sha256"]) is None
@@ -778,7 +810,7 @@ class _RecoveryContractValidator:
             or resolver["owner"] != "parent-orchestrator"
             or resolver["status"] != "complete"
             or resolver["profile"] != "github-codex-recovery-resolver-anchor-v1"
-            or resolver != self.expected_resolver_anchor
+            or not _type_preserving_equal(resolver, self.expected_resolver_anchor)
             or resolver["kind"]
             not in {
                 "target-branch-baseline",
@@ -960,7 +992,10 @@ class _RecoveryContractValidator:
                 "existing-run-rerun-full",
             }
             or not self._positive_int(operation["workflow_id"])
-            or operation["workflow_id"] != producer["workflow_id"]
+            or not self._same_positive_int(
+                operation["workflow_id"], producer["workflow_id"]
+            )
+            or not self._positive_int(operation["run_id"])
             or not isinstance(operation["ref"], str)
             or not operation["ref"]
             or not isinstance(inputs, list)
@@ -993,18 +1028,18 @@ class _RecoveryContractValidator:
             and before["http_method"] == "GET"
             and before["response_status"] == 200
             and _timestamp(before["response_date"]) is not None
-            and before["run_id"] == producer["run_id"]
-            and self._positive_int(before["run_id"])
-            and before["run_attempt"] == producer["run_attempt"]
-            and self._positive_int(before["run_attempt"])
-            and self._positive_int(operation["pre_run_attempt"])
-            and operation["pre_run_attempt"] == before["run_attempt"]
-            and self._positive_int(operation["expected_run_attempt"])
-            and operation["expected_run_attempt"] == before["run_attempt"] + 1
+            and self._same_positive_int(before["run_id"], producer["run_id"])
+            and self._same_positive_int(
+                before["run_attempt"],
+                producer["run_attempt"],
+                operation["pre_run_attempt"],
+            )
+            and self._same_positive_int(
+                operation["expected_run_attempt"], before["run_attempt"] + 1
+            )
             and _timestamp(before["observed_at"]) is not None
             and before["head_sha"] == producer["feature_head_sha"]
-            and before["workflow_id"] == producer["workflow_id"]
-            and self._positive_int(before["workflow_id"])
+            and self._same_positive_int(before["workflow_id"], producer["workflow_id"])
             and before["workflow_sha"] == producer["workflow_sha"]
             and _same_repository_selector(
                 before["workflow_ref"],
@@ -1024,10 +1059,10 @@ class _RecoveryContractValidator:
                 ),
             )
             and self._closed(before["platform_identity"], "platform_identity")
-            and before["platform_identity"]
-            == {"source": "github-actions-api", "authenticated": True}
+            and before["platform_identity"]["source"] == "github-actions-api"
+            and before["platform_identity"]["authenticated"] is True
             and before["receipt_sha256"] == _receipt_sha256(before)
-            and operation["run_id"] == producer["run_id"]
+            and self._same_positive_int(operation["run_id"], producer["run_id"])
             and operation["ref"] == producer["run_ref"]
             and not inputs
         )
@@ -1087,7 +1122,9 @@ class _RecoveryContractValidator:
             }
             or not self._positive_int(delivery["returned_run_id"])
             or not self._positive_int(delivery["unique_run_id"])
-            or delivery["unique_run_id"] != delivery["returned_run_id"]
+            or not self._same_positive_int(
+                delivery["unique_run_id"], delivery["returned_run_id"]
+            )
             or delivery["receipt_sha256"] != _receipt_sha256(delivery)
             or delivery["receipt_sha256"] != self.expected_delivery_receipt_sha256
             or not self._closed(
@@ -1111,16 +1148,20 @@ class _RecoveryContractValidator:
             != delivery["receipt_sha256"]
             or observation["request_delivery_status"] != "proved-delivered"
             or not self._positive_int(observation["returned_run_id"])
-            or observation["returned_run_id"] != delivery["returned_run_id"]
+            or not self._same_positive_int(
+                observation["returned_run_id"], delivery["returned_run_id"]
+            )
             or not self._closed(run_object, "platform_run_object")
             or not self._positive_int(run_object["id"])
             or not self._positive_int(run_object["run_attempt"])
             or not self._positive_int(run_object["workflow_id"])
-            or run_object["id"] != observation["returned_run_id"]
+            or not self._same_positive_int(
+                run_object["id"], observation["returned_run_id"]
+            )
             or observation["run_object_sha256"] != _canonical_sha256(run_object)
             or not self._closed(observation["platform_identity"], "platform_identity")
-            or observation["platform_identity"]
-            != {"source": "github-actions-api", "authenticated": True}
+            or observation["platform_identity"]["source"] != "github-actions-api"
+            or observation["platform_identity"]["authenticated"] is not True
             or observation["receipt_sha256"] != _receipt_sha256(observation)
         ):
             return False
@@ -1159,16 +1200,24 @@ class _RecoveryContractValidator:
             != delivery["receipt_sha256"]
             or current_observation["request_delivery_status"] != "proved-delivered"
             or not self._positive_int(current_observation["returned_run_id"])
-            or current_observation["returned_run_id"] != observation["returned_run_id"]
+            or not self._same_positive_int(
+                current_observation["returned_run_id"], observation["returned_run_id"]
+            )
             or not self._closed(current_run_object, "platform_run_object")
             or not self._positive_int(current_run_object["id"])
             or not self._positive_int(current_run_object["run_attempt"])
             or not self._positive_int(current_run_object["workflow_id"])
-            or current_run_object["id"] != observation["returned_run_id"]
+            or not self._same_positive_int(
+                current_run_object["id"], observation["returned_run_id"]
+            )
             or current_observation["run_object_sha256"]
             != _canonical_sha256(current_run_object)
-            or current_observation["platform_identity"]
-            != {"source": "github-actions-api", "authenticated": True}
+            or not self._closed(
+                current_observation["platform_identity"], "platform_identity"
+            )
+            or current_observation["platform_identity"]["source"]
+            != "github-actions-api"
+            or current_observation["platform_identity"]["authenticated"] is not True
             or current_observation["receipt_sha256"]
             != _receipt_sha256(current_observation)
         ):
@@ -1272,7 +1321,9 @@ class _RecoveryContractValidator:
                 transaction["repository"], accepted_preflight["repository"]
             )
             or not self._positive_int(transaction["run_id"])
-            or transaction["run_id"] != observation["returned_run_id"]
+            or not self._same_positive_int(
+                transaction["run_id"], observation["returned_run_id"]
+            )
             or transaction["pre_observation_sha256"]
             != accepted_preflight["pre_mutation_run_observation"]["receipt_sha256"]
             or transaction["delivery_receipt_sha256"] != delivery["receipt_sha256"]
@@ -1322,8 +1373,11 @@ class _RecoveryContractValidator:
             or delivery["response_sha256"] is not None
             or not self._positive_int(producer_attempt)
             or not self._positive_int(run_object["run_attempt"])
-            or run_object["run_attempt"] != producer_attempt + 1
-            or run_object["run_attempt"] != operation["expected_run_attempt"]
+            or not self._same_positive_int(
+                run_object["run_attempt"],
+                producer_attempt + 1,
+                operation["expected_run_attempt"],
+            )
             or not _repository_scoped_string_matches(
                 observation["query_endpoint"],
                 "/repos/",
@@ -1358,7 +1412,9 @@ class _RecoveryContractValidator:
                 accepted_preflight["repository"],
                 f"/actions/runs/{expected_run_id}/attempts/{producer_attempt}",
             )
-            or current_run_object["run_attempt"] != producer_attempt + 1
+            or not self._same_positive_int(
+                current_run_object["run_attempt"], producer_attempt + 1
+            )
             or not _repository_scoped_string_matches(
                 current_run_object["previous_attempt_url"],
                 "https://api.github.com/repos/",
@@ -1414,7 +1470,7 @@ class _RecoveryContractValidator:
             or not _same_repository(
                 transaction["repository"], accepted_preflight["repository"]
             )
-            or transaction["run_id"] != expected_run_id
+            or not self._same_positive_int(transaction["run_id"], expected_run_id)
             or transaction["pre_observation_sha256"]
             != accepted_preflight["pre_mutation_run_observation"]["receipt_sha256"]
             or transaction["delivery_receipt_sha256"] != delivery["receipt_sha256"]
@@ -1460,24 +1516,28 @@ class _RecoveryContractValidator:
             == current_observation["receipt_sha256"]
             and completion["acquisition_transaction_receipt_sha256"]
             == transaction["receipt_sha256"]
-            and self._positive_int(completion["returned_run_id"])
-            and completion["returned_run_id"] == expected_run_id
-            and completion["returned_run_id"] == observation["returned_run_id"]
+            and self._same_positive_int(
+                completion["returned_run_id"],
+                expected_run_id,
+                observation["returned_run_id"],
+            )
             and _same_repository(
                 completion["observed_repository"], run_object["repository"]
             )
             and _same_repository(
                 run_object["repository"], accepted_preflight["repository"]
             )
-            and self._positive_int(completion["observed_run_attempt"])
-            and completion["observed_run_attempt"] == run_object["run_attempt"]
+            and self._same_positive_int(
+                completion["observed_run_attempt"], run_object["run_attempt"]
+            )
             and completion["observed_head_sha"]
             == run_object["head_sha"]
             == accepted_preflight["head_sha"]
-            and self._positive_int(completion["observed_workflow_id"])
-            and completion["observed_workflow_id"]
-            == run_object["workflow_id"]
-            == operation["workflow_id"]
+            and self._same_positive_int(
+                completion["observed_workflow_id"],
+                run_object["workflow_id"],
+                operation["workflow_id"],
+            )
             and completion["observed_workflow_sha"]
             == run_object["workflow_sha"]
             == producer["workflow_sha"]
@@ -2899,6 +2959,237 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 operation[field] = bool(operation[field])
                 rehash(contract)
                 self.assertFalse(validator_for(contract).validate_preflight(contract))
+
+    def test_recovery_id_and_authentication_joins_reject_boolean_aliases(
+        self,
+    ) -> None:
+        producer_fields = self.carriers["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_producer_implementation_receipt"]
+
+        def rehash_preflight(
+            contract: dict[str, object], producer: dict[str, object]
+        ) -> None:
+            producer["receipt_sha256"] = _receipt_sha256(producer)
+            resolution = contract["dependency_edge_resolution_receipt"]
+            resolution["implementation_receipt_sha256"] = producer["receipt_sha256"]
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            before = contract["pre_mutation_run_observation"]
+            before["receipt_sha256"] = _receipt_sha256(before)
+            contract["repeat_safety"]["operation_identity_sha256"] = _canonical_sha256(
+                contract["operation_intent"]
+            )
+            contract["preflight_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in contract.items()
+                    if key != "preflight_sha256"
+                }
+            )
+
+        def preflight_validator(
+            contract: dict[str, object], producer: dict[str, object]
+        ) -> _RecoveryContractValidator:
+            resolution = contract["dependency_edge_resolution_receipt"]
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                producer,
+                producer_fields,
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                resolution["resolver_anchor"],
+                contract["pre_mutation_run_observation"],
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        def id_join_fixture() -> tuple[dict[str, object], dict[str, object]]:
+            contract = copy.deepcopy(self.recovery_contract)
+            producer = copy.deepcopy(self.producer_receipt)
+            producer["run_id"] = 1
+            producer["workflow_id"] = 1
+            implementation = contract["implementation_receipt_identity"]
+            implementation["receipt_sha256"] = ""
+            implementation["run_id"] = 1
+            implementation["workflow_id"] = 1
+            operation = contract["operation_intent"]
+            operation["run_id"] = 1
+            operation["workflow_id"] = 1
+            before = contract["pre_mutation_run_observation"]
+            before["query_endpoint"] = f"/repos/{contract['repository']}/actions/runs/1"
+            before["run_id"] = 1
+            before["workflow_id"] = 1
+            rehash_preflight(contract, producer)
+            implementation["receipt_sha256"] = producer["receipt_sha256"]
+            rehash_preflight(contract, producer)
+            return contract, producer
+
+        for receipt, field in (
+            ("implementation_receipt_identity", "run_id"),
+            ("implementation_receipt_identity", "workflow_id"),
+            ("operation_intent", "run_id"),
+            ("operation_intent", "workflow_id"),
+        ):
+            with self.subTest(receipt=receipt, field=field):
+                contract, producer = id_join_fixture()
+                validator = preflight_validator(contract, producer)
+                self.assertTrue(validator.validate_preflight(contract))
+                contract[receipt][field] = True
+                rehash_preflight(contract, producer)
+                self.assertFalse(validator.validate_preflight(contract))
+
+        contract = copy.deepcopy(self.recovery_contract)
+        producer = copy.deepcopy(self.producer_receipt)
+        before = contract["pre_mutation_run_observation"]
+        before["platform_identity"]["authenticated"] = 1
+        rehash_preflight(contract, producer)
+        self.assertFalse(
+            preflight_validator(contract, producer).validate_preflight(contract)
+        )
+
+        for observation_name in ("platform", "current"):
+            with self.subTest(observation=observation_name):
+                observation = copy.deepcopy(self.platform_observation)
+                current = copy.deepcopy(self.post_current_observation)
+                transaction = copy.deepcopy(self.acquisition_transaction)
+                completion = copy.deepcopy(self.completion_receipt)
+                target = observation if observation_name == "platform" else current
+                target["platform_identity"]["authenticated"] = 1
+                target["receipt_sha256"] = _receipt_sha256(target)
+                transaction["exact_attempt_observation_sha256"] = observation[
+                    "receipt_sha256"
+                ]
+                transaction["current_run_observation_sha256"] = current[
+                    "receipt_sha256"
+                ]
+                transaction["receipt_sha256"] = _receipt_sha256(transaction)
+                completion["platform_observation_receipt_sha256"] = observation[
+                    "receipt_sha256"
+                ]
+                completion["post_current_observation_receipt_sha256"] = current[
+                    "receipt_sha256"
+                ]
+                completion["acquisition_transaction_receipt_sha256"] = transaction[
+                    "receipt_sha256"
+                ]
+                completion["completion_sha256"] = _canonical_sha256(
+                    {
+                        key: value
+                        for key, value in completion.items()
+                        if key != "completion_sha256"
+                    }
+                )
+                validator = _RecoveryContractValidator(
+                    self.recovery_schema,
+                    self.producer_receipt,
+                    producer_fields,
+                    observation,
+                    self.dispatch_delivery_receipt,
+                    self.dispatch_delivery_receipt["receipt_sha256"],
+                    self.recovery_contract["dependency_edge_resolution_receipt"],
+                    self.recovery_contract["dependency_edge_resolution_receipt"][
+                        "resolver_anchor"
+                    ],
+                    self.recovery_contract["pre_mutation_run_observation"],
+                    current,
+                    transaction,
+                )
+                self.assertFalse(
+                    validator.validate_completion(completion, self.recovery_contract)
+                )
+
+    def test_recovery_independent_parent_receipts_preserve_types(
+        self,
+    ) -> None:
+        producer_fields = self.carriers["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_producer_implementation_receipt"]
+
+        def validator_for(
+            *,
+            expected_resolution: dict[str, object] | None = None,
+            expected_before: dict[str, object] | None = None,
+        ) -> _RecoveryContractValidator:
+            resolution = self.recovery_contract["dependency_edge_resolution_receipt"]
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                self.producer_receipt,
+                producer_fields,
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution if expected_resolution is None else expected_resolution,
+                resolution["resolver_anchor"],
+                self.recovery_contract["pre_mutation_run_observation"]
+                if expected_before is None
+                else expected_before,
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        contract = copy.deepcopy(self.recovery_contract)
+        self.assertTrue(validator_for().validate_preflight(contract))
+
+        expected_before = copy.deepcopy(contract["pre_mutation_run_observation"])
+        expected_before["platform_identity"]["authenticated"] = 1
+        self.assertTrue(
+            contract["pre_mutation_run_observation"]["platform_identity"][
+                "authenticated"
+            ]
+            is True
+        )
+        self.assertEqual(
+            expected_before["receipt_sha256"],
+            contract["pre_mutation_run_observation"]["receipt_sha256"],
+        )
+        self.assertEqual(expected_before, contract["pre_mutation_run_observation"])
+        self.assertFalse(
+            _type_preserving_equal(
+                expected_before, contract["pre_mutation_run_observation"]
+            )
+        )
+        self.assertFalse(
+            validator_for(expected_before=expected_before).validate_preflight(contract)
+        )
+
+        expected_resolution = copy.deepcopy(
+            contract["dependency_edge_resolution_receipt"]
+        )
+        record_index = next(
+            index
+            for index, item in enumerate(expected_resolution["records"])
+            if item["discovered_reference_count"] == 1
+        )
+        record = expected_resolution["records"][record_index]
+        record["discovered_reference_count"] = True
+        embedded_resolution = contract["dependency_edge_resolution_receipt"]
+        embedded_count = embedded_resolution["records"][record_index][
+            "discovered_reference_count"
+        ]
+        self.assertIs(type(embedded_count), int)
+        self.assertEqual(
+            embedded_count,
+            1,
+        )
+        self.assertEqual(
+            expected_resolution["receipt_sha256"],
+            embedded_resolution["receipt_sha256"],
+        )
+        self.assertEqual(
+            expected_resolution["records"][record_index]["record_sha256"],
+            embedded_resolution["records"][record_index]["record_sha256"],
+        )
+        self.assertEqual(expected_resolution, embedded_resolution)
+        self.assertFalse(
+            _type_preserving_equal(expected_resolution, embedded_resolution)
+        )
+        self.assertFalse(
+            validator_for(expected_resolution=expected_resolution).validate_preflight(
+                contract
+            )
+        )
 
     def test_recovery_refs_and_endpoints_preserve_non_repository_bytes(self) -> None:
         def validate_before(**updates: str) -> bool:

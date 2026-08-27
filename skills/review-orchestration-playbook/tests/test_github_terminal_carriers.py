@@ -1799,14 +1799,25 @@ class _ReportValidator:
     ) -> bool:
         parent_scope = self.merge_status_parent_scope
         parent_contract = self.merge_status_parent_contract
+        if not self._closed_parent_input(
+            parent_scope, "merge_status_scope"
+        ) or not self._closed_parent_input(
+            parent_contract, "merge_status_parent_contract"
+        ):
+            return False
+        report_scope = {
+            "repository": report["repository"],
+            "pull_request": report["pull_request"],
+            "feature_head_sha": report["head_sha"],
+        }
+        parent_report_scope = {
+            "repository": parent_scope["repository"],
+            "pull_request": parent_scope["pull_request"],
+            "feature_head_sha": parent_scope["feature_head_sha"],
+        }
         if (
-            not self._closed_parent_input(parent_scope, "merge_status_scope")
-            or not self._closed_parent_input(
-                parent_contract, "merge_status_parent_contract"
-            )
-            or not _same_repository(report["repository"], parent_scope["repository"])
-            or report["pull_request"] != parent_scope["pull_request"]
-            or report["head_sha"] != parent_scope["feature_head_sha"]
+            not self._positive_int(parent_scope["pull_request"])
+            or not self._scope_records_equal(report_scope, parent_report_scope)
             or parent_contract["owner"] != "parent-orchestrator"
             or parent_contract["status"] != "complete"
             or not self._merge_status_contract_trust_anchor_matches(report)
@@ -4217,8 +4228,11 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self,
         snapshot: dict[str, object] | None,
         *,
+        selection_outcome: dict[str, object] | None = None,
+        direct_scope: dict[str, object] | None = None,
         terminal_identity: dict[str, object] | None = None,
         reaction_epoch: dict[str, object] | None = None,
+        merge_scope: dict[str, object] | None = None,
         merge_contract: dict[str, object] | None = None,
         merge_anchor: dict[str, object] | None = None,
         merge_exclusion_receipt: dict[str, object] | None = None,
@@ -4256,8 +4270,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         selected_resolution["receipt_sha256"] = _receipt_sha256(selected_resolution)
         return _ReportValidator(
             self.grammar,
-            self.selected_parent_selection_outcome,
-            self.direct_positive_parent_scope,
+            (
+                selection_outcome
+                if selection_outcome is not None
+                else self.selected_parent_selection_outcome
+            ),
+            direct_scope
+            if direct_scope is not None
+            else self.direct_positive_parent_scope,
             (
                 terminal_identity
                 if terminal_identity is not None
@@ -4268,7 +4288,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 if reaction_epoch is not None
                 else self.reaction_clean_parent_epoch
             ),
-            self.merge_status_parent_scope,
+            merge_scope if merge_scope is not None else self.merge_status_parent_scope,
             (
                 merge_contract
                 if merge_contract is not None
@@ -7306,6 +7326,35 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.merge_status_parent_contract,
                 )
                 self.assertFalse(validator.validate(report))
+
+    def test_merge_status_parent_scope_rejects_pr_one_boolean_alias_after_rehash(
+        self,
+    ) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        report["pull_request"] = 1
+        report["evidence"]["association"]["pull_request"] = True
+        parent_scope = copy.deepcopy(self.merge_status_parent_scope)
+        parent_scope["pull_request"] = True
+        selection = copy.deepcopy(self.selected_parent_selection_outcome)
+        selection["pull_request"] = 1
+        direct_scope = copy.deepcopy(self.direct_positive_parent_scope)
+        direct_scope["pull_request"] = 1
+        snapshot = self._merge_snapshot_for_report(report, "d")
+        for phase in ("initial", "final"):
+            snapshot[f"{phase}_scope"] = copy.deepcopy(direct_scope)
+        validator = self._validator_with_complete_snapshot(
+            snapshot,
+            selection_outcome=selection,
+            direct_scope=direct_scope,
+            merge_scope=parent_scope,
+        )
+
+        self.assertTrue(validator._selection_outcome_matches(report))
+        self.assertTrue(
+            validator._complete_pr_snapshot_matches(report, report["evidence"], "clean")
+        )
+        self.assertFalse(validator._merge_status_evidence(report, report["evidence"]))
+        self.assertFalse(validator.validate(report))
 
     def test_independent_scope_records_use_repository_identity_only(self) -> None:
         head_sha = self.direct_positive_parent_scope["head_sha"]

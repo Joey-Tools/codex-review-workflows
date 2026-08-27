@@ -2369,6 +2369,40 @@ superseded_by:
   `104/104`. Outside the previously demonstrated outer macOS sandbox
   restriction, the complete review-playbook suite then passed all `3,249`
   tests in `1,952.505` seconds with six conditional skips and no failures.
+- The fresh whole-range review of signed head `f5bbaa3` found two remaining
+  Python Boolean/integer alias joins: recovery implementation, operation, and
+  authenticated platform evidence still used ordinary equality in several
+  trust/ID relationships, and merge-status parent scope could match Boolean
+  `true` to pull request `1`. Recovery now validates every linked run,
+  workflow, attempt, delivery, observation, transaction, and completion ID as
+  a positive non-Boolean safe integer before comparison, requires each
+  authentication bit with `is True`, and recursively compares independently
+  supplied implementation, dependency, pre-mutation, and resolver receipts
+  type for type. Merge-status requires a positive parent PR number and uses the
+  repository-aware scope comparator, so only repository spelling is
+  case-insensitive while PR number and head remain type- and byte-exact.
+- The first closure audit found that the embedded pre-mutation receipt was
+  strict but its independent parent-owned expected copy still joined through
+  ordinary dictionary equality. A second audit then found that the initial
+  regression rehashed the malformed parent copy, allowing unequal digest
+  strings to mask the intended join. The final end-to-end regressions preserve
+  identical embedded/parent digest bytes, explicitly prove that Python's old
+  dictionary equality accepts the one-sided `True`/`1` aliases, and prove the
+  recursive type-preserving join and validator reject them. The final Ultra
+  closure audit returned no findings. Both repaired modules passed `61/61`
+  under CPython 3.10 and 3.13, the joined four-module matrix passed `107/107`,
+  and Ruff plus whitespace validation passed. The next complete suite ran all
+  `3,252` tests with six conditional skips in `3,842.232` seconds. Four
+  `test_named_lane` subprocess calls exhausted approximately `1.965`-second
+  deadlines while the suite took roughly twice its preceding wall time; no
+  recovery or terminal-carrier assertion failed. The persisted runner output
+  retained two exact IDs but truncated the other two before durable capture.
+  Both retained failures passed an immediate exact rerun, and the complete
+  `74`-test supervisor/signal/session/output group spanning their unittest
+  ordering interval then passed in `276.937` seconds with no residual fixture
+  process. This classifies the four errors as host-load deadline artifacts,
+  while retaining the earlier post-loader full-suite clean result as the
+  complete green baseline for unchanged named-lane code.
 
 ## Next Steps
 
