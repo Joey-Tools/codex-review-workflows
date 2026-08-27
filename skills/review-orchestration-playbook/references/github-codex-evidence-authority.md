@@ -522,6 +522,19 @@ digest to a separate closed parent-owned authenticated platform observation
 for the exact query endpoint, proved delivery/returned ID, closed run object
 and digest, and run/head/workflow/ref/job identities. Completion fields cannot
 self-attest.
+Existing-run recovery has two closed modes: full rerun POSTs `/rerun` and
+failed-jobs rerun POSTs `/rerun-failed-jobs`; each uses API `2026-03-10`, no
+request body, and HTTP 201. An independently supplied authenticated observation
+binds attempt `n` before mutation. The post receipt is an authenticated HTTP
+200 GET of exact `/attempts/{n+1}` and binds exact `n+1`, the attempt-`n`
+`previous_attempt_url`, and acquisition ordering. Cross-mode, ambiguous,
+debug/job-specific, current-run-only, stale, unchanged, or skipped-attempt
+evidence is status-only.
+Follow the exact-attempt GET with an authenticated current-run GET proving the
+same identity and current `run_attempt == n+1`. A separately closed transaction
+joins pre-observation, 201 delivery, both post observations, GitHub response
+dates, acquisition times, and platform `run_started_at`/`updated_at`.
+Historical-attempt replay or a possible intervening rerun is status-only.
 Guarded dispatch is mutation-eligible only under API version `2026-03-10` with
 the exact POST endpoint and semantic body, HTTP 200, and closed
 `{workflow_run_id, run_url, html_url}` response and canonical digest. The ID

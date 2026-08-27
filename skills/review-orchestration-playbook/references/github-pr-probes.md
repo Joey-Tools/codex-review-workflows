@@ -311,10 +311,22 @@ operation that can recover the machine-decidable retryable state:
    run/check identities equal the frozen contract. GitHub reruns retain that
    run's original `GITHUB_SHA` and `GITHUB_REF`; do not substitute a live branch
    ref.
+   Bind an independently supplied authenticated pre-mutation run receipt for
+   attempt `n`, POST exactly `/rerun-failed-jobs` with API `2026-03-10`, no
+   request body, and HTTP 201, then GET exactly `/attempts/{n+1}` with HTTP 200.
 2. Rerun the full exact existing run under the same binding for a run-level
    infrastructure failure or broken aggregate. Stop mutation attempts at the
    provider or contract cap; GitHub's total rerun limit is 50. Hourly monitoring
    remains unlimited after mutation eligibility is exhausted.
+   This is the distinct `existing-run-rerun-full` operation and uses `/rerun`;
+   it cannot reuse a failed-jobs preflight or authorization. Both modes require
+   exact `n+1`, the attempt-`n` `previous_attempt_url`, and authenticated
+   acquisition ordering across preflight, POST, and post observation.
+   Follow the exact-attempt GET with an authenticated current-run GET and
+   require the same identity plus current `run_attempt == n+1`. One closed
+   transaction joins all four receipts, GitHub response dates, acquisition
+   times, and platform `run_started_at`/`updated_at`; a historical attempt
+   re-read or possible intervening rerun remains status-only.
 3. A new `workflow_dispatch` is eligible only when the trusted immutable
    workflow revision contains a closure-bound pre-side-effect gate accepting
    exact `expected_head_sha`, rereading the live selected-PR head, and aborting

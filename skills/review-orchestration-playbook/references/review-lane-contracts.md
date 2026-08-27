@@ -692,6 +692,18 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   query endpoint, delivery/returned ID, closed run object/digest, actual head,
   workflow SHA/ref, run ref, and job identity; completion fields do not
   self-attest.
+  Existing-run mode is exactly full or failed-jobs. Bind an independent
+  authenticated attempt-`n` pre-observation, API `2026-03-10` POST to exact
+  `/rerun` or `/rerun-failed-jobs` with no body and HTTP 201, and an
+  authenticated HTTP 200 GET of exact `/attempts/{n+1}` proving exact `n+1`,
+  the attempt-`n` `previous_attempt_url`, and acquisition ordering. Cross-mode
+  reuse, debug/job variants, current-run-only queries, and stale or skipped
+  attempts are status-only.
+  Follow the exact-attempt GET with an authenticated current-run GET and require
+  the same identity plus current `run_attempt == n+1`. One closed transaction
+  joins pre-observation, 201 POST, both post observations, response/acquisition
+  ordering, and platform `run_started_at`/`updated_at`; historical-attempt
+  replay or a possible intervening rerun is status-only.
   Guarded-dispatch v1 requires API version `2026-03-10`, exact POST endpoint
   and semantic `{ref, inputs: inputs_object}` body, HTTP 200, and a closed
   `{workflow_run_id, run_url, html_url}` response/digest whose ID and canonical

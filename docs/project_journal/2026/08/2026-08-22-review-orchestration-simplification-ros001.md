@@ -2104,6 +2104,27 @@ superseded_by:
   body, changed URL/ID, or coupled substitution remains status-only. This
   preserves automatic recovery when GitHub supplies atomic run details without
   turning approximate discovery into authority.
+- The final fresh-context review exposed four additional recovery-boundary
+  gaps that focused self-tests had not found: target repository identity did
+  not cross every receipt boundary; the recovery resolver could still omit a
+  dependency edge or supply its own trust anchor; an existing-run rerun could
+  reuse an older run snapshot; and failed-job versus full reruns shared an
+  ambiguous operation kind. The repaired contract now carries exact target
+  repository equality through producer, operation, delivery, observation, and
+  completion; freezes resolver anchor, provenance, and full-entry resolution
+  independently from the candidate preflight; and maps failed-job/full reruns
+  to separate GitHub REST operations with distinct operation identities.
+- Existing-run recovery now joins a mutation-before authenticated current-run
+  observation, an exact HTTP 201 no-body delivery receipt, an exact-attempt
+  observation, a mutation-after current-run observation, and a closed
+  acquisition transaction. Both post observations must describe attempt
+  `n + 1` with the same immutable run identity and platform start time, while
+  the start must follow the POST boundary. A stale historical attempt, an
+  intervening rerun, a cross-mode endpoint, or a coupled digest rewrite is
+  status-only. Exact-attempt and current-run `updated_at` values are validated
+  against their own response windows rather than compared across endpoints;
+  live GitHub samples showed that those endpoint projections may differ by one
+  second even for the same attempt.
 - Repeat safety and mutation authority remain separate. Equality of an
   operation tuple identifies a requested repeat but does not make arbitrary
   Actions idempotent or reentrant. Only a candidate-range-external closed
@@ -2118,18 +2139,21 @@ superseded_by:
   supplied-diff review helper. The active skill describes only the clean
   independent workspace and current local/GitHub lane contracts; unadvertised
   compatibility internals remain outside named review shapes.
-- Four rounds of coupled-mutation audit progressively rejected forged
+- Multiple rounds of coupled-mutation audit progressively rejected forged
   producer references, root-only and empty-edge closure claims, fake source
   anchors, arbitrary existing-run refs, unbound gate entries, pre/post phase
   conflation, substituted dispatch runs, incomplete REST response envelopes,
-  and the internal-list-versus-API-object request-body mismatch. The final
-  independent focused audit returned `CLEAN`; the combined contract/carrier/
-  recovery/local-lane matrix passed all 86 tests. The authoritative outer-
-  environment warning-strict whole-skill suite then passed all 3,225 tests with
-  six conditional skips in 1,487.224 seconds. The GitHub Action/status/ruleset
-  thread remains responsible for the production producer and consumer; this
-  workstream supplies its closed skill-facing evidence contract and test-only
-  reference validators without claiming they are the deployed integration.
+  the internal-list-versus-API-object request-body mismatch, cross-repository
+  receipt substitution, a candidate-controlled installed-release resolver,
+  stale historical attempts after a new rerun POST, and cross-mode rerun
+  substitution. The first focused audit returned `CLEAN`, but the later formal
+  fresh-context review correctly found four stronger coupled attacks; each
+  original attack author then re-ran its probe against the repaired contract
+  and returned `CLEAN`. The focused contract/carrier/recovery/local-lane matrix
+  now passes all 88 tests. The GitHub Action/status/ruleset thread remains
+  responsible for the production producer and consumer; this workstream
+  supplies its closed skill-facing evidence contract and test-only reference
+  validators without claiming they are the deployed integration.
 
 ## Next Steps
 
@@ -2177,9 +2201,11 @@ superseded_by:
   tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`86` focused policy, distribution, carrier, report, recovery, and
-  self-policy contracts), followed by the complete `3,225`-test suite with six
-  conditional skips in `1,487.224` seconds.
+  matrix (`88` focused policy, distribution, carrier, report, recovery, and
+  self-policy contracts). The preceding exact head passed the complete
+  `3,225`-test suite with six conditional skips in `1,487.224` seconds; the
+  final repaired head will be validated and reported as PR evidence before
+  publication.
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
   parse; source-only Python compile; Ruff lint; Markdown relative-link check;

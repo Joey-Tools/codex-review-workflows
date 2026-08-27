@@ -788,6 +788,18 @@ observation for exact query endpoint, delivery/returned ID, closed run
 object/digest, and run/head/workflow/ref/job identities. Completion fields
 cannot self-attest. Tuple equality never creates repeat safety, and mutation authorization
 remains separate. Stop mutations at provider/contract caps while hourly
+monitoring remains unlimited. Existing-run full and failed-jobs reruns are
+distinct operations: bind an independent authenticated attempt-`n`
+pre-observation, API `2026-03-10` HTTP 201 POST to exact `/rerun` or
+`/rerun-failed-jobs` with no body, and authenticated HTTP 200 GET of exact
+`/attempts/{n+1}` proving exact `n+1`, attempt-`n` `previous_attempt_url`, and
+acquisition ordering. Cross-mode or stale/current-run-only evidence is
+status-only.
+Follow the exact-attempt GET with an authenticated current-run GET proving the
+same identity and current `run_attempt == n+1`. Join pre-observation, 201 POST,
+both post observations, response/acquisition ordering, and platform
+`run_started_at`/`updated_at` in one closed transaction receipt; historical
+attempt replay or a possible intervening rerun is status-only.
 status-only monitoring may continue without a time ceiling. Never reconcile a
 substantive finding, test failure, policy failure, or comment creation as
 infrastructure.

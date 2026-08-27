@@ -153,10 +153,27 @@ Before any Actions mutation, validate a closed parent-owned
 exact repository/PR/frozen head, source trust anchor, candidate-range exclusion
 receipt, dynamically identified workflow/run/ref/operation/inputs, and trusted
 producer-implementation receipt identity plus a complete resolved dependency
-edge receipt, and independently declares the exact operation idempotent or
+edge receipt supplied independently by the parent; it gives every canonical
+repository/commit/path/kind/blob closure entry one sorted, unique, complete
+parser/reference record and a bijective full-entry edge projection. It also
+independently declares the exact operation idempotent or
 reentrant. Existing-run reruns are eligible only when
 the platform-authenticated original head, ref, workflow SHA, and run/check
 identity match; GitHub reruns retain the original `GITHUB_SHA` and `GITHUB_REF`.
+The operation kind is exactly `existing-run-rerun-full` or
+`existing-run-rerun-failed-jobs`; these are different operations. Bind an
+authenticated pre-mutation GET of attempt `n`, then require the matching exact
+POST endpoint (`/rerun` or `/rerun-failed-jobs`) under API `2026-03-10` with
+HTTP 201 and no request body, followed by an authenticated HTTP 200 GET of
+`/attempts/{n+1}`. The post receipt must prove exact attempt `n+1`, its
+`previous_attempt_url` for attempt `n`, and acquisition no earlier than the
+POST. Then GET the current run and require the same repository/run/head/workflow/ref
+identity and current `run_attempt == n+1`. One closed transaction joins the
+pre-observation, 201 POST, exact-attempt GET, current-run GET, GitHub response
+dates, acquisition times, and platform `run_started_at`/`updated_at`. A
+historical attempt re-read after a new POST or any possible intervening rerun
+is status-only. An ambiguous mode, current-run-only snapshot, unchanged/skipped attempt,
+debug rerun, cross-mode endpoint, or stale receipt remains status-only.
 Never use generic `gh workflow run --ref <current-head-branch>` as a head
 binding. A new dispatch requires an immutable workflow closure whose resolved
 dependency edges bind the actual gate implementation, plus a closure-bound
