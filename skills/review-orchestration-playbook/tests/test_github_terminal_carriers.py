@@ -4,9 +4,13 @@ import copy
 import datetime
 import hashlib
 import json
+import os
 import pathlib
 import re
+import stat
+import tempfile
 import unittest
+import unittest.mock
 import urllib.parse
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -24,6 +28,8 @@ MAX_CANONICAL_JSON_DEPTH = 256
 MAX_CANONICAL_JSON_NODES = 100_000
 MAX_CANONICAL_JSON_STRING_UTF8_BYTES = 1 << 20
 MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES = 16 << 20
+MAX_CARRIER_GRAMMAR_SOURCE_BYTES = 2 << 20
+MAX_JSON_INTEGER_DIGITS = len(str(MAX_SAFE_INTEGER))
 GRAMMAR_TOP_LEVEL_KEYS = frozenset(
     {
         "ancestor_shas_projection",
@@ -279,11 +285,50 @@ def _require_rfc8785_integer_domain(value: object) -> None:
         raise ValueError("canonical JSON value is outside the integer-only profile")
 
 
+def _read_carrier_grammar_source(path: pathlib.Path) -> str:
+    """Read the fixed grammar through a pre-decode byte and file-type bound."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("carrier grammar source cannot be opened safely") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("carrier grammar source must be a regular file")
+        if metadata.st_size > MAX_CARRIER_GRAMMAR_SOURCE_BYTES:
+            raise ValueError("carrier grammar source exceeds the raw byte cap")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_CARRIER_GRAMMAR_SOURCE_BYTES + 1)
+        if len(raw) > MAX_CARRIER_GRAMMAR_SOURCE_BYTES:
+            raise ValueError("carrier grammar source exceeds the raw byte cap")
+    except OSError as error:
+        raise ValueError("carrier grammar source cannot be read safely") from error
+    finally:
+        os.close(descriptor)
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("carrier grammar source must be strict UTF-8") from error
+
+
 def _load_carrier_grammar_text(text: str) -> dict[str, object]:
     """Load the closed grammar without JSON ambiguity or unvalidated content."""
 
     if type(text) is not str:
         raise ValueError("carrier grammar must be JSON text")
+    if len(text) > MAX_CARRIER_GRAMMAR_SOURCE_BYTES:
+        raise ValueError("carrier grammar source exceeds the raw byte cap")
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("carrier grammar source must be strict UTF-8") from error
+    if len(encoded) > MAX_CARRIER_GRAMMAR_SOURCE_BYTES:
+        raise ValueError("carrier grammar source exceeds the raw byte cap")
 
     def closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -296,11 +341,25 @@ def _load_carrier_grammar_text(text: str) -> dict[str, object]:
     def reject_non_finite_constant(constant: str) -> object:
         raise ValueError(f"non-finite JSON number: {constant}")
 
+    def parse_integer(token: str) -> int:
+        digits = token[1:] if token.startswith("-") else token
+        if len(digits) > MAX_JSON_INTEGER_DIGITS:
+            raise ValueError("JSON integer token exceeds the safe digit cap")
+        value = int(token)
+        if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+            raise ValueError("integer is outside the RFC 8785 interoperable domain")
+        return value
+
+    def reject_float(token: str) -> object:
+        raise ValueError(f"floating-point JSON number is not permitted: {token[:32]}")
+
     try:
         grammar = json.loads(
             text,
             object_pairs_hook=closed_object,
             parse_constant=reject_non_finite_constant,
+            parse_float=reject_float,
+            parse_int=parse_integer,
         )
         _require_rfc8785_integer_domain(grammar)
     except VALIDATION_EXCEPTIONS as error:
@@ -313,6 +372,10 @@ def _load_carrier_grammar_text(text: str) -> dict[str, object]:
     if type(grammar) is not dict or set(grammar) != GRAMMAR_TOP_LEVEL_KEYS:
         raise ValueError("carrier grammar has a non-closed top-level object")
     return grammar
+
+
+def _load_carrier_grammar_path(path: pathlib.Path) -> dict[str, object]:
+    return _load_carrier_grammar_text(_read_carrier_grammar_source(path))
 
 
 _MALFORMED_PARENT_INPUT = object()
@@ -3423,9 +3486,7 @@ class _ReportValidator:
 class GitHubTerminalCarrierContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.grammar = _load_carrier_grammar_text(
-            GRAMMAR_PATH.read_text(encoding="utf-8")
-        )
+        cls.grammar = _load_carrier_grammar_path(GRAMMAR_PATH)
         cls.classifier = _ReferenceClassifier(cls.grammar)
         cls.selected_parent_selection_outcome = copy.deepcopy(
             cls.grammar["report_parent_selection_outcomes"]["selected_pr"]
@@ -4518,9 +4579,60 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         return snapshot
 
     def test_resource_loader_rejects_ambiguous_or_unbounded_json(self) -> None:
-        source = GRAMMAR_PATH.read_text(encoding="utf-8")
+        source = _read_carrier_grammar_source(GRAMMAR_PATH)
         loaded = _load_carrier_grammar_text(source)
         self.assertTrue(_ReportValidator._type_preserving_equal(loaded, self.grammar))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            oversized_path = pathlib.Path(temporary_directory) / "oversized.json"
+            with oversized_path.open("wb") as stream:
+                stream.write(b"\xff")
+                stream.truncate(MAX_CARRIER_GRAMMAR_SOURCE_BYTES + 1)
+            with self.assertRaisesRegex(ValueError, "raw byte cap"):
+                _load_carrier_grammar_path(oversized_path)
+
+        class ReadProbe:
+            def __init__(self) -> None:
+                self.read_sizes: list[int] = []
+
+            def __enter__(self) -> ReadProbe:
+                return self
+
+            def __exit__(self, *unused: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return b"{}"
+
+        read_probe = ReadProbe()
+        with (
+            unittest.mock.patch.object(
+                pathlib.Path,
+                "read_text",
+                side_effect=AssertionError("unbounded text read attempted"),
+            ),
+            unittest.mock.patch.object(os, "fdopen", return_value=read_probe),
+        ):
+            self.assertEqual(_read_carrier_grammar_source(GRAMMAR_PATH), "{}")
+        self.assertEqual(read_probe.read_sizes, [MAX_CARRIER_GRAMMAR_SOURCE_BYTES + 1])
+
+        with self.assertRaisesRegex(ValueError, "raw byte cap"):
+            _load_carrier_grammar_text(" " * (MAX_CARRIER_GRAMMAR_SOURCE_BYTES + 1))
+
+        oversized_integer = source.replace(
+            '  "schema_version": 1,',
+            f'  "schema_version": {"9" * (MAX_JSON_INTEGER_DIGITS + 1)},',
+            1,
+        )
+        self.assertNotEqual(oversized_integer, source)
+        with unittest.mock.patch(
+            "builtins.int", side_effect=AssertionError("integer conversion attempted")
+        ) as integer_constructor:
+            with self.assertRaises(ValueError) as integer_error:
+                _load_carrier_grammar_text(oversized_integer)
+        integer_constructor.assert_not_called()
+        self.assertRegex(str(integer_error.exception), "integer token exceeds")
 
         duplicate_key = source.replace(
             '  "schema": "github-codex-terminal-carriers-v1",',

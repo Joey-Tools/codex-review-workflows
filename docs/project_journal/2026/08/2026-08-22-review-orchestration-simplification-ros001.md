@@ -2347,6 +2347,28 @@ superseded_by:
   The journal-only evidence update receives lightweight validation; the signed
   repaired head still receives new exact-secret admission and a fresh
   whole-range review rather than reusing the reviewed `c3951fe` result.
+- The next zero-inherited-context `gpt-5.6-sol` / `ultra` peer review of the
+  signed `493957a` head found one remaining resource-ordering defect in the
+  fixed terminal-carrier grammar loader: the resource was read without a raw
+  byte bound and integer tokens reached Python's integer constructor before
+  the post-decode resource walk. A fixed 2 MiB source cap now applies through
+  one descriptor-bound regular-file read of at most `cap + 1` bytes before
+  strict UTF-8 decoding or JSON parsing. The loader rejects symlink traversal
+  where the host supplies `O_NOFOLLOW`, floating-point tokens, non-finite
+  constants, and integer tokens outside the safe digit/range profile; the
+  integer digit check precedes `int()` so Python 3.10 cannot spend unbounded
+  work on a giant literal. The existing node, depth, individual-string, and
+  aggregate-string caps remain the decoded-value checks.
+- A separate Ultra audit accepted that implementation but found that the first
+  regressions proved only the eventual error, not the ordering property. The
+  strengthened tests use an oversized invalid-UTF-8 file, prohibit
+  `Path.read_text`, observe the exact bounded read request, and mock `int()` to
+  prove that an over-limit token is rejected before conversion. The follow-up
+  audit returned no findings. The carrier module passed `39/39` under both
+  CPython 3.10 and 3.13, and the joined four-module contract matrix passed
+  `104/104`. Outside the previously demonstrated outer macOS sandbox
+  restriction, the complete review-playbook suite then passed all `3,249`
+  tests in `1,952.505` seconds with six conditional skips and no failures.
 
 ## Next Steps
 
