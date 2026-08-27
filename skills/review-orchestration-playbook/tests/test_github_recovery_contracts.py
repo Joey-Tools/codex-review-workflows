@@ -552,11 +552,26 @@ class _RecoveryContractValidator:
             or isinstance(exclusion["candidate_commit_count"], bool)
             or exclusion["candidate_commit_count"] != len(commits)
             or exclusion["candidate_commits_sha256"] != _commit_set_sha256(commits)
-            or (
-                _same_repository(source["source_repository"], contract["repository"])
-                and source["source_commit"] in commits
-            )
         ):
+            return False
+
+        source_kind = anchor["kind"]
+        source_is_candidate_repository = _same_repository(
+            source["source_repository"], contract["repository"]
+        )
+        if source_kind == "target-branch-baseline":
+            if not (
+                source_is_candidate_repository
+                and source["source_commit"] == exclusion["base_sha"]
+            ):
+                return False
+        elif source_kind == "installed-trusted-release":
+            if source_is_candidate_repository and source["source_commit"] in commits:
+                return False
+        elif source_kind == "parent-fixed-external":
+            if source_is_candidate_repository:
+                return False
+        else:
             return False
 
         producer = self.producer_receipt
@@ -2083,6 +2098,121 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             }
         )
         self.assertFalse(self.recovery_validator.validate_preflight(manual_dispatch))
+
+    def test_recovery_source_trust_anchor_kind_relationships_are_closed(
+        self,
+    ) -> None:
+        producer_fields = self.carriers["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_producer_implementation_receipt"]
+
+        def rehash_contract(contract: dict[str, object]) -> None:
+            source = contract["source_descriptor"]
+            anchor = contract["source_trust_anchor"]
+            anchor["identity"] = (
+                f"{source['source_repository']}@{source['source_commit']}:"
+                f"{source['source_path']}"
+            )
+            anchor["sha256"] = source["source_sha256"]
+
+            exclusion = contract["candidate_range_exclusion_receipt"]
+            exclusion["source"] = copy.deepcopy(source)
+            exclusion["candidate_commit_count"] = len(exclusion["candidate_commits"])
+            exclusion["candidate_commits_sha256"] = _commit_set_sha256(
+                exclusion["candidate_commits"]
+            )
+
+            resolution = contract["dependency_edge_resolution_receipt"]
+            resolver = resolution["resolver_anchor"]
+            resolver["candidate_range_exclusion_sha256"] = _canonical_sha256(exclusion)
+            resolver["receipt_sha256"] = _receipt_sha256(resolver)
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            contract["preflight_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in contract.items()
+                    if key != "preflight_sha256"
+                }
+            )
+
+        def validator_for(
+            contract: dict[str, object],
+        ) -> _RecoveryContractValidator:
+            resolution = contract["dependency_edge_resolution_receipt"]
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                self.producer_receipt,
+                producer_fields,
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                resolution["resolver_anchor"],
+                contract["pre_mutation_run_observation"],
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        valid_relationships = {
+            "target-baseline-case-alias": (
+                "target-branch-baseline",
+                self.recovery_contract["repository"].upper(),
+                self.recovery_contract["source_trust_anchor"]["base_sha"],
+            ),
+            "installed-prior-candidate-repository-release": (
+                "installed-trusted-release",
+                self.recovery_contract["repository"],
+                self.recovery_contract["source_trust_anchor"]["base_sha"],
+            ),
+            "parent-fixed-external": (
+                "parent-fixed-external",
+                self.recovery_contract["source_descriptor"]["source_repository"],
+                self.recovery_contract["source_descriptor"]["source_commit"],
+            ),
+        }
+        for name, (kind, repository, commit) in valid_relationships.items():
+            with self.subTest(valid_source_relationship=name):
+                contract = copy.deepcopy(self.recovery_contract)
+                contract["source_trust_anchor"]["kind"] = kind
+                contract["source_descriptor"].update(
+                    source_repository=repository,
+                    source_commit=commit,
+                )
+                rehash_contract(contract)
+                self.assertTrue(validator_for(contract).validate_preflight(contract))
+
+        invalid_relationships = {
+            "baseline-from-different-repository": (
+                "target-branch-baseline",
+                self.recovery_contract["source_descriptor"]["source_repository"],
+                self.recovery_contract["source_trust_anchor"]["base_sha"],
+            ),
+            "baseline-from-wrong-candidate-commit": (
+                "target-branch-baseline",
+                self.recovery_contract["repository"],
+                "e" * 40,
+            ),
+            "external-from-candidate-repository-case-alias": (
+                "parent-fixed-external",
+                self.recovery_contract["repository"].upper(),
+                self.recovery_contract["source_trust_anchor"]["base_sha"],
+            ),
+            "installed-release-from-candidate-range": (
+                "installed-trusted-release",
+                self.recovery_contract["repository"].upper(),
+                "d" * 40,
+            ),
+        }
+        for name, (kind, repository, commit) in invalid_relationships.items():
+            with self.subTest(invalid_source_relationship=name):
+                contract = copy.deepcopy(self.recovery_contract)
+                contract["source_trust_anchor"]["kind"] = kind
+                contract["source_descriptor"].update(
+                    source_repository=repository,
+                    source_commit=commit,
+                )
+                rehash_contract(contract)
+                self.assertFalse(validator_for(contract).validate_preflight(contract))
 
     def test_recovery_requires_attempt_stable_dependency_references(self) -> None:
         self.assertTrue(

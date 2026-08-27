@@ -24,6 +24,37 @@ MAX_CANONICAL_JSON_DEPTH = 256
 MAX_CANONICAL_JSON_NODES = 100_000
 MAX_CANONICAL_JSON_STRING_UTF8_BYTES = 1 << 20
 MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES = 16 << 20
+GRAMMAR_TOP_LEVEL_KEYS = frozenset(
+    {
+        "ancestor_shas_projection",
+        "bases",
+        "branches",
+        "canonical_json_profile",
+        "closed_record_fields",
+        "closed_world",
+        "disclosure_lines",
+        "fixture_patch_semantics",
+        "fixtures",
+        "github_url_profile",
+        "normalization",
+        "producer_contract",
+        "provider_identity",
+        "recovery_operation_contract_schema",
+        "report_base_parent_selection_outcomes",
+        "report_bases",
+        "report_fixtures",
+        "report_parent_selection_outcomes",
+        "repository_identity_profile",
+        "required_report_schema",
+        "role",
+        "safe_repository_path_profile",
+        "schema",
+        "schema_version",
+        "semantic_time",
+        "terminal_commit_binding",
+        "terminal_detection",
+    }
+)
 VALIDATION_EXCEPTIONS = (
     AttributeError,
     IndexError,
@@ -246,6 +277,42 @@ def _require_rfc8785_integer_domain(value: object) -> None:
             stack.append(("iterator", children, next_depth, identity))
             continue
         raise ValueError("canonical JSON value is outside the integer-only profile")
+
+
+def _load_carrier_grammar_text(text: str) -> dict[str, object]:
+    """Load the closed grammar without JSON ambiguity or unvalidated content."""
+
+    if type(text) is not str:
+        raise ValueError("carrier grammar must be JSON text")
+
+    def closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = value
+        return result
+
+    def reject_non_finite_constant(constant: str) -> object:
+        raise ValueError(f"non-finite JSON number: {constant}")
+
+    try:
+        grammar = json.loads(
+            text,
+            object_pairs_hook=closed_object,
+            parse_constant=reject_non_finite_constant,
+        )
+        _require_rfc8785_integer_domain(grammar)
+    except VALIDATION_EXCEPTIONS as error:
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError(
+            "carrier grammar violates the closed resource profile"
+        ) from error
+
+    if type(grammar) is not dict or set(grammar) != GRAMMAR_TOP_LEVEL_KEYS:
+        raise ValueError("carrier grammar has a non-closed top-level object")
+    return grammar
 
 
 _MALFORMED_PARENT_INPUT = object()
@@ -1189,6 +1256,7 @@ class _ReportValidator:
         }
         return (
             self._type_preserving_equal(merge_status, expected_merge_status)
+            and self._positive_int(parent_contract["run_attempt"])
             and merge_status["id"] == parent_contract["check_run_id"]
             and _same_github_url(merge_status["url"], parent_contract["check_run_url"])
             and merge_status["check_name"] == parent_contract["check_name"]
@@ -1196,7 +1264,9 @@ class _ReportValidator:
             and merge_status["app"]["slug"] == parent_contract["app_slug"]
             and merge_status["workflow_id"] == parent_contract["workflow_id"]
             and merge_status["run_id"] == parent_contract["run_id"]
-            and merge_status["run_attempt"] == parent_contract["run_attempt"]
+            and self._type_preserving_equal(
+                merge_status["run_attempt"], parent_contract["run_attempt"]
+            )
             and merge_status["check_suite_id"] == parent_contract["check_suite_id"]
             and self._type_preserving_equal(
                 merge_status["contract"], parent_contract["contract_descriptor"]
@@ -1692,6 +1762,17 @@ class _ReportValidator:
                     "check_suite_id",
                 )
             )
+            or any(
+                not self._positive_int(parent_contract[field])
+                for field in (
+                    "app_id",
+                    "workflow_id",
+                    "run_id",
+                    "run_attempt",
+                    "check_suite_id",
+                    "check_run_id",
+                )
+            )
             or evidence["server_time_field"] != "completed_at"
             or evidence["id"] != parent_contract["check_run_id"]
             or not _same_github_url(evidence["url"], parent_contract["check_run_url"])
@@ -1823,14 +1904,18 @@ class _ReportValidator:
             or association["pull_request"] != report["pull_request"]
             or association["feature_head_sha"] != report["head_sha"]
             or evidence["check_subject_sha"] != association["check_subject_sha"]
-            or association["check_run_id"] != evidence["id"]
+            or not self._type_preserving_equal(
+                association["check_run_id"], evidence["id"]
+            )
             or not _same_github_url(association["check_run_url"], evidence["url"])
             or association["check_name"] != check_name
-            or association["app_id"] != app["id"]
+            or not self._type_preserving_equal(association["app_id"], app["id"])
             or association["app_slug"] != app["slug"]
             or any(
-                association[field] != evidence[field]
-                or association[field] != parent_contract[field]
+                not self._type_preserving_equal(association[field], evidence[field])
+                or not self._type_preserving_equal(
+                    association[field], parent_contract[field]
+                )
                 for field in (
                     "workflow_id",
                     "run_id",
@@ -1838,12 +1923,16 @@ class _ReportValidator:
                     "check_suite_id",
                 )
             )
-            or association["check_run_id"] != parent_contract["check_run_id"]
+            or not self._type_preserving_equal(
+                association["check_run_id"], parent_contract["check_run_id"]
+            )
             or not _same_github_url(
                 association["check_run_url"], parent_contract["check_run_url"]
             )
             or association["check_name"] != parent_contract["check_name"]
-            or association["app_id"] != parent_contract["app_id"]
+            or not self._type_preserving_equal(
+                association["app_id"], parent_contract["app_id"]
+            )
             or association["app_slug"] != parent_contract["app_slug"]
         ):
             return False
@@ -1981,11 +2070,20 @@ class _ReportValidator:
             or receipt["feature_head_sha"] != report["head_sha"]
             or not isinstance(receipt["run_ref"], str)
             or not receipt["run_ref"].startswith("refs/")
-            or receipt["run_id"] != parent_contract["run_id"]
-            or receipt["run_attempt"] != parent_contract["run_attempt"]
-            or receipt["check_suite_id"] != parent_contract["check_suite_id"]
-            or receipt["check_run_id"] != parent_contract["check_run_id"]
-            or receipt["workflow_id"] != parent_contract["workflow_id"]
+            or any(
+                not self._positive_int(receipt[field])
+                or not self._positive_int(parent_contract[field])
+                or not self._type_preserving_equal(
+                    receipt[field], parent_contract[field]
+                )
+                for field in (
+                    "workflow_id",
+                    "run_id",
+                    "run_attempt",
+                    "check_suite_id",
+                    "check_run_id",
+                )
+            )
             or receipt["implementation_closure_complete"] is not True
             or not isinstance(receipt["implementation_closure"], list)
             or not receipt["implementation_closure"]
@@ -2254,10 +2352,12 @@ class _ReportValidator:
 
         if (
             not isinstance(records, list)
-            or receipt["record_count"] != len(records)
+            or not self._nonnegative_int(receipt["record_count"])
+            or not self._type_preserving_equal(receipt["record_count"], len(records))
             or receipt["records_sha256"] != _canonical_json_sha256(records)
             or not isinstance(edges, list)
-            or receipt["edge_count"] != len(edges)
+            or not self._nonnegative_int(receipt["edge_count"])
+            or not self._type_preserving_equal(receipt["edge_count"], len(edges))
             or receipt["edges_sha256"] != _canonical_json_sha256(edges)
         ):
             return False
@@ -2282,7 +2382,10 @@ class _ReportValidator:
                 or record["parser_profile"] != "github-actions-dependency-resolver-v1"
                 or record["source_sha256"] != source["blob_sha256"]
                 or not isinstance(references, list)
-                or record["discovered_reference_count"] != len(references)
+                or not self._nonnegative_int(record["discovered_reference_count"])
+                or not self._type_preserving_equal(
+                    record["discovered_reference_count"], len(references)
+                )
                 or record["record_sha256"]
                 != _canonical_json_sha256(
                     {
@@ -3300,7 +3403,9 @@ class _ReportValidator:
 class GitHubTerminalCarrierContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.grammar = json.loads(GRAMMAR_PATH.read_text(encoding="utf-8"))
+        cls.grammar = _load_carrier_grammar_text(
+            GRAMMAR_PATH.read_text(encoding="utf-8")
+        )
         cls.classifier = _ReferenceClassifier(cls.grammar)
         cls.selected_parent_selection_outcome = copy.deepcopy(
             cls.grammar["report_parent_selection_outcomes"]["selected_pr"]
@@ -4392,7 +4497,46 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         snapshot["final_snapshot_sha256"] = digest_character * 64
         return snapshot
 
+    def test_resource_loader_rejects_ambiguous_or_unbounded_json(self) -> None:
+        source = GRAMMAR_PATH.read_text(encoding="utf-8")
+        loaded = _load_carrier_grammar_text(source)
+        self.assertTrue(_ReportValidator._type_preserving_equal(loaded, self.grammar))
+
+        duplicate_key = source.replace(
+            '  "schema": "github-codex-terminal-carriers-v1",',
+            '  "schema": "duplicate",\n'
+            '  "schema": "github-codex-terminal-carriers-v1",',
+            1,
+        )
+        self.assertNotEqual(duplicate_key, source)
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            _load_carrier_grammar_text(duplicate_key)
+
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(non_finite_constant=constant):
+                non_finite = source.replace(
+                    '  "schema_version": 1,',
+                    f'  "schema_version": {constant},',
+                    1,
+                )
+                self.assertNotEqual(non_finite, source)
+                with self.assertRaisesRegex(ValueError, "non-finite JSON number"):
+                    _load_carrier_grammar_text(non_finite)
+
+        oversized = copy.deepcopy(self.grammar)
+        oversized["closed_world"]["unreferenced_test_value"] = "a" * (
+            MAX_CANONICAL_JSON_STRING_UTF8_BYTES + 1
+        )
+        with self.assertRaisesRegex(ValueError, "string exceeds the closed byte cap"):
+            _load_carrier_grammar_text(json.dumps(oversized))
+
+        extra_top_level = copy.deepcopy(self.grammar)
+        extra_top_level["unrecognized_extension"] = None
+        with self.assertRaisesRegex(ValueError, "non-closed top-level object"):
+            _load_carrier_grammar_text(json.dumps(extra_top_level))
+
     def test_resource_is_versioned_closed_and_consumer_only(self) -> None:
+        self.assertEqual(set(self.grammar), GRAMMAR_TOP_LEVEL_KEYS)
         self.assertEqual(self.grammar["schema"], "github-codex-terminal-carriers-v1")
         self.assertEqual(self.grammar["schema_version"], 1)
         self.assertEqual(self.grammar["role"], "consumer-terminal-carrier-grammar")
@@ -7637,6 +7781,131 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                         merge_resolver_anchor=anchor,
                     ).validate(report)
                 )
+
+    def test_merge_status_integer_bindings_reject_boolean_aliases_after_rehash(
+        self,
+    ) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        implementation = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        root_entry = copy.deepcopy(implementation["workflow_ref_identity"]["entry"])
+        implementation["job_workflow_ref"] = implementation["workflow_ref"]
+        implementation["job_workflow_ref_identity"] = copy.deepcopy(
+            implementation["workflow_ref_identity"]
+        )
+        implementation["implementation_closure"] = [root_entry]
+        implementation["implementation_closure_count"] = 1
+        implementation["implementation_closure_sha256"] = _canonical_json_sha256(
+            implementation["implementation_closure"]
+        )
+        implementation["receipt_sha256"] = _receipt_sha256(implementation)
+
+        record = copy.deepcopy(
+            self.merge_status_dependency_resolution_receipt["records"][0]
+        )
+        record["source_entry"] = copy.deepcopy(root_entry)
+        record["source_sha256"] = root_entry["blob_sha256"]
+        record["discovered_references"] = []
+        record["discovered_reference_count"] = 0
+        record["record_sha256"] = _canonical_json_sha256(
+            {key: value for key, value in record.items() if key != "record_sha256"}
+        )
+        resolution = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+        resolution["implementation_receipt_sha256"] = implementation["receipt_sha256"]
+        resolution["records"] = [record]
+        resolution["record_count"] = 1
+        resolution["records_sha256"] = _canonical_json_sha256(resolution["records"])
+        resolution["edges"] = []
+        resolution["edge_count"] = 0
+        resolution["edges_sha256"] = _canonical_json_sha256(resolution["edges"])
+        resolution["receipt_sha256"] = _receipt_sha256(resolution)
+
+        def validator_for(
+            implementation_receipt: dict[str, object],
+            resolution_receipt: dict[str, object],
+            digest_character: str,
+        ) -> _ReportValidator:
+            bound_resolution = copy.deepcopy(resolution_receipt)
+            bound_resolution["implementation_receipt_sha256"] = implementation_receipt[
+                "receipt_sha256"
+            ]
+            bound_resolution["resolver_anchor_receipt_sha256"] = (
+                self.merge_status_dependency_resolver_anchor["receipt_sha256"]
+            )
+            bound_resolution["receipt_sha256"] = _receipt_sha256(bound_resolution)
+            snapshot = self._merge_snapshot_for_report(
+                report,
+                digest_character,
+                implementation_receipt,
+            )
+            for phase in ("initial", "final"):
+                snapshot[f"{phase}_basis_selection"]["merge_status"][
+                    "producer_dependency_resolution_receipt_sha256"
+                ] = bound_resolution["receipt_sha256"]
+            return self._validator_with_complete_snapshot(
+                snapshot,
+                merge_implementation_receipt=implementation_receipt,
+                merge_resolution_receipt=bound_resolution,
+            )
+
+        control = validator_for(implementation, resolution, "1")
+        self.assertTrue(control._merge_status_producer_implementation_matches(report))
+        self.assertTrue(control._merge_status_dependency_resolution_matches(report))
+        self.assertTrue(control.validate(report))
+
+        boolean_attempt = copy.deepcopy(implementation)
+        boolean_attempt["run_attempt"] = True
+        boolean_attempt["receipt_sha256"] = _receipt_sha256(boolean_attempt)
+        attempted = validator_for(boolean_attempt, resolution, "2")
+        self.assertFalse(
+            attempted._merge_status_producer_implementation_matches(report)
+        )
+        self.assertFalse(attempted.validate(report))
+
+        for name, mutate in (
+            (
+                "record-count",
+                lambda candidate: candidate.update(record_count=True),
+            ),
+            (
+                "edge-count",
+                lambda candidate: candidate.update(edge_count=False),
+            ),
+            (
+                "discovered-reference-count",
+                lambda candidate: candidate["records"][0].update(
+                    discovered_reference_count=False
+                ),
+            ),
+        ):
+            with self.subTest(boolean_alias=name):
+                malformed_resolution = copy.deepcopy(resolution)
+                mutate(malformed_resolution)
+                malformed_resolution["records"][0]["record_sha256"] = (
+                    _canonical_json_sha256(
+                        {
+                            key: value
+                            for key, value in malformed_resolution["records"][0].items()
+                            if key != "record_sha256"
+                        }
+                    )
+                )
+                malformed_resolution["records_sha256"] = _canonical_json_sha256(
+                    malformed_resolution["records"]
+                )
+                malformed_resolution["receipt_sha256"] = _receipt_sha256(
+                    malformed_resolution
+                )
+                validator = validator_for(
+                    implementation,
+                    malformed_resolution,
+                    {"record-count": "3", "edge-count": "4"}.get(name, "5"),
+                )
+                self.assertFalse(
+                    validator._merge_status_dependency_resolution_matches(report)
+                )
+                self.assertFalse(validator.validate(report))
 
     def test_merge_status_dependency_resolution_is_exact_and_complete(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])

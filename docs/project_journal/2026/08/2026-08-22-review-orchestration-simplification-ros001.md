@@ -2292,23 +2292,48 @@ superseded_by:
   independently passed the focused carrier/recovery matrix at `52/52`, the
   four-module contract matrix at `98/98`, Ruff format/check, JSON parsing,
   `git diff --check`, skill validation, and project-journal validation. The
-  final full review-playbook suite then passed `3,243` tests in `1,657.587`
+  first full review-playbook suite then passed `3,243` tests in `1,657.587`
   seconds with six conditional skips under CPython 3.13 and
   `ResourceWarning` promoted to an error.
-- The final signed head still
-  requires complete local validation, exact-secret admission, and a new
-  independent clean-workspace review; no earlier review or test result will be
-  reused for the advanced head.
+- A committed-range exact-secret admission for
+  `a439793df9483943991c258e16f4ddf705736643..dacb26847dad27f219dab26c794c7baf20bdcd77`
+  was clean with complete temporary cleanup. The installed specialized
+  `reviewer` role was temporarily unavailable at launch, so the parent used the
+  contract's peer-adapter fallback: one zero-inherited-context
+  `gpt-5.6-sol` / `ultra` subagent over an exact-pack detached workspace from
+  the installed trusted release. Prepare and validation agreed on seven
+  commits and 360 range objects; the issued and live-consumed sanitized Git
+  prefix receipts were byte-identical. Post-review trusted validation remained
+  clean and the guard completed workspace cleanup.
+- That review found three remaining fail-closed gaps. The recovery validator
+  did not bind each source trust-anchor kind to its required repository/base
+  relation; Python Boolean/integer equality could satisfy implementation run
+  and dependency-count bindings; and the candidate grammar used permissive
+  `json.loads` without duplicate-key, non-finite-number, whole-resource, or
+  closed top-level checks. The repairs now apply kind-specific source
+  relationships, exact non-Boolean integer domains plus type-preserving
+  equality, and one strict whole-grammar loader. Fully rehashed regressions
+  reach each intended check rather than failing on stale digest evidence.
+- Recovery and terminal focused modules passed `18/18` and `37/37`; the joined
+  four-module matrix passed `101/101`. Two independent closure audits returned
+  clean for exact file SHA-256 values
+  `364680bdec20adbd9bb8ac84f5fef9176f0f4cc6c79a1bce99c38fdbb448434b`
+  and
+  `274737adb251de68c7fe224f5f3b588e16c41ac4aa2c0662a4f384a00b7445eb`.
+  The post-fix full review-playbook suite passed `3,246` tests in `2,027.495`
+  seconds with six conditional skips under the same strict warning profile.
+  Because the repairs advance the head, the earlier admission and review are
+  evidence for the repair loop only; final-head admission and fresh review are
+  rerun rather than reused.
 
 ## Next Steps
 
-- Complete focused and full validation of the canonical follow-up, obtain one
-  fresh-context local Codex result plus current-head GitHub Codex evidence, and
-  merge its signed PR.
-- Advance private PR #181 to the resulting canonical merge identity, regenerate
-  rather than hand-edit the overlay, and rerun exact-secret admission, full
-  local tests, fresh local review, GitHub/CI/readiness, package verification,
-  merge, immutable release, local installer, and strict installed-state checks.
+- Keep final-head delivery evidence—exact-secret admission, fresh local Codex,
+  current-head GitHub Codex, CI, conversation, and ruleset readiness—in the PR
+  rather than advancing the reviewed head for journal-only status prose.
+- Let the private overlay consume the canonical merge through its generated
+  sync workflow. Do not hand-edit the generated overlay; release and installed
+  verification remain downstream delivery evidence.
 
 ## Evidence
 
