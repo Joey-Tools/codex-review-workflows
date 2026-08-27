@@ -185,6 +185,12 @@ to a separate closed parent-owned authenticated platform observation. That
 observation binds the exact API query endpoint, proved delivery and returned
 run, closed run object/digest, and actual repository, head, workflow SHA/ref,
 run ref, and job-workflow identity. Completion fields cannot self-attest.
+For both rerun and guarded dispatch, the final current-run observation must
+repeat the complete frozen exact-observation identity, use an independently
+valid endpoint time interval, and join the same closed acquisition transaction.
+Guarded dispatch requires attempt 1 with null `previous_attempt_url`; any
+final-window drift, arbitrary transaction rehash, or possible concurrent run
+leaves recovery status-only.
 For guarded dispatch, v1 accepts only the exact REST contract with
 `X-GitHub-Api-Version: 2026-03-10`, the exact POST endpoint and semantic body,
 HTTP 200, and

@@ -1242,6 +1242,14 @@ class _ReportValidator:
             and all(part not in {"", ".", ".."} for part in path.parts)
         )
 
+    @staticmethod
+    def _repository(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value.split("/")) == 2
+            and all(value.split("/"))
+        )
+
     def _merge_status_evidence(
         self, report: dict[str, object], evidence: object
     ) -> bool:
@@ -1605,8 +1613,7 @@ class _ReportValidator:
 
         if any(
             not self._closed_parent_input(entry, "merge_status_implementation_entry")
-            or not isinstance(entry["repository"], str)
-            or entry["repository"].count("/") != 1
+            or not self._repository(entry["repository"])
             or not self._full_sha(entry["commit"])
             or not self._safe_contract_path(entry["path"])
             or not isinstance(entry["blob_sha256"], str)
@@ -1653,8 +1660,7 @@ class _ReportValidator:
             return (
                 receipt["attestation_source"] == "github-actions-api"
                 and parent_contract["app_slug"] == "github-actions"
-                and isinstance(receipt["workflow_repository"], str)
-                and receipt["workflow_repository"].count("/") == 1
+                and self._repository(receipt["workflow_repository"])
                 and self._safe_contract_path(receipt["workflow_path"])
                 and self._full_sha(receipt["workflow_sha"])
                 and ref_identity_matches(
@@ -1689,7 +1695,9 @@ class _ReportValidator:
                         "workflow_path",
                         "workflow_sha",
                         "workflow_ref",
+                        "workflow_ref_identity",
                         "job_workflow_ref",
+                        "job_workflow_ref_identity",
                     )
                 )
                 and isinstance(receipt["external_implementation_id"], str)
@@ -5160,7 +5168,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             workflow_path=None,
             workflow_sha=None,
             workflow_ref=None,
+            workflow_ref_identity=None,
             job_workflow_ref=None,
+            job_workflow_ref_identity=None,
             external_implementation_id="provider-build:0123456789abcdef",
         )
         alternate_implementation["receipt_sha256"] = _receipt_sha256(
@@ -5175,6 +5185,43 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 merge_contract=alternate_contract,
                 merge_anchor=alternate_anchor,
                 merge_implementation_receipt=alternate_implementation,
+            ).validate(alternate_merge)
+        )
+        for field in ("workflow_ref_identity", "job_workflow_ref_identity"):
+            with self.subTest(external_app_identity=field):
+                invalid_external = copy.deepcopy(alternate_implementation)
+                invalid_external[field] = copy.deepcopy(
+                    self.merge_status_producer_implementation_receipt[field]
+                )
+                invalid_external["receipt_sha256"] = _receipt_sha256(invalid_external)
+                invalid_snapshot = self._merge_snapshot_for_report(
+                    alternate_merge, "f", invalid_external
+                )
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(
+                        invalid_snapshot,
+                        merge_contract=alternate_contract,
+                        merge_anchor=alternate_anchor,
+                        merge_implementation_receipt=invalid_external,
+                    ).validate(alternate_merge)
+                )
+        combined_identity_injection = copy.deepcopy(alternate_implementation)
+        for field in ("workflow_ref_identity", "job_workflow_ref_identity"):
+            combined_identity_injection[field] = copy.deepcopy(
+                self.merge_status_producer_implementation_receipt[field]
+            )
+        combined_identity_injection["receipt_sha256"] = _receipt_sha256(
+            combined_identity_injection
+        )
+        combined_snapshot = self._merge_snapshot_for_report(
+            alternate_merge, "f", combined_identity_injection
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                combined_snapshot,
+                merge_contract=alternate_contract,
+                merge_anchor=alternate_anchor,
+                merge_implementation_receipt=combined_identity_injection,
             ).validate(alternate_merge)
         )
 

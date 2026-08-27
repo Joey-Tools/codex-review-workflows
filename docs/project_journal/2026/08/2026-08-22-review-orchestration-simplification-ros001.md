@@ -2149,8 +2149,14 @@ superseded_by:
   substitution. The first focused audit returned `CLEAN`, but the later formal
   fresh-context review correctly found four stronger coupled attacks; each
   original attack author then re-ran its probe against the repaired contract
-  and returned `CLEAN`. The focused contract/carrier/recovery/local-lane matrix
-  now passes all 88 tests. The GitHub Action/status/ruleset thread remains
+  and returned `CLEAN`. A later formal pass additionally established that
+  guarded dispatch shares the same closed final current-run identity and
+  acquisition transaction as rerun, recovery consumes the canonical closed
+  producer-entry profile (`action`, not an invented kind), and the external-App
+  union nulls both raw and parsed workflow identities. Coupled final-window,
+  malformed-entry, and provider-union attacks now fail mechanically. The
+  focused contract/carrier/recovery/local-lane matrix now passes all 90 tests.
+  The GitHub Action/status/ruleset thread remains
   responsible for the production producer and consumer; this workstream
   supplies its closed skill-facing evidence contract and test-only reference
   validators without claiming they are the deployed integration.
@@ -2201,9 +2207,9 @@ superseded_by:
   tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`88` focused policy, distribution, carrier, report, recovery, and
-  self-policy contracts). The preceding exact head passed the complete
-  `3,225`-test suite with six conditional skips in `1,487.224` seconds; the
+  matrix (`90` focused policy, distribution, carrier, report, recovery, and
+  self-policy contracts). Signed head `65a36ce` passed the complete
+  `3,227`-test suite with six conditional skips in `1,562.494` seconds; the
   final repaired head will be validated and reported as PR evidence before
   publication.
 - Skill quick validation for `review-orchestration-playbook`,

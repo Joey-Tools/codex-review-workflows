@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import datetime
 import hashlib
+import importlib
 import json
 import pathlib
 import re
@@ -110,6 +111,14 @@ class _RecoveryContractValidator:
             and all(part not in {"", ".", ".."} for part in path.parts)
         )
 
+    @staticmethod
+    def _repository(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value.split("/")) == 2
+            and all(value.split("/"))
+        )
+
     def validate_preflight(self, contract: object) -> bool:
         if not self._closed(contract, "preflight_contract"):
             return False
@@ -125,8 +134,7 @@ class _RecoveryContractValidator:
             contract["owner"] != "parent-orchestrator"
             or contract["status"] != "complete"
             or contract["profile"] != "github-codex-recovery-operation-preflight-v1"
-            or not isinstance(contract["repository"], str)
-            or contract["repository"].count("/") != 1
+            or not self._repository(contract["repository"])
             or not self._positive_int(contract["pull_request"])
             or not isinstance(contract["head_sha"], str)
             or FULL_SHA.fullmatch(contract["head_sha"]) is None
@@ -228,6 +236,17 @@ class _RecoveryContractValidator:
             or producer["provider_kind"] != "github-actions"
             or producer["attestation_source"] != "github-actions-api"
             or producer["repository"] != contract["repository"]
+            or not isinstance(producer["run_ref"], str)
+            or not producer["run_ref"].startswith("refs/")
+            or not self._positive_int(producer["run_id"])
+            or not self._positive_int(producer["run_attempt"])
+            or not self._positive_int(producer["check_suite_id"])
+            or not self._positive_int(producer["check_run_id"])
+            or not self._positive_int(producer["workflow_id"])
+            or not isinstance(producer["implementation_closure"], list)
+            or not producer["implementation_closure"]
+            or not isinstance(producer["implementation_closure_count"], int)
+            or isinstance(producer["implementation_closure_count"], bool)
             or producer["implementation_closure_count"]
             != len(producer["implementation_closure"])
             or producer["implementation_closure_sha256"]
@@ -258,7 +277,61 @@ class _RecoveryContractValidator:
                 entry["blob_sha256"],
             )
 
+        if any(
+            not self._closed(entry, "implementation_entry")
+            or not self._repository(entry["repository"])
+            or not isinstance(entry["commit"], str)
+            or FULL_SHA.fullmatch(entry["commit"]) is None
+            or not self._safe_path(entry["path"])
+            or not isinstance(entry["blob_sha256"], str)
+            or SHA256.fullmatch(entry["blob_sha256"]) is None
+            or entry["kind"]
+            not in {"workflow", "reusable-workflow", "action", "script"}
+            for entry in entries
+        ):
+            return False
         entry_by_key = {entry_key(item): item for item in entries}
+        entry_keys = [entry_key(item) for item in entries]
+        if entry_keys != sorted(entry_keys) or len(entry_keys) != len(set(entry_keys)):
+            return False
+
+        def ref_identity_matches(raw: object, identity: object) -> bool:
+            if not self._closed(identity, "workflow_ref_identity"):
+                return False
+            entry = identity["entry"]
+            return (
+                self._closed(entry, "implementation_entry")
+                and entry_key(entry) in entry_by_key
+                and entry == entry_by_key[entry_key(entry)]
+                and identity["entry_sha256"] == _canonical_sha256(entry)
+                and identity["repository"] == entry["repository"]
+                and identity["path"] == entry["path"]
+                and identity["resolved_commit"] == entry["commit"]
+                and isinstance(identity["ref"], str)
+                and raw
+                == f"{identity['repository']}/{identity['path']}@{identity['ref']}"
+            )
+
+        if (
+            not self._repository(producer["workflow_repository"])
+            or not self._safe_path(producer["workflow_path"])
+            or FULL_SHA.fullmatch(producer["workflow_sha"]) is None
+            or not ref_identity_matches(
+                producer["workflow_ref"], producer["workflow_ref_identity"]
+            )
+            or not ref_identity_matches(
+                producer["job_workflow_ref"], producer["job_workflow_ref_identity"]
+            )
+            or producer["workflow_ref_identity"]["repository"]
+            != producer["workflow_repository"]
+            or producer["workflow_ref_identity"]["path"] != producer["workflow_path"]
+            or producer["workflow_ref_identity"]["resolved_commit"]
+            != producer["workflow_sha"]
+            or producer["workflow_ref_identity"]["ref"] != producer["run_ref"]
+            or producer["external_implementation_id"] is not None
+        ):
+            return False
+
         workflow_entries = [
             item
             for item in producer["implementation_closure"]
@@ -462,12 +535,15 @@ class _RecoveryContractValidator:
                 and before["response_status"] == 200
                 and _timestamp(before["response_date"]) is not None
                 and before["run_id"] == producer["run_id"]
+                and self._positive_int(before["run_id"])
                 and before["run_attempt"] == producer["run_attempt"]
+                and self._positive_int(before["run_attempt"])
                 and operation["pre_run_attempt"] == before["run_attempt"]
                 and operation["expected_run_attempt"] == before["run_attempt"] + 1
                 and _timestamp(before["observed_at"]) is not None
                 and before["head_sha"] == producer["feature_head_sha"]
                 and before["workflow_id"] == producer["workflow_id"]
+                and self._positive_int(before["workflow_id"])
                 and before["workflow_sha"] == producer["workflow_sha"]
                 and before["workflow_ref"] == producer["workflow_ref"]
                 and before["run_ref"] == producer["run_ref"]
@@ -541,6 +617,7 @@ class _RecoveryContractValidator:
                 "existing-run-rerun-full",
             }
             or not self._positive_int(delivery["returned_run_id"])
+            or not self._positive_int(delivery["unique_run_id"])
             or delivery["unique_run_id"] != delivery["returned_run_id"]
             or delivery["receipt_sha256"] != _receipt_sha256(delivery)
             or delivery["receipt_sha256"] != self.expected_delivery_receipt_sha256
@@ -565,6 +642,9 @@ class _RecoveryContractValidator:
             or not self._positive_int(observation["returned_run_id"])
             or observation["returned_run_id"] != delivery["returned_run_id"]
             or not self._closed(run_object, "platform_dispatch_run_object")
+            or not self._positive_int(run_object["id"])
+            or not self._positive_int(run_object["run_attempt"])
+            or not self._positive_int(run_object["workflow_id"])
             or run_object["id"] != observation["returned_run_id"]
             or observation["run_object_sha256"] != _canonical_sha256(run_object)
             or not self._closed(observation["platform_identity"], "platform_identity")
@@ -601,8 +681,12 @@ class _RecoveryContractValidator:
             or current_observation["dispatch_delivery_receipt_sha256"]
             != delivery["receipt_sha256"]
             or current_observation["request_delivery_status"] != "proved-delivered"
+            or not self._positive_int(current_observation["returned_run_id"])
             or current_observation["returned_run_id"] != observation["returned_run_id"]
             or not self._closed(current_run_object, "platform_dispatch_run_object")
+            or not self._positive_int(current_run_object["id"])
+            or not self._positive_int(current_run_object["run_attempt"])
+            or not self._positive_int(current_run_object["workflow_id"])
             or current_run_object["id"] != observation["returned_run_id"]
             or current_observation["run_object_sha256"]
             != _canonical_sha256(current_run_object)
@@ -610,6 +694,92 @@ class _RecoveryContractValidator:
             != {"source": "github-actions-api", "authenticated": True}
             or current_observation["receipt_sha256"]
             != _receipt_sha256(current_observation)
+        ):
+            return False
+        frozen_identity_fields = (
+            "id",
+            "repository",
+            "run_attempt",
+            "previous_attempt_url",
+            "head_sha",
+            "workflow_id",
+            "workflow_sha",
+            "workflow_ref",
+            "run_ref",
+            "job_workflow_ref",
+        )
+        exact_started = _timestamp(run_object["run_started_at"])
+        exact_updated = _timestamp(run_object["updated_at"])
+        exact_response = _timestamp(observation["response_date"])
+        exact_acquired = _timestamp(run_object["observed_at"])
+        current_started = _timestamp(current_run_object["run_started_at"])
+        current_updated = _timestamp(current_run_object["updated_at"])
+        current_response = _timestamp(current_observation["response_date"])
+        current_acquired = _timestamp(current_run_object["observed_at"])
+        post_boundary = _timestamp(delivery["request_server_time"])
+        before_response = _timestamp(
+            accepted_preflight["pre_mutation_run_observation"]["response_date"]
+        )
+        before_acquired = _timestamp(
+            accepted_preflight["pre_mutation_run_observation"]["observed_at"]
+        )
+        if (
+            {key: current_run_object[key] for key in frozen_identity_fields}
+            != {key: run_object[key] for key in frozen_identity_fields}
+            or None
+            in {
+                exact_started,
+                exact_updated,
+                exact_response,
+                exact_acquired,
+                current_started,
+                current_updated,
+                current_response,
+                current_acquired,
+                post_boundary,
+                before_response,
+                before_acquired,
+            }
+            or exact_started != current_started
+            or not (
+                before_response
+                <= before_acquired
+                <= post_boundary
+                <= exact_started
+                <= exact_updated
+                <= exact_response
+                <= exact_acquired
+                <= current_response
+                <= current_acquired
+            )
+            or not (current_started <= current_updated <= current_response)
+            or not self._closed(transaction, "recovery_acquisition_transaction_receipt")
+            or transaction["owner"] != "parent-orchestrator"
+            or transaction["status"] != "complete"
+            or transaction["profile"]
+            != "github-codex-recovery-acquisition-transaction-v1"
+            or transaction["repository"] != accepted_preflight["repository"]
+            or not self._positive_int(transaction["run_id"])
+            or transaction["run_id"] != observation["returned_run_id"]
+            or transaction["pre_observation_sha256"]
+            != accepted_preflight["pre_mutation_run_observation"]["receipt_sha256"]
+            or transaction["delivery_receipt_sha256"] != delivery["receipt_sha256"]
+            or transaction["exact_attempt_observation_sha256"]
+            != observation["receipt_sha256"]
+            or transaction["current_run_observation_sha256"]
+            != current_observation["receipt_sha256"]
+            or transaction["pre_response_date"]
+            != accepted_preflight["pre_mutation_run_observation"]["response_date"]
+            or transaction["pre_acquired_at"]
+            != accepted_preflight["pre_mutation_run_observation"]["observed_at"]
+            or transaction["post_server_time"] != delivery["request_server_time"]
+            or transaction["exact_response_date"] != observation["response_date"]
+            or transaction["exact_acquired_at"] != run_object["observed_at"]
+            or transaction["current_response_date"]
+            != current_observation["response_date"]
+            or transaction["current_acquired_at"] != current_run_object["observed_at"]
+            or transaction["no_intervening_rerun"] is not True
+            or transaction["receipt_sha256"] != _receipt_sha256(transaction)
         ):
             return False
         if operation["kind"].startswith("existing-run-rerun-"):
@@ -759,6 +929,7 @@ class _RecoveryContractValidator:
                 or delivery["request_body"] != semantic_body
                 or delivery["response_status"] != 200
                 or not self._closed(response, "dispatch_response")
+                or not self._positive_int(response["workflow_run_id"])
                 or response["workflow_run_id"] != delivery["returned_run_id"]
                 or response["workflow_run_id"] != delivery["unique_run_id"]
                 or response["workflow_run_id"] != observation["returned_run_id"]
@@ -767,6 +938,7 @@ class _RecoveryContractValidator:
                 or response["html_url"]
                 != f"https://github.com/{accepted_preflight['repository']}/actions/runs/{response['workflow_run_id']}"
                 or delivery["response_sha256"] != _canonical_sha256(response)
+                or not self._positive_int(run_object["run_attempt"])
                 or run_object["run_attempt"] != 1
                 or run_object["previous_attempt_url"] is not None
                 or _timestamp(run_object["observed_at"]) is None
@@ -796,10 +968,12 @@ class _RecoveryContractValidator:
             and completion["observed_repository"]
             == run_object["repository"]
             == accepted_preflight["repository"]
+            and self._positive_int(completion["observed_run_attempt"])
             and completion["observed_run_attempt"] == run_object["run_attempt"]
             and completion["observed_head_sha"]
             == run_object["head_sha"]
             == accepted_preflight["head_sha"]
+            and self._positive_int(completion["observed_workflow_id"])
             and completion["observed_workflow_id"]
             == run_object["workflow_id"]
             == operation["workflow_id"]
@@ -852,7 +1026,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 "commit": "2" * 40,
                 "path": "actions/reconcile/action.yml",
                 "blob_sha256": "8" * 64,
-                "kind": "local-action",
+                "kind": "action",
             },
         ]
         cls.producer_receipt = {
@@ -1441,6 +1615,12 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             current_run_observation_sha256=guarded_current_observation[
                 "receipt_sha256"
             ],
+            exact_response_date=guarded_observation["response_date"],
+            exact_acquired_at=guarded_observation["run_object"]["observed_at"],
+            current_response_date=guarded_current_observation["response_date"],
+            current_acquired_at=guarded_current_observation["run_object"][
+                "observed_at"
+            ],
         )
         guarded_transaction["receipt_sha256"] = _receipt_sha256(guarded_transaction)
         guarded_completion["pre_mutation_observation_sha256"] = guarded[
@@ -1478,6 +1658,316 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         )
         self.assertTrue(
             guarded_validator.validate_completion(guarded_completion, guarded)
+        )
+
+        id_one_delivery = copy.deepcopy(guarded_delivery)
+        id_one_delivery.update(returned_run_id=1, unique_run_id=1)
+        id_one_delivery["response"] = {
+            "workflow_run_id": 1,
+            "run_url": "https://api.github.com/repos/octo/review-fixture/actions/runs/1",
+            "html_url": "https://github.com/octo/review-fixture/actions/runs/1",
+        }
+        id_one_delivery["response_sha256"] = _canonical_sha256(
+            id_one_delivery["response"]
+        )
+        id_one_delivery["receipt_sha256"] = _receipt_sha256(id_one_delivery)
+        id_one_observation = copy.deepcopy(guarded_observation)
+        id_one_observation.update(
+            returned_run_id=1,
+            query_endpoint="/repos/octo/review-fixture/actions/runs/1",
+            dispatch_delivery_receipt_sha256=id_one_delivery["receipt_sha256"],
+        )
+        id_one_observation["run_object"]["id"] = 1
+        id_one_observation["run_object_sha256"] = _canonical_sha256(
+            id_one_observation["run_object"]
+        )
+        id_one_observation["receipt_sha256"] = _receipt_sha256(id_one_observation)
+        id_one_current = copy.deepcopy(guarded_current_observation)
+        id_one_current.update(
+            returned_run_id=1,
+            query_endpoint="/repos/octo/review-fixture/actions/runs/1",
+            dispatch_delivery_receipt_sha256=id_one_delivery["receipt_sha256"],
+        )
+        id_one_current["run_object"]["id"] = 1
+        id_one_current["run_object_sha256"] = _canonical_sha256(
+            id_one_current["run_object"]
+        )
+        id_one_current["receipt_sha256"] = _receipt_sha256(id_one_current)
+        id_one_transaction = copy.deepcopy(guarded_transaction)
+        id_one_transaction.update(
+            run_id=1,
+            delivery_receipt_sha256=id_one_delivery["receipt_sha256"],
+            exact_attempt_observation_sha256=id_one_observation["receipt_sha256"],
+            current_run_observation_sha256=id_one_current["receipt_sha256"],
+        )
+        id_one_transaction["receipt_sha256"] = _receipt_sha256(id_one_transaction)
+        id_one_completion = copy.deepcopy(guarded_completion)
+        id_one_completion.update(
+            returned_run_id=1,
+            dispatch_delivery_receipt_sha256=id_one_delivery["receipt_sha256"],
+            platform_observation_receipt_sha256=id_one_observation["receipt_sha256"],
+            post_current_observation_receipt_sha256=id_one_current["receipt_sha256"],
+            acquisition_transaction_receipt_sha256=id_one_transaction["receipt_sha256"],
+        )
+        id_one_completion["completion_sha256"] = _canonical_sha256(
+            {k: v for k, v in id_one_completion.items() if k != "completion_sha256"}
+        )
+
+        def id_one_validator(
+            current: dict[str, object], transaction: dict[str, object]
+        ) -> _RecoveryContractValidator:
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                self.producer_receipt,
+                self.carriers["required_report_schema"]["parent_input_profiles"][
+                    "merge_status_producer_implementation_receipt"
+                ],
+                id_one_observation,
+                id_one_delivery,
+                id_one_delivery["receipt_sha256"],
+                guarded["dependency_edge_resolution_receipt"],
+                guarded["dependency_edge_resolution_receipt"]["resolver_anchor"],
+                guarded["pre_mutation_run_observation"],
+                current,
+                transaction,
+            )
+
+        self.assertTrue(
+            id_one_validator(id_one_current, id_one_transaction).validate_completion(
+                id_one_completion, guarded
+            )
+        )
+        for typed_id in (True, 1.0):
+            with self.subTest(shared_run_id_type=type(typed_id).__name__):
+                typed_current_id = copy.deepcopy(id_one_current)
+                typed_observation_id = copy.deepcopy(id_one_observation)
+                for receipt in (typed_observation_id, typed_current_id):
+                    receipt["run_object"]["id"] = typed_id
+                    receipt["run_object_sha256"] = _canonical_sha256(
+                        receipt["run_object"]
+                    )
+                    receipt["receipt_sha256"] = _receipt_sha256(receipt)
+                typed_id_transaction = copy.deepcopy(id_one_transaction)
+                typed_id_transaction["exact_attempt_observation_sha256"] = (
+                    typed_observation_id["receipt_sha256"]
+                )
+                typed_id_transaction["current_run_observation_sha256"] = (
+                    typed_current_id["receipt_sha256"]
+                )
+                typed_id_transaction["receipt_sha256"] = _receipt_sha256(
+                    typed_id_transaction
+                )
+                typed_id_completion = copy.deepcopy(id_one_completion)
+                typed_id_completion["platform_observation_receipt_sha256"] = (
+                    typed_observation_id["receipt_sha256"]
+                )
+                typed_id_completion["post_current_observation_receipt_sha256"] = (
+                    typed_current_id["receipt_sha256"]
+                )
+                typed_id_completion["acquisition_transaction_receipt_sha256"] = (
+                    typed_id_transaction["receipt_sha256"]
+                )
+                typed_id_completion["completion_sha256"] = _canonical_sha256(
+                    {
+                        k: v
+                        for k, v in typed_id_completion.items()
+                        if k != "completion_sha256"
+                    }
+                )
+                typed_id_validator = _RecoveryContractValidator(
+                    self.recovery_schema,
+                    self.producer_receipt,
+                    self.carriers["required_report_schema"]["parent_input_profiles"][
+                        "merge_status_producer_implementation_receipt"
+                    ],
+                    typed_observation_id,
+                    id_one_delivery,
+                    id_one_delivery["receipt_sha256"],
+                    guarded["dependency_edge_resolution_receipt"],
+                    guarded["dependency_edge_resolution_receipt"]["resolver_anchor"],
+                    guarded["pre_mutation_run_observation"],
+                    typed_current_id,
+                    typed_id_transaction,
+                )
+                self.assertFalse(
+                    typed_id_validator.validate_completion(typed_id_completion, guarded)
+                )
+
+                typed_transaction_id = copy.deepcopy(id_one_transaction)
+                typed_transaction_id["run_id"] = typed_id
+                typed_transaction_id["receipt_sha256"] = _receipt_sha256(
+                    typed_transaction_id
+                )
+                typed_transaction_completion = copy.deepcopy(id_one_completion)
+                typed_transaction_completion[
+                    "acquisition_transaction_receipt_sha256"
+                ] = typed_transaction_id["receipt_sha256"]
+                typed_transaction_completion["completion_sha256"] = _canonical_sha256(
+                    {
+                        k: v
+                        for k, v in typed_transaction_completion.items()
+                        if k != "completion_sha256"
+                    }
+                )
+                self.assertFalse(
+                    id_one_validator(
+                        id_one_current, typed_transaction_id
+                    ).validate_completion(typed_transaction_completion, guarded)
+                )
+
+        for typed_attempt in (True, 1.0):
+            with self.subTest(guarded_attempt_type=type(typed_attempt).__name__):
+                typed_observation = copy.deepcopy(guarded_observation)
+                typed_observation["run_object"]["run_attempt"] = typed_attempt
+                typed_observation["run_object_sha256"] = _canonical_sha256(
+                    typed_observation["run_object"]
+                )
+                typed_observation["receipt_sha256"] = _receipt_sha256(typed_observation)
+                typed_current = copy.deepcopy(guarded_current_observation)
+                typed_current["run_object"]["run_attempt"] = typed_attempt
+                typed_current["run_object_sha256"] = _canonical_sha256(
+                    typed_current["run_object"]
+                )
+                typed_current["receipt_sha256"] = _receipt_sha256(typed_current)
+                typed_transaction = copy.deepcopy(guarded_transaction)
+                typed_transaction["exact_attempt_observation_sha256"] = (
+                    typed_observation["receipt_sha256"]
+                )
+                typed_transaction["current_run_observation_sha256"] = typed_current[
+                    "receipt_sha256"
+                ]
+                typed_transaction["receipt_sha256"] = _receipt_sha256(typed_transaction)
+                typed_completion = copy.deepcopy(guarded_completion)
+                typed_completion["observed_run_attempt"] = typed_attempt
+                typed_completion["platform_observation_receipt_sha256"] = (
+                    typed_observation["receipt_sha256"]
+                )
+                typed_completion["post_current_observation_receipt_sha256"] = (
+                    typed_current["receipt_sha256"]
+                )
+                typed_completion["acquisition_transaction_receipt_sha256"] = (
+                    typed_transaction["receipt_sha256"]
+                )
+                typed_completion["completion_sha256"] = _canonical_sha256(
+                    {
+                        k: v
+                        for k, v in typed_completion.items()
+                        if k != "completion_sha256"
+                    }
+                )
+                typed_validator = _RecoveryContractValidator(
+                    self.recovery_schema,
+                    self.producer_receipt,
+                    self.carriers["required_report_schema"]["parent_input_profiles"][
+                        "merge_status_producer_implementation_receipt"
+                    ],
+                    typed_observation,
+                    guarded_delivery,
+                    guarded_delivery["receipt_sha256"],
+                    guarded["dependency_edge_resolution_receipt"],
+                    guarded["dependency_edge_resolution_receipt"]["resolver_anchor"],
+                    guarded["pre_mutation_run_observation"],
+                    typed_current,
+                    typed_transaction,
+                )
+                self.assertFalse(
+                    typed_validator.validate_completion(typed_completion, guarded)
+                )
+
+        forged_guarded_current = copy.deepcopy(guarded_current_observation)
+        forged_guarded_current["run_object"].update(
+            repository="octo/forged",
+            run_attempt=7,
+            head_sha="9" * 40,
+            workflow_sha="9" * 40,
+            run_ref="refs/heads/forged",
+            job_workflow_ref="octo/forged/.github/workflows/x.yml@refs/heads/forged",
+        )
+        forged_guarded_current["run_object_sha256"] = _canonical_sha256(
+            forged_guarded_current["run_object"]
+        )
+        forged_guarded_current["receipt_sha256"] = _receipt_sha256(
+            forged_guarded_current
+        )
+        forged_guarded_transaction = copy.deepcopy(guarded_transaction)
+        forged_guarded_transaction["current_run_observation_sha256"] = (
+            forged_guarded_current["receipt_sha256"]
+        )
+        forged_guarded_transaction["receipt_sha256"] = _receipt_sha256(
+            forged_guarded_transaction
+        )
+        forged_guarded_completion = copy.deepcopy(guarded_completion)
+        forged_guarded_completion["post_current_observation_receipt_sha256"] = (
+            forged_guarded_current["receipt_sha256"]
+        )
+        forged_guarded_completion["acquisition_transaction_receipt_sha256"] = (
+            forged_guarded_transaction["receipt_sha256"]
+        )
+        forged_guarded_completion["completion_sha256"] = _canonical_sha256(
+            {
+                k: v
+                for k, v in forged_guarded_completion.items()
+                if k != "completion_sha256"
+            }
+        )
+        forged_guarded_validator = _RecoveryContractValidator(
+            self.recovery_schema,
+            self.producer_receipt,
+            self.carriers["required_report_schema"]["parent_input_profiles"][
+                "merge_status_producer_implementation_receipt"
+            ],
+            guarded_observation,
+            guarded_delivery,
+            guarded_delivery["receipt_sha256"],
+            guarded["dependency_edge_resolution_receipt"],
+            guarded["dependency_edge_resolution_receipt"]["resolver_anchor"],
+            guarded["pre_mutation_run_observation"],
+            forged_guarded_current,
+            forged_guarded_transaction,
+        )
+        self.assertFalse(
+            forged_guarded_validator.validate_completion(
+                forged_guarded_completion, guarded
+            )
+        )
+
+        arbitrary_guarded_transaction = copy.deepcopy(guarded_transaction)
+        arbitrary_guarded_transaction.update(
+            owner="candidate", no_intervening_rerun=False
+        )
+        arbitrary_guarded_transaction["receipt_sha256"] = _receipt_sha256(
+            arbitrary_guarded_transaction
+        )
+        arbitrary_transaction_completion = copy.deepcopy(guarded_completion)
+        arbitrary_transaction_completion["acquisition_transaction_receipt_sha256"] = (
+            arbitrary_guarded_transaction["receipt_sha256"]
+        )
+        arbitrary_transaction_completion["completion_sha256"] = _canonical_sha256(
+            {
+                k: v
+                for k, v in arbitrary_transaction_completion.items()
+                if k != "completion_sha256"
+            }
+        )
+        arbitrary_transaction_validator = _RecoveryContractValidator(
+            self.recovery_schema,
+            self.producer_receipt,
+            self.carriers["required_report_schema"]["parent_input_profiles"][
+                "merge_status_producer_implementation_receipt"
+            ],
+            guarded_observation,
+            guarded_delivery,
+            guarded_delivery["receipt_sha256"],
+            guarded["dependency_edge_resolution_receipt"],
+            guarded["dependency_edge_resolution_receipt"]["resolver_anchor"],
+            guarded["pre_mutation_run_observation"],
+            guarded_current_observation,
+            arbitrary_guarded_transaction,
+        )
+        self.assertFalse(
+            arbitrary_transaction_validator.validate_completion(
+                arbitrary_transaction_completion, guarded
+            )
         )
 
         delivery_attacks = {
@@ -2294,6 +2784,208 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                     self.acquisition_transaction,
                 )
                 self.assertFalse(validator.validate_preflight(attacked))
+
+    def test_recovery_composes_with_closed_producer_profile(self) -> None:
+        module_name = (
+            f"{__package__}.test_github_terminal_carriers"
+            if __package__
+            else "test_github_terminal_carriers"
+        )
+        terminal_module = importlib.import_module(module_name)
+        terminal_case_class = terminal_module.GitHubTerminalCarrierContractTest
+        terminal_case_class.setUpClass()
+        terminal_case = terminal_case_class()
+        terminal_validator = terminal_case._validator_with_complete_snapshot(
+            terminal_case.merge_complete_pr_parent_snapshot
+        )
+        composed_receipt = copy.deepcopy(
+            terminal_case.merge_status_producer_implementation_receipt
+        )
+        for field in (
+            "workflow_repository",
+            "workflow_path",
+            "workflow_sha",
+            "workflow_ref",
+            "workflow_ref_identity",
+            "job_workflow_ref",
+            "job_workflow_ref_identity",
+            "implementation_closure_complete",
+            "implementation_closure",
+            "implementation_closure_count",
+            "implementation_closure_sha256",
+        ):
+            composed_receipt[field] = copy.deepcopy(self.producer_receipt[field])
+        composed_receipt["receipt_sha256"] = _receipt_sha256(composed_receipt)
+        terminal_validator.merge_status_producer_implementation_receipt = (
+            composed_receipt
+        )
+        report = copy.deepcopy(terminal_case.grammar["report_bases"]["merge_status"])
+        self.assertTrue(
+            terminal_validator._merge_status_producer_implementation_matches(report)
+        )
+        self.assertTrue(
+            self.recovery_validator.validate_preflight(self.recovery_contract)
+        )
+
+    def test_recovery_rejects_malformed_producer_closure_after_coupled_rehash(
+        self,
+    ) -> None:
+        def rebuild(
+            producer: dict[str, object], contract: dict[str, object]
+        ) -> _RecoveryContractValidator:
+            producer["implementation_closure_sha256"] = _canonical_sha256(
+                producer["implementation_closure"]
+            )
+            producer["receipt_sha256"] = _receipt_sha256(producer)
+            contract["implementation_receipt_identity"]["receipt_sha256"] = producer[
+                "receipt_sha256"
+            ]
+            resolution = contract["dependency_edge_resolution_receipt"]
+            resolution["implementation_receipt_sha256"] = producer["receipt_sha256"]
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            contract["preflight_sha256"] = _canonical_sha256(
+                {k: v for k, v in contract.items() if k != "preflight_sha256"}
+            )
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                producer,
+                self.carriers["required_report_schema"]["parent_input_profiles"][
+                    "merge_status_producer_implementation_receipt"
+                ],
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                self.recovery_contract["dependency_edge_resolution_receipt"][
+                    "resolver_anchor"
+                ],
+                self.recovery_contract["pre_mutation_run_observation"],
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        def mutate_non_root_entry(
+            producer: dict[str, object],
+            contract: dict[str, object],
+            mutate: object,
+        ) -> None:
+            old_entry = copy.deepcopy(producer["implementation_closure"][1])
+            new_entry = copy.deepcopy(old_entry)
+            mutate(new_entry)
+            producer["implementation_closure"][1] = new_entry
+            resolution = contract["dependency_edge_resolution_receipt"]
+            for record in resolution["records"]:
+                if record["source_entry"] == old_entry:
+                    record["source_entry"] = copy.deepcopy(new_entry)
+                    record["source_sha256"] = new_entry["blob_sha256"]
+                for reference in record["discovered_references"]:
+                    if reference["target_entry"] == old_entry:
+                        reference["target_entry"] = copy.deepcopy(new_entry)
+                record["record_sha256"] = _canonical_sha256(
+                    {k: v for k, v in record.items() if k != "record_sha256"}
+                )
+            resolution["records"].sort(
+                key=lambda record: (
+                    record["source_entry"].get("repository", ""),
+                    record["source_entry"].get("commit", ""),
+                    record["source_entry"].get("path", ""),
+                    record["source_entry"].get("kind", ""),
+                    record["source_entry"].get("blob_sha256", ""),
+                )
+            )
+            resolution["records_sha256"] = _canonical_sha256(resolution["records"])
+            for edge in resolution["edges"]:
+                if edge["source_entry"] == old_entry:
+                    edge["source_entry"] = copy.deepcopy(new_entry)
+                if edge["target_entry"] == old_entry:
+                    edge["target_entry"] = copy.deepcopy(new_entry)
+            resolution["edges"].sort(
+                key=lambda edge: (
+                    edge["source_entry"].get("repository", ""),
+                    edge["source_entry"].get("commit", ""),
+                    edge["source_entry"].get("path", ""),
+                    edge["source_entry"].get("kind", ""),
+                    edge["source_entry"].get("blob_sha256", ""),
+                    edge["reference"],
+                    edge["target_entry"].get("repository", ""),
+                    edge["target_entry"].get("commit", ""),
+                    edge["target_entry"].get("path", ""),
+                    edge["target_entry"].get("kind", ""),
+                    edge["target_entry"].get("blob_sha256", ""),
+                )
+            )
+            resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+
+        for name, mutate in {
+            "invalid-kind": lambda entry: entry.update(kind="local-action"),
+            "unsafe-path": lambda entry: entry.update(path="actions/../action.yml"),
+            "invalid-repository": lambda entry: entry.update(repository="owner/"),
+            "invalid-commit-sha": lambda entry: entry.update(commit="bad"),
+            "invalid-blob-sha": lambda entry: entry.update(blob_sha256="bad"),
+            "extra-entry-field": lambda entry: entry.update(extra=True),
+        }.items():
+            with self.subTest(producer_attack=name):
+                producer = copy.deepcopy(self.producer_receipt)
+                contract = copy.deepcopy(self.recovery_contract)
+                mutate_non_root_entry(producer, contract, mutate)
+                validator = rebuild(producer, contract)
+                self.assertFalse(validator.validate_preflight(contract))
+
+        producer = copy.deepcopy(self.producer_receipt)
+        contract = copy.deepcopy(self.recovery_contract)
+        producer["run_ref"] = "feature/review"
+        for raw_field, identity_field in (
+            ("workflow_ref", "workflow_ref_identity"),
+            ("job_workflow_ref", "job_workflow_ref_identity"),
+        ):
+            producer[identity_field]["ref"] = producer["run_ref"]
+            producer[raw_field] = (
+                f"{producer[identity_field]['repository']}/"
+                f"{producer[identity_field]['path']}@{producer['run_ref']}"
+            )
+        contract["implementation_receipt_identity"]["run_ref"] = producer["run_ref"]
+        contract["operation_intent"]["ref"] = producer["run_ref"]
+        contract["repeat_safety"]["operation_identity_sha256"] = _canonical_sha256(
+            contract["operation_intent"]
+        )
+        attacked_before = contract["pre_mutation_run_observation"]
+        attacked_before["run_ref"] = producer["run_ref"]
+        attacked_before["workflow_ref"] = producer["workflow_ref"]
+        attacked_before["job_workflow_ref"] = producer["job_workflow_ref"]
+        attacked_before["receipt_sha256"] = _receipt_sha256(attacked_before)
+        validator = rebuild(producer, contract)
+        validator.expected_pre_mutation_observation = copy.deepcopy(attacked_before)
+        self.assertFalse(validator.validate_preflight(contract))
+
+        for name, mutate in {
+            "float-count": lambda producer: producer.update(
+                implementation_closure_count=2.0
+            ),
+            "tuple-closure": lambda producer: producer.update(
+                implementation_closure=tuple(producer["implementation_closure"])
+            ),
+        }.items():
+            with self.subTest(producer_shape_attack=name):
+                producer = copy.deepcopy(self.producer_receipt)
+                contract = copy.deepcopy(self.recovery_contract)
+                mutate(producer)
+                validator = rebuild(producer, contract)
+                self.assertFalse(validator.validate_preflight(contract))
+
+        for name, mutate in {
+            "malformed-nested-entry": lambda producer: producer[
+                "workflow_ref_identity"
+            ]["entry"].update(extra=True),
+            "unsorted-closure": lambda producer: producer[
+                "implementation_closure"
+            ].reverse(),
+        }.items():
+            with self.subTest(producer_attack=name):
+                producer = copy.deepcopy(self.producer_receipt)
+                contract = copy.deepcopy(self.recovery_contract)
+                mutate(producer)
+                validator = rebuild(producer, contract)
+                self.assertFalse(validator.validate_preflight(contract))
 
     def test_actions_repeat_requires_external_repeat_safety_contract_and_authorization(
         self,

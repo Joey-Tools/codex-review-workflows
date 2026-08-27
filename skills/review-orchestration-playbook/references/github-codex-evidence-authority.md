@@ -931,6 +931,13 @@ verified record and compare every remaining field type-preservingly. Coupled
 edits to the report's contract, App, run, check, assertion, or stable
 association identities therefore fail even when the edited report remains
 internally self-consistent.
+The GitHub-Actions producer closure uses the same closed entry profile for
+merge-status and recovery: exact nonempty owner/repository, full commit SHA,
+safe canonical path, SHA-256 blob digest, and kind `workflow`,
+`reusable-workflow`, `action`, or `script`; parsed workflow and job identities
+must carry exact closed entries. For an external-App producer, both raw
+workflow fields and both parsed workflow identity fields are null; retaining
+either parsed identity makes the provider union unavailable.
 
 The consumer also receives the independent common `complete_pr_snapshot`.
 Its stable positive selection must equal the complete outer merge-status
