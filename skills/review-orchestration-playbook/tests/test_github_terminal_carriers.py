@@ -1045,6 +1045,24 @@ class _ReportValidator:
             )
         return left == right
 
+    @staticmethod
+    def _scope_records_equal(left: object, right: object) -> bool:
+        if (
+            not isinstance(left, dict)
+            or not isinstance(right, dict)
+            or set(left) != set(right)
+            or "repository" not in left
+            or _repository_identity(left["repository"]) is None
+            or _repository_identity(right["repository"]) is None
+            or not _same_repository(left["repository"], right["repository"])
+        ):
+            return False
+        return all(
+            _ReportValidator._type_preserving_equal(left[key], right[key])
+            for key in left
+            if key != "repository"
+        )
+
     def _common_evidence(self, report: dict[str, object], evidence: object) -> bool:
         if not self._closed(evidence, "evidence"):
             return False
@@ -1340,13 +1358,15 @@ class _ReportValidator:
             self._direct_positive_scope_matches(report)
             and snapshot["owner"] == "parent-orchestrator"
             and snapshot["status"] == "complete"
-            and self._type_preserving_equal(initial_scope, final_scope)
-            and initial_scope
-            == {
-                "repository": report["repository"],
-                "pull_request": report["pull_request"],
-                "head_sha": report["head_sha"],
-            }
+            and self._scope_records_equal(initial_scope, final_scope)
+            and self._scope_records_equal(
+                initial_scope,
+                {
+                    "repository": report["repository"],
+                    "pull_request": report["pull_request"],
+                    "head_sha": report["head_sha"],
+                },
+            )
             and self._type_preserving_equal(initial_inventory, final_inventory)
             and all(initial_inventory[field] is True for field in page_fields)
             and all(
@@ -1400,10 +1420,8 @@ class _ReportValidator:
         if report["basis"] == "merge-status":
             if (
                 not self._closed_parent_input(initial_merge_scope, "merge_status_scope")
-                or not self._type_preserving_equal(
-                    initial_merge_scope, final_merge_scope
-                )
-                or not self._type_preserving_equal(
+                or not self._scope_records_equal(initial_merge_scope, final_merge_scope)
+                or not self._scope_records_equal(
                     initial_merge_scope, self.merge_status_parent_scope
                 )
             ):
@@ -1487,7 +1505,9 @@ class _ReportValidator:
             "final_scope",
         ):
             scope = epoch[field]
-            if not self._selected_pr_scope_value(scope) or scope != expected_scope:
+            if not self._selected_pr_scope_value(
+                scope
+            ) or not self._scope_records_equal(scope, expected_scope):
                 return False
         try:
             request_time = _time(epoch["request_server_time"])
@@ -1812,7 +1832,7 @@ class _ReportValidator:
         }
         base_ref = association["base_ref"]
         if (
-            not self._type_preserving_equal(association_scope, parent_scope)
+            not self._scope_records_equal(association_scope, parent_scope)
             or not isinstance(base_ref, str)
             or not base_ref.startswith("refs/heads/")
             or len(base_ref) > 255
@@ -1991,7 +2011,7 @@ class _ReportValidator:
             "check_name": parent_contract["check_name"],
             "provider_clean_assertion": parent_contract["provider_clean_assertion"],
         }
-        if not self._type_preserving_equal(
+        if not self._scope_records_equal(
             candidate_scope, expected_candidate_scope
         ) or not self._type_preserving_equal(
             trusted_contract, expected_trusted_contract
@@ -2743,7 +2763,7 @@ class _ReportValidator:
             "pull_request": expected_scope["pull_request"],
             "head_sha": expected_scope["head_sha"],
         }
-        if not self._type_preserving_equal(observation["scope"], selected_scope):
+        if not self._scope_records_equal(observation["scope"], selected_scope):
             return False
         inventory = observation["page_inventory"]
         issue_comments = observation["issue_comments"]
@@ -2916,7 +2936,7 @@ class _ReportValidator:
             and receipt["status"] == rules["status"]
             and receipt["profile"] == "github-codex-finding-acquisition-v1"
             and self._closed_parent_input(receipt["scope"], "finding_acquisition_scope")
-            and self._type_preserving_equal(receipt["scope"], receipt_scope)
+            and self._scope_records_equal(receipt["scope"], receipt_scope)
             and self._closed_parent_input(
                 inventory, "finding_acquisition_page_inventory"
             )
@@ -7174,6 +7194,124 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     self.merge_status_parent_contract,
                 )
                 self.assertFalse(validator.validate(report))
+
+    def test_independent_scope_records_use_repository_identity_only(self) -> None:
+        head_sha = self.direct_positive_parent_scope["head_sha"]
+        left_scope = {
+            "repository": "OcTo/Review-Fixture",
+            "pull_request": 7,
+            "head_sha": head_sha,
+        }
+        right_scope = {
+            "repository": "octo/review-fixture",
+            "pull_request": 7,
+            "head_sha": head_sha,
+        }
+        self.assertTrue(_ReportValidator._scope_records_equal(left_scope, right_scope))
+        self.assertEqual(left_scope["repository"], "OcTo/Review-Fixture")
+        for field, replacement in (
+            ("pull_request", 7.0),
+            ("head_sha", "A" * 40),
+        ):
+            with self.subTest(non_repository_drift=field):
+                drifted_scope = copy.deepcopy(right_scope)
+                drifted_scope[field] = replacement
+                self.assertFalse(
+                    _ReportValidator._scope_records_equal(left_scope, drifted_scope)
+                )
+        opened_scope = copy.deepcopy(right_scope)
+        opened_scope["opaque"] = True
+        self.assertFalse(
+            _ReportValidator._scope_records_equal(left_scope, opened_scope)
+        )
+        invalid_repository_scope = copy.deepcopy(right_scope)
+        invalid_repository_scope["repository"] = "octo/仓库"
+        self.assertFalse(
+            _ReportValidator._scope_records_equal(left_scope, invalid_repository_scope)
+        )
+
+    def test_independent_parent_scopes_accept_repository_case_variants(
+        self,
+    ) -> None:
+        clean_report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        clean_snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        clean_snapshot["initial_scope"]["repository"] = "OcTo/Review-Fixture"
+        clean_snapshot["final_scope"]["repository"] = "OCTO/review-fixture"
+        self.assertTrue(
+            self._validator_with_complete_snapshot(clean_snapshot).validate(
+                clean_report
+            )
+        )
+        self.assertEqual(
+            clean_snapshot["initial_scope"]["repository"], "OcTo/Review-Fixture"
+        )
+
+        reaction_report = copy.deepcopy(self.grammar["report_bases"]["reaction_clean"])
+        reaction_epoch = copy.deepcopy(self.reaction_clean_parent_epoch)
+        reaction_scope_repositories = {
+            "pre_request_scope": "OcTo/Review-Fixture",
+            "post_request_scope": "octo/REVIEW-FIXTURE",
+            "reaction_read_scope": "OCTO/review-fixture",
+            "final_scope": "octo/Review-Fixture",
+        }
+        for field, repository in reaction_scope_repositories.items():
+            reaction_epoch[field]["repository"] = repository
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                self.absent_complete_pr_parent_snapshot,
+                reaction_epoch=reaction_epoch,
+            ).validate(reaction_report)
+        )
+        self.assertEqual(
+            reaction_epoch["reaction_read_scope"]["repository"],
+            "OCTO/review-fixture",
+        )
+
+        merge_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        merge_report["evidence"]["association"]["repository"] = "OcTo/Review-Fixture"
+        merge_snapshot = self._merge_snapshot_for_report(merge_report)
+        merge_snapshot["initial_merge_status_scope"]["repository"] = (
+            "OCTO/review-fixture"
+        )
+        merge_snapshot["final_merge_status_scope"]["repository"] = "octo/REVIEW-FIXTURE"
+        merge_anchor = copy.deepcopy(self.merge_status_contract_trust_anchor)
+        merge_anchor["candidate_scope"]["repository"] = "OCTO/Review-Fixture"
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                merge_snapshot,
+                merge_anchor=merge_anchor,
+            ).validate(merge_report)
+        )
+        self.assertEqual(
+            merge_report["evidence"]["association"]["repository"],
+            "OcTo/Review-Fixture",
+        )
+        self.assertEqual(
+            merge_anchor["candidate_scope"]["repository"],
+            "OCTO/Review-Fixture",
+        )
+
+        finding_report = copy.deepcopy(self.grammar["report_bases"]["finding"])
+        finding_snapshot = copy.deepcopy(self.top_level_finding_carrier_snapshot)
+        finding_observation = finding_snapshot["complete_observation"]
+        finding_observation["scope"]["repository"] = "OcTo/Review-Fixture"
+        finding_snapshot["complete_observation_sha256"] = _canonical_json_sha256(
+            finding_observation
+        )
+        finding_page_receipt = copy.deepcopy(self.finding_page_parent_receipt)
+        finding_page_receipt["scope"]["repository"] = "OCTO/review-fixture"
+        self.assertTrue(
+            self._validator_with_finding_snapshot(
+                finding_snapshot,
+                page_receipt=finding_page_receipt,
+            ).validate(finding_report)
+        )
+        self.assertEqual(
+            finding_observation["scope"]["repository"], "OcTo/Review-Fixture"
+        )
+        self.assertEqual(
+            finding_page_receipt["scope"]["repository"], "OCTO/review-fixture"
+        )
 
     def test_merge_status_uses_independent_parent_contract_input(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])

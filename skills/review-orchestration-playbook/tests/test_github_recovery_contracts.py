@@ -298,6 +298,14 @@ class _RecoveryContractValidator:
         )
 
     @staticmethod
+    def _nonnegative_int(value: object) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= MAX_SAFE_INTEGER
+        )
+
+    @staticmethod
     def _safe_path(value: object) -> bool:
         if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
             return False
@@ -811,9 +819,11 @@ class _RecoveryContractValidator:
             )
             or resolver["receipt_sha256"] != _receipt_sha256(resolver)
             or not isinstance(records, list)
+            or not self._nonnegative_int(edges_receipt["record_count"])
             or edges_receipt["record_count"] != len(records)
             or edges_receipt["records_sha256"] != _canonical_sha256(records)
             or not isinstance(edges, list)
+            or not self._nonnegative_int(edges_receipt["edge_count"])
             or edges_receipt["edge_count"] != len(edges)
             or edges_receipt["edges_sha256"] != _canonical_sha256(edges)
             or edges_receipt["receipt_sha256"] != _receipt_sha256(edges_receipt)
@@ -863,6 +873,7 @@ class _RecoveryContractValidator:
                     }
                 )
                 != len(references)
+                or not self._nonnegative_int(record["discovered_reference_count"])
                 or record["discovered_reference_count"] != len(references)
                 or record["record_sha256"]
                 != _canonical_sha256(
@@ -986,7 +997,9 @@ class _RecoveryContractValidator:
             and self._positive_int(before["run_id"])
             and before["run_attempt"] == producer["run_attempt"]
             and self._positive_int(before["run_attempt"])
+            and self._positive_int(operation["pre_run_attempt"])
             and operation["pre_run_attempt"] == before["run_attempt"]
+            and self._positive_int(operation["expected_run_attempt"])
             and operation["expected_run_attempt"] == before["run_attempt"] + 1
             and _timestamp(before["observed_at"]) is not None
             and before["head_sha"] == producer["feature_head_sha"]
@@ -2815,6 +2828,77 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         self.assertFalse(
             self.recovery_validator.validate_completion(cyclic, self.recovery_contract)
         )
+
+    def test_recovery_numeric_counts_and_attempts_reject_boolean_aliases(
+        self,
+    ) -> None:
+        producer_fields = self.carriers["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_producer_implementation_receipt"]
+
+        def rehash(contract: dict[str, object]) -> None:
+            resolution = contract["dependency_edge_resolution_receipt"]
+            for record in resolution["records"]:
+                record["record_sha256"] = _canonical_sha256(
+                    {k: v for k, v in record.items() if k != "record_sha256"}
+                )
+            resolution["records_sha256"] = _canonical_sha256(resolution["records"])
+            resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            contract["repeat_safety"]["operation_identity_sha256"] = _canonical_sha256(
+                contract["operation_intent"]
+            )
+            contract["preflight_sha256"] = _canonical_sha256(
+                {k: v for k, v in contract.items() if k != "preflight_sha256"}
+            )
+
+        def validator_for(
+            contract: dict[str, object],
+        ) -> _RecoveryContractValidator:
+            resolution = contract["dependency_edge_resolution_receipt"]
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                self.producer_receipt,
+                producer_fields,
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                resolution["resolver_anchor"],
+                contract["pre_mutation_run_observation"],
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        for field in ("record_count", "edge_count"):
+            with self.subTest(resolution_count=field):
+                contract = copy.deepcopy(self.recovery_contract)
+                resolution = contract["dependency_edge_resolution_receipt"]
+                resolution[field] = bool(resolution[field])
+                rehash(contract)
+                self.assertFalse(validator_for(contract).validate_preflight(contract))
+
+        for index, source_record in enumerate(
+            self.recovery_contract["dependency_edge_resolution_receipt"]["records"]
+        ):
+            with self.subTest(discovered_reference_count=index):
+                contract = copy.deepcopy(self.recovery_contract)
+                record = contract["dependency_edge_resolution_receipt"]["records"][
+                    index
+                ]
+                record["discovered_reference_count"] = bool(
+                    source_record["discovered_reference_count"]
+                )
+                rehash(contract)
+                self.assertFalse(validator_for(contract).validate_preflight(contract))
+
+        for field in ("pre_run_attempt", "expected_run_attempt"):
+            with self.subTest(operation_attempt=field):
+                contract = copy.deepcopy(self.recovery_contract)
+                operation = contract["operation_intent"]
+                operation[field] = bool(operation[field])
+                rehash(contract)
+                self.assertFalse(validator_for(contract).validate_preflight(contract))
 
     def test_recovery_refs_and_endpoints_preserve_non_repository_bytes(self) -> None:
         def validate_before(**updates: str) -> bool:

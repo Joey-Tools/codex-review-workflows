@@ -2325,6 +2325,28 @@ superseded_by:
   Because the repairs advance the head, the earlier admission and review are
   evidence for the repair loop only; final-head admission and fresh review are
   rerun rather than reused.
+- A later zero-inherited-context `gpt-5.6-sol` / `ultra` peer-subagent review
+  inspected the complete merge-inclusive range
+  `a439793df9483943991c258e16f4ddf705736643..c3951fe8236da5f5993df4e557613c50dfb0d89e`
+  in a freshly validated exact-pack workspace. It found two remaining consumer
+  inconsistencies: recovery count/attempt comparisons could still admit Python
+  Boolean aliases at equality-compatible values, and independently acquired
+  parent scopes compared repository spelling byte-for-byte instead of using
+  GitHub's ASCII case-insensitive repository identity. The repairs validate
+  every count and attempt as an exact non-Boolean safe integer before equality,
+  and compare only each scope's `repository` field semantically while keeping
+  all other fields type- and byte-exact and preserving every raw spelling.
+  Fully rehashed Boolean regressions and independent mixed-case scope matrices
+  cover clean, reaction, merge-status, trust-anchor, and finding evidence.
+- The two repaired modules passed `58/58` focused tests. The complete
+  review-playbook suite then ran all `3,249` tests with six conditional skips
+  in `2,103.706` seconds; its only failure was the known outer-sandbox refusal
+  to nest macOS `sandbox-exec` for the Claude keychain broker
+  (`sandbox_apply: Operation not permitted`). That exact broker test passed in
+  `1.928` seconds when rerun outside only the demonstrated outer restriction.
+  The journal-only evidence update receives lightweight validation; the signed
+  repaired head still receives new exact-secret admission and a fresh
+  whole-range review rather than reusing the reviewed `c3951fe` result.
 
 ## Next Steps
 
