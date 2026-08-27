@@ -41,7 +41,7 @@ Freeze one committed `base_sha..head_sha` range for all local lanes. Resolve a P
   rewriting the old one.
 - Treat the range as the complete Git DAG comparison. Merge commits and in-range side history are valid; never project it to linear, first-parent, or ancestry-path history.
 - When PR-wide coverage matters, require one unique current merge base, `base_sha` to equal it and be an ancestor of `head_sha`, and `head_sha` to equal the selected PR's current head.
-- Treat the selected PR's exact repository, `baseRefName`, and `baseRefOid` as
+- Treat the selected PR's canonical repository identity, exact `baseRefName`, and exact `baseRefOid` as
   separate readiness bindings. Any observed base-ref retarget, even to the
   same OID, or any base-tip change invalidates every prior local review, local
   validation and test result, CI/status result, conversation/readiness
@@ -91,6 +91,36 @@ Double and triple add one actual Claude Code process in a second independent wor
 
 Before any GitHub-lane action, read [github-codex-evidence-authority.md](references/github-codex-evidence-authority.md). It is the field-level authority for producer identity, complete pagination, lifecycle, terminal selection, unresolved findings, fallback reactions, and machine-readable reporting.
 
+For every GitHub-lane semantic join, require a valid ASCII `owner/name`
+repository locator and compare its two components case-insensitively. Apply that
+canonical repository identity to same-repository tests, closure and reachability
+keys, selector repository segments, candidate-range exclusion,
+action-manifest-directory uniqueness, and repository-scoped URL/ref joins. Do
+not case-fold paths, commits, refs, or URL suffix/query/fragment fields, and do
+not rewrite the original repository spelling inside a raw or digest-bound
+record: those bytes remain exact and type-preserving. Repository case folding
+is not rename following and does not imply that this version possesses an
+immutable repository ID.
+
+Accept a GitHub web or API URL only when its raw ASCII text contains no C0,
+space, or DEL character, uses the exact lowercase `https://github.com/` or
+`https://api.github.com/` prefix required by that field, and parses then
+recomposes byte-for-byte. Only the `owner/name` segment is compared by canonical
+repository identity; path, ref, SHA, query, fragment, and delimiter presence
+remain exact. Uppercase scheme/host spellings, stripped whitespace, and an empty
+`?` or `#` delimiter that a parser would discard are malformed. A claimed safe
+canonical repository path must be a nonempty relative POSIX path with at least
+one component and no NUL, backslash, absolute form, empty/dot component, or
+noncanonical spelling; `.` is not a file path.
+
+Before copying, canonicalizing, or digesting a parent/report JSON value, apply
+the closed canonical-JSON resource profile: exact acyclic list/dict containers,
+at most 256 container levels and 100,000 value nodes, at most 1 MiB of UTF-8 per
+string value or object key, and at most 16 MiB of aggregate UTF-8 across all
+string values and keys. Reject a string whose code-point count already exceeds
+1 MiB before bounded UTF-8 encoding; malformed or over-limit inputs are
+status-only rather than exceptions.
+
 The intended current policy is:
 
 - Use exact `@codex review` on an existing supported `github.com` PR at the frozen current head. An ordinary terminal artifact, reaction, or feature-head-only producer result does not prove provider coverage of the local merge base; base and merge-base coverage remain local PR-readiness facts.
@@ -110,10 +140,36 @@ The intended current policy is:
   clean. A separate parent-owned anchored resolver must emit records that
   exactly cover every canonical closure entry, bind parser/source digests and
   complete discovered references, and project one full-entry edge per
-  reference; bind its receipt digest into the stable snapshot basis.
-  Candidate-range implementation bytes, an unbound actual run, or an
-  external App without equivalent provider-authenticated immutable identity
-  cannot pass. A `feature-head` contract reports only latest-feature-head coverage;
+  reference; bind its receipt digest into the stable snapshot basis. Apply the
+  authority's closed selector and job-identity semantics: external reusable
+  workflows from workflow/reusable-workflow sources and external actions from
+  workflow/reusable-workflow/action sources use canonical target
+  repository/path selectors ending in the target's full commit SHA; an action
+  path is its manifest directory or repository root. Workflow targets are
+  direct `.github/workflows/*.yml` or `.github/workflows/*.yaml` children, not
+  nested paths. Each canonical-repository-identity/commit/path identifies one
+  kind and blob, each
+  source-entry/raw-selector pair identifies one target, and each
+  canonical-repository-identity/commit/action-manifest directory identifies at
+  most one action
+  entry; a competing `action.yml` and `action.yaml` pair is status-only.
+  Same-repository reusable
+  workflows may also use the exact same-commit `./.github/workflows/...` or
+  `$/.github/workflows/...` form; and a `$/` action selector binds the source
+  repository and running commit to the target action-manifest directory. Other
+  relative local-action forms and untyped action-to-script relative strings are
+  status-only. Every closure entry must be root-reachable, with the exact root
+  workflow identity as the zero-inbound job identity and each non-root
+  reusable-workflow job identity joined to exactly one semantically matching
+  inbound edge. Only the external reusable-workflow arm requires a full-SHA raw
+  job ref, and its unique edge reference must equal that raw job ref exactly; a
+  local `./` or `$/` arm may retain its authenticated branch-like raw identity
+  ref while its target entry and resolved commit remain fixed to the source
+  running commit.
+  Candidate-range implementation bytes or an unbound actual run cannot pass.
+  Version 1 has no accepted external-App ID-to-root-to-closure binding profile,
+  so external-App merge-status is unavailable and terminal-clean fallback
+  remains. A `feature-head` contract reports only latest-feature-head coverage;
   a `github-synthetic-merge` contract may report current-merge-scope coverage
   only while every base/merge/subject binding remains stable. With zero
   applicable unresolved findings, this basis passes independently and does not
@@ -161,6 +217,44 @@ independently declares the exact operation idempotent or
 reentrant. Existing-run reruns are eligible only when
 the platform-authenticated original head, ref, workflow SHA, and run/check
 identity match; GitHub reruns retain the original `GITHUB_SHA` and `GITHUB_REF`.
+Before either automatic rerun, require every reusable-workflow or external
+action selector in the complete resolution graph to end in its target closure
+entry's exact lowercase full commit SHA. The selector is canonical target
+repository/workflow-path for a reusable workflow and canonical target
+repository/action-manifest-directory for an action; a root action manifest uses
+the repository root. Workflow targets are direct
+`.github/workflows/*.yml` or `.github/workflows/*.yaml` children, not nested
+paths. Each canonical-repository-identity/commit/path identifies one kind and
+blob, each
+source-entry/raw-selector pair identifies one target, and each
+canonical-repository-identity/commit/action-manifest directory identifies at
+most one action
+entry; a competing `action.yml` and `action.yaml` pair is status-only.
+Reusable-workflow sources are limited to workflow or
+reusable-workflow entries, while action sources are limited to workflow,
+reusable-workflow, or action entries. A workflow or reusable-workflow source may
+instead bind a same-repository, same-commit reusable workflow by exact
+`./.github/workflows/...` or `$/.github/workflows/...`; a `$/` action selector
+may likewise bind the source repository and running commit to the exact target
+action-manifest directory. Version 1 cannot bind a workflow/reusable-workflow
+`./` or `../` local action to immutable runner-workspace bytes, and it cannot
+bind an untyped bare action-manifest-to-script relative string; those and every
+unrecognized relative form are status-only. Require every closure entry to be
+reachable from the authenticated root workflow. The root job identity must be
+exactly the root workflow identity and have no inbound edge. Every non-root job
+identity must be a reusable-workflow entry, have exactly one total inbound edge,
+and have its unique edge semantically match the job ref from a workflow or
+reusable-workflow source. The external arm requires a full-SHA raw selector and
+job ref equal to the resolved commit, with the unique edge reference exactly
+equal to that raw job ref. A same-repository local `./` or `$/` arm may retain
+the platform-authenticated branch-like raw job identity ref, but its
+target entry and resolved commit must equal the source running commit and its
+unique local edge must match repository and workflow path exactly. A tag,
+expression, mismatched repository/commit/path, disconnected entry, or unknown
+reference keeps recovery status-only. Apply this conservative rule to both full
+and failed-jobs reruns; the documented first-attempt
+reusable-workflow reuse for failed jobs does not bind every external action
+dependency in the version-1 schema.
 The operation kind is exactly `existing-run-rerun-full` or
 `existing-run-rerun-failed-jobs`; these are different operations. Bind an
 authenticated pre-mutation GET of attempt `n`, then require the matching exact
@@ -185,7 +279,7 @@ receipts remain status-only and cannot satisfy recovery. A later current-head
 run/check can count only through an independent ordinary producer/status
 contract; the dispatch never supplies pass authority by itself. The machine-readable
 recovery union therefore contains only the two exact existing-run rerun modes.
-Their trusted root workflow repository must equal the recovery repository;
+Their trusted root workflow repository must have canonical identity equal to the recovery repository identity;
 an external reusable workflow may appear only through the exact job-workflow
 identity. Equality of a tuple never creates repeat safety.
 Current mutation authorization remains separate. Issue-comment creation is
@@ -239,7 +333,7 @@ every `baseRefOid != merge_expected_base` mutation; that exact-base property is
 preferred. A narrow alternative protects proven monotonic range contraction:
 the mutation still binds the exact reviewed head, GitHub enforces strict
 up-to-date in the merge transaction, `merge_expected_base == base_sha`, the
-frozen `merge_expected_base_ref` binds the exact repository and `baseRefName`,
+frozen `merge_expected_base_ref` binds the canonical repository identity and exact `baseRefName`,
 and the complete current policy inventory proves that same base ref can only
 fast-forward from the expected base and cannot be deleted or non-fast-forward
 rewritten. Then any unobserved mergeable base movement is both a descendant of

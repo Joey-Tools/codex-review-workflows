@@ -18,6 +18,125 @@ FINDING = re.compile(r"- \[P[0-3]\] (.{1,240}) — (https://[^\s]+)\Z")
 RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 APP_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?\Z")
+REPOSITORY_COMPONENT = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
+MAX_SAFE_INTEGER = (1 << 53) - 1
+MAX_CANONICAL_JSON_DEPTH = 256
+MAX_CANONICAL_JSON_NODES = 100_000
+MAX_CANONICAL_JSON_STRING_UTF8_BYTES = 1 << 20
+MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES = 16 << 20
+VALIDATION_EXCEPTIONS = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    OverflowError,
+    RecursionError,
+    TypeError,
+    ValueError,
+)
+
+
+def _repository_identity(value: object) -> str | None:
+    """Return GitHub's ASCII case-insensitive owner/name identity."""
+
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    parts = value.split("/")
+    if (
+        len(parts) != 2
+        or any(REPOSITORY_COMPONENT.fullmatch(part) is None for part in parts)
+        or any(part in {".", ".."} for part in parts)
+    ):
+        return None
+    return "/".join(part.lower() for part in parts)
+
+
+def _same_repository(left: object, right: object) -> bool:
+    left_identity = _repository_identity(left)
+    return left_identity is not None and left_identity == _repository_identity(right)
+
+
+def _repository_selector_matches(
+    reference: object, repository: object, exact_suffix: str
+) -> bool:
+    if (
+        not isinstance(reference, str)
+        or not exact_suffix
+        or not reference.endswith(exact_suffix)
+    ):
+        return False
+    return _same_repository(reference[: -len(exact_suffix)], repository)
+
+
+def _repository_selector_identity(
+    reference: str, target_entry: dict[str, object]
+) -> tuple[object, ...]:
+    if reference.startswith(("./", "../", "$/")):
+        return ("relative", reference)
+    kind = target_entry["kind"]
+    path = target_entry["path"]
+    commit = target_entry["commit"]
+    if kind == "reusable-workflow":
+        suffix = f"/{path}@{commit}"
+    elif kind == "action":
+        action_directory = pathlib.PurePosixPath(path).parent.as_posix()
+        suffix = (
+            f"@{commit}" if action_directory == "." else f"/{action_directory}@{commit}"
+        )
+    else:
+        return ("unsupported", reference)
+    repository = reference[: -len(suffix)] if reference.endswith(suffix) else None
+    return ("external", _repository_identity(repository), suffix)
+
+
+def _repository_path_parts_match(parts: list[str], repository: object) -> bool:
+    return len(parts) >= 2 and _same_repository("/".join(parts[:2]), repository)
+
+
+def _has_url_control_or_space(value: str) -> bool:
+    return any(
+        ord(character) <= 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
+    )
+
+
+def _strict_github_url_parts(
+    value: object,
+) -> tuple[urllib.parse.SplitResult, str, str] | None:
+    prefix = "https://github.com/"
+    if (
+        not isinstance(value, str)
+        or _has_url_control_or_space(value)
+        or not value.startswith(prefix)
+    ):
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or urllib.parse.urlunsplit(parsed) != value
+    ):
+        return None
+    path_parts = parsed.path.removeprefix("/").split("/")
+    if len(path_parts) < 2:
+        return None
+    raw_repository = "/".join(path_parts[:2])
+    repository = _repository_identity(raw_repository)
+    if repository is None:
+        return None
+    exact_suffix = value[len(prefix) + len(raw_repository) :]
+    return parsed, repository, exact_suffix
+
+
+def _github_url_identity(value: object) -> tuple[object, ...] | None:
+    strict = _strict_github_url_parts(value)
+    if strict is None:
+        return None
+    _, repository, exact_suffix = strict
+    return repository, exact_suffix
+
+
+def _same_github_url(left: object, right: object) -> bool:
+    left_identity = _github_url_identity(left)
+    return left_identity is not None and left_identity == _github_url_identity(right)
 
 
 def _merge_patch(target: object, patch: object) -> object:
@@ -56,8 +175,94 @@ def _time(value: object) -> datetime.datetime:
     return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
 
 
+def _require_rfc8785_integer_domain(value: object) -> None:
+    stack: list[tuple[str, object, int, int]] = [("value", value, 0, 0)]
+    active_containers: set[int] = set()
+    node_count = 0
+    aggregate_string_bytes = 0
+    while stack:
+        frame_kind, current, container_depth, container_identity = stack.pop()
+        if frame_kind == "iterator":
+            try:
+                child = next(current)  # type: ignore[arg-type]
+            except StopIteration:
+                active_containers.remove(container_identity)
+                continue
+            stack.append(("iterator", current, container_depth, container_identity))
+            stack.append(("value", child, container_depth, 0))
+            continue
+        node_count += 1
+        if node_count > MAX_CANONICAL_JSON_NODES:
+            raise ValueError("canonical JSON exceeds the closed resource profile")
+        if type(current) is bool or current is None:
+            continue
+        if type(current) is str:
+            if len(current) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                raise ValueError("canonical JSON string exceeds the closed byte cap")
+            try:
+                encoded = current.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError(
+                    "canonical JSON strings must contain Unicode scalars"
+                ) from error
+            if len(encoded) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                raise ValueError("canonical JSON string exceeds the closed byte cap")
+            aggregate_string_bytes += len(encoded)
+            if aggregate_string_bytes > MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES:
+                raise ValueError("canonical JSON strings exceed the aggregate byte cap")
+            continue
+        if type(current) is int:
+            if not -MAX_SAFE_INTEGER <= current <= MAX_SAFE_INTEGER:
+                raise ValueError("integer is outside the RFC 8785 interoperable domain")
+            continue
+        if type(current) in {list, dict}:
+            next_depth = container_depth + 1
+            if next_depth > MAX_CANONICAL_JSON_DEPTH:
+                raise ValueError("canonical JSON exceeds the closed resource profile")
+            if node_count + len(current) > MAX_CANONICAL_JSON_NODES:
+                raise ValueError("canonical JSON exceeds the closed resource profile")
+            identity = id(current)
+            if identity in active_containers:
+                raise ValueError("canonical JSON containers must be acyclic")
+            active_containers.add(identity)
+            if type(current) is dict:
+                for key in current:
+                    if type(key) is not str or not key.isascii():
+                        raise ValueError(
+                            "canonical JSON object keys must be ASCII strings"
+                        )
+                    if len(key) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                        raise ValueError(
+                            "canonical JSON object key exceeds the closed byte cap"
+                        )
+                    aggregate_string_bytes += len(key)
+                    if aggregate_string_bytes > MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES:
+                        raise ValueError(
+                            "canonical JSON strings exceed the aggregate byte cap"
+                        )
+                children = iter(current.values())
+            else:
+                children = iter(current)
+            stack.append(("iterator", children, next_depth, identity))
+            continue
+        raise ValueError("canonical JSON value is outside the integer-only profile")
+
+
+_MALFORMED_PARENT_INPUT = object()
+
+
+def _bounded_parent_copy(value: object) -> object:
+    try:
+        _require_rfc8785_integer_domain(value)
+        return copy.deepcopy(value)
+    except VALIDATION_EXCEPTIONS:
+        return _MALFORMED_PARENT_INPUT
+
+
 def _canonical_json_sha256(value: object) -> str:
-    """Return the RFC 8785 digest for this grammar's integer-only JSON values."""
+    """Return the RFC 8785 digest for the fixed-key, safe-integer JSON profile."""
+
+    _require_rfc8785_integer_domain(value)
 
     canonical = json.dumps(
         value,
@@ -172,7 +377,11 @@ class _ReferenceClassifier:
 
     @staticmethod
     def _is_positive_int(value: object) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 < value <= MAX_SAFE_INTEGER
+        )
 
     def _projection_status(self, scope: dict[str, object]) -> str | None:
         ancestors = scope["ancestor_shas"]
@@ -192,7 +401,7 @@ class _ReferenceClassifier:
         if (
             projection["owner"] != self.ancestor_projection["owner"]
             or status not in self.ancestor_projection["status_values"]
-            or projection["repository"] != scope["repository"]
+            or not _same_repository(projection["repository"], scope["repository"])
             or not self._is_positive_int(projection["pull_request"])
             or projection["pull_request"] != scope["pull_request"]
             or not self._is_full_sha(projection["base_sha"])
@@ -231,6 +440,16 @@ class _ReferenceClassifier:
         )
 
     def classify(self, record: object) -> dict[str, object]:
+        try:
+            return self._classify(record)
+        except VALIDATION_EXCEPTIONS:
+            return self._result("malformed", None, None)
+
+    def _classify(self, record: object) -> dict[str, object]:
+        try:
+            _require_rfc8785_integer_domain(record)
+        except ValueError:
+            return self._result("malformed", None, None)
         if not isinstance(record, dict) or record.get("kind") not in {
             "issue_comment",
             "review",
@@ -248,8 +467,7 @@ class _ReferenceClassifier:
             return self._result("malformed", None, None)
         scope = record["scope"]
         if (
-            not isinstance(scope["repository"], str)
-            or not scope["repository"]
+            _repository_identity(scope["repository"]) is None
             or not self._is_positive_int(scope["pull_request"])
             or not self._is_full_sha(scope["base_sha"])
             or scope["base_sha"] == scope["head_sha"]
@@ -358,7 +576,9 @@ class _ReferenceClassifier:
             if not self._closed(resolution, "commit_resolution"):
                 return self._result("malformed", None, semantic)
             if (
-                resolution["repository"] != record["scope"]["repository"]
+                not _same_repository(
+                    resolution["repository"], record["scope"]["repository"]
+                )
                 or resolution["commit_ref"] != commit_ref
                 or resolution["initial_resolved_commit"] != head
                 or resolution["final_resolved_commit"] != head
@@ -446,7 +666,6 @@ class _ReferenceClassifier:
         if lines[0] != branch["header"] or len(lines) < 2:
             return self._result("malformed", None, semantic)
         commits: set[str] = set()
-        prefix = f"https://github.com/{record['scope']['repository']}/blob/"
         for line in lines[1:]:
             matched = FINDING.fullmatch(line)
             if not matched:
@@ -457,20 +676,34 @@ class _ReferenceClassifier:
                 or title[0] in "\t "
                 or title[-1] in "\t "
                 or "\t" in title
-                or not url.startswith(prefix)
             ):
                 return self._result("malformed", None, semantic)
             try:
                 url.encode("ascii")
             except UnicodeEncodeError:
                 return self._result("malformed", None, semantic)
-            suffix = url[len(prefix) :]
-            commit, separator, location = suffix.partition("/")
-            path, anchor_separator, anchor = location.rpartition("#")
+            strict_url = _strict_github_url_parts(url)
+            if strict_url is None:
+                return self._result("malformed", None, semantic)
+            parsed_url, _, _ = strict_url
+            path_parts = parsed_url.path.removeprefix("/").split("/")
             if (
-                not separator
-                or FULL_SHA.fullmatch(commit) is None
-                or not anchor_separator
+                parsed_url.scheme != "https"
+                or parsed_url.netloc != "github.com"
+                or parsed_url.query
+                or not _repository_path_parts_match(
+                    path_parts, record["scope"]["repository"]
+                )
+                or len(path_parts) < 5
+                or path_parts[2] != "blob"
+            ):
+                return self._result("malformed", None, semantic)
+            commit = path_parts[3]
+            path = "/".join(path_parts[4:])
+            anchor = parsed_url.fragment
+            if (
+                FULL_SHA.fullmatch(commit) is None
+                or not anchor
                 or re.fullmatch(r"L[1-9][0-9]*(?:-L[1-9][0-9]*)?", anchor) is None
                 or re.fullmatch(
                     r"(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2})+", path
@@ -559,11 +792,23 @@ class _ReferenceClassifier:
                 or child["pull_request_review_id"] != record["id"]
             ):
                 return self._result("malformed", None, semantic)
-            expected_url = (
-                f"https://github.com/{record['scope']['repository']}/pull/"
-                f"{record['scope']['pull_request']}#discussion_r{child['id']}"
-            )
-            if child["url"] != expected_url:
+            if not isinstance(child["url"], str):
+                return self._result("malformed", None, semantic)
+            strict_url = _strict_github_url_parts(child["url"])
+            if strict_url is None:
+                return self._result("malformed", None, semantic)
+            parsed_url, _, _ = strict_url
+            path_parts = parsed_url.path.removeprefix("/").split("/")
+            if (
+                parsed_url.scheme != "https"
+                or parsed_url.netloc != "github.com"
+                or parsed_url.query
+                or not _repository_path_parts_match(
+                    path_parts, record["scope"]["repository"]
+                )
+                or path_parts[2:] != ["pull", str(record["scope"]["pull_request"])]
+                or parsed_url.fragment != f"discussion_r{child['id']}"
+            ):
                 return self._result("malformed", None, semantic)
             targets.append(child)
         unresolved = 0
@@ -589,7 +834,7 @@ class _ReferenceClassifier:
                 or join["parent_review_id"] != record["id"]
                 or not self._is_positive_int(join["child_comment_id"])
                 or join["child_comment_id"] != child["id"]
-                or join["url"] != child["url"]
+                or not _same_github_url(join["url"], child["url"])
             ):
                 return self._result("malformed", None, semantic)
             child_join = (join["parent_review_id"], join["child_comment_id"])
@@ -639,39 +884,51 @@ class _ReportValidator:
         self.scope_rules = self.schema["scope_rules"]
         self.rules = self.schema["basis_rules"]
         self.finding_rules = self.schema["unresolved_provider_findings_rules"]
-        self.parent_selection_outcome = copy.deepcopy(parent_selection_outcome)
-        self.direct_positive_parent_scope = copy.deepcopy(direct_positive_parent_scope)
-        self.terminal_clean_parent_identity = copy.deepcopy(
+        self.parent_selection_outcome = _bounded_parent_copy(parent_selection_outcome)
+        self.direct_positive_parent_scope = _bounded_parent_copy(
+            direct_positive_parent_scope
+        )
+        self.terminal_clean_parent_identity = _bounded_parent_copy(
             terminal_clean_parent_identity
         )
-        self.reaction_clean_parent_epoch = copy.deepcopy(reaction_clean_parent_epoch)
-        self.merge_status_parent_scope = copy.deepcopy(merge_status_parent_scope)
-        self.merge_status_parent_contract = copy.deepcopy(merge_status_parent_contract)
-        self.resolved_inline_parent_snapshot = copy.deepcopy(
+        self.reaction_clean_parent_epoch = _bounded_parent_copy(
+            reaction_clean_parent_epoch
+        )
+        self.merge_status_parent_scope = _bounded_parent_copy(merge_status_parent_scope)
+        self.merge_status_parent_contract = _bounded_parent_copy(
+            merge_status_parent_contract
+        )
+        self.resolved_inline_parent_snapshot = _bounded_parent_copy(
             resolved_inline_parent_snapshot
         )
-        self.complete_pr_parent_snapshot = copy.deepcopy(complete_pr_parent_snapshot)
-        self.finding_carrier_parent_snapshot = copy.deepcopy(
+        self.complete_pr_parent_snapshot = _bounded_parent_copy(
+            complete_pr_parent_snapshot
+        )
+        self.finding_carrier_parent_snapshot = _bounded_parent_copy(
             finding_carrier_parent_snapshot
         )
-        self.finding_range_parent_receipt = copy.deepcopy(finding_range_parent_receipt)
-        self.finding_page_parent_receipt = copy.deepcopy(finding_page_parent_receipt)
-        self.merge_status_contract_trust_anchor = copy.deepcopy(
+        self.finding_range_parent_receipt = _bounded_parent_copy(
+            finding_range_parent_receipt
+        )
+        self.finding_page_parent_receipt = _bounded_parent_copy(
+            finding_page_parent_receipt
+        )
+        self.merge_status_contract_trust_anchor = _bounded_parent_copy(
             merge_status_contract_trust_anchor
         )
-        self.merge_status_candidate_range_exclusion_receipt = copy.deepcopy(
+        self.merge_status_candidate_range_exclusion_receipt = _bounded_parent_copy(
             merge_status_candidate_range_exclusion_receipt
         )
-        self.merge_status_producer_implementation_receipt = copy.deepcopy(
+        self.merge_status_producer_implementation_receipt = _bounded_parent_copy(
             merge_status_producer_implementation_receipt
         )
-        self.merge_status_dependency_resolver_anchor = copy.deepcopy(
+        self.merge_status_dependency_resolver_anchor = _bounded_parent_copy(
             merge_status_dependency_resolver_anchor
         )
-        self.merge_status_dependency_resolution_receipt = copy.deepcopy(
+        self.merge_status_dependency_resolution_receipt = _bounded_parent_copy(
             merge_status_dependency_resolution_receipt
         )
-        self.merge_status_installed_release_provenance = copy.deepcopy(
+        self.merge_status_installed_release_provenance = _bounded_parent_copy(
             merge_status_installed_release_provenance
         )
         self.provider_identity = copy.deepcopy(grammar["provider_identity"])
@@ -687,11 +944,19 @@ class _ReportValidator:
 
     @staticmethod
     def _positive_int(value: object) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 < value <= MAX_SAFE_INTEGER
+        )
 
     @staticmethod
     def _nonnegative_int(value: object) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= MAX_SAFE_INTEGER
+        )
 
     @staticmethod
     def _full_sha(value: object) -> bool:
@@ -721,12 +986,16 @@ class _ReportValidator:
         except (TypeError, ValueError):
             return False
         request_id = evidence["request_id"]
+        strict_url = _strict_github_url_parts(evidence["url"])
+        if strict_url is None:
+            return False
+        parsed_url, _, _ = strict_url
+        path_parts = parsed_url.path.removeprefix("/").split("/")
         return (
             self._positive_int(evidence["id"])
-            and isinstance(evidence["url"], str)
-            and evidence["url"].startswith(
-                f"https://github.com/{report['repository']}/"
-            )
+            and parsed_url.scheme == "https"
+            and parsed_url.netloc == "github.com"
+            and _repository_path_parts_match(path_parts, report["repository"])
             and (request_id is None or self._positive_int(request_id))
         )
 
@@ -736,10 +1005,8 @@ class _ReportValidator:
         if (
             not self._closed_parent_input(selection, "selection_outcome")
             or selection["owner"] != rules["owner"]
-            or not isinstance(selection["repository"], str)
-            or selection["repository"].count("/") != 1
-            or not all(selection["repository"].split("/"))
-            or report["repository"] != selection["repository"]
+            or _repository_identity(selection["repository"]) is None
+            or not _same_repository(report["repository"], selection["repository"])
             or report["pull_request"] != selection["pull_request"]
             or report["head_sha"] != selection["head_sha"]
         ):
@@ -789,7 +1056,7 @@ class _ReportValidator:
         parent_scope = self.direct_positive_parent_scope
         return (
             self._selected_pr_scope_value(parent_scope)
-            and report["repository"] == parent_scope["repository"]
+            and _same_repository(report["repository"], parent_scope["repository"])
             and report["pull_request"] == parent_scope["pull_request"]
             and report["head_sha"] == parent_scope["head_sha"]
         )
@@ -797,9 +1064,7 @@ class _ReportValidator:
     def _selected_pr_scope_value(self, scope: object) -> bool:
         return (
             self._closed_parent_input(scope, "selected_pr_scope")
-            and isinstance(scope["repository"], str)
-            and scope["repository"].count("/") == 1
-            and all(scope["repository"].split("/"))
+            and _repository_identity(scope["repository"]) is not None
             and self._positive_int(scope["pull_request"])
             and self._full_sha(scope["head_sha"])
         )
@@ -864,10 +1129,10 @@ class _ReportValidator:
             return (
                 self._type_preserving_equal(reaction, expected_reaction)
                 and reaction["reaction_id"] == evidence["id"]
-                and reaction["reaction_url"] == evidence["url"]
+                and _same_github_url(reaction["reaction_url"], evidence["url"])
                 and reaction["reaction_server_time"] == evidence["server_time"]
                 and reaction["request_id"] == evidence["request_id"]
-                and reaction["request_url"] == evidence["url"]
+                and _same_github_url(reaction["request_url"], evidence["url"])
             )
 
         merge_status = selection["merge_status"]
@@ -925,7 +1190,7 @@ class _ReportValidator:
         return (
             self._type_preserving_equal(merge_status, expected_merge_status)
             and merge_status["id"] == parent_contract["check_run_id"]
-            and merge_status["url"] == parent_contract["check_run_url"]
+            and _same_github_url(merge_status["url"], parent_contract["check_run_url"])
             and merge_status["check_name"] == parent_contract["check_name"]
             and merge_status["app"]["id"] == parent_contract["app_id"]
             and merge_status["app"]["slug"] == parent_contract["app_slug"]
@@ -1176,11 +1441,11 @@ class _ReportValidator:
             and epoch["request_kind"] == "issue-comment"
             and self._positive_int(epoch["request_id"])
             and epoch["request_id"] == evidence["request_id"]
-            and epoch["request_url"] == evidence["url"]
+            and _same_github_url(epoch["request_url"], evidence["url"])
             and epoch["request_command"] == "@codex review"
             and self._positive_int(epoch["reaction_id"])
             and epoch["reaction_id"] == evidence["id"]
-            and epoch["reaction_url"] == evidence["url"]
+            and _same_github_url(epoch["reaction_url"], evidence["url"])
             and epoch["reaction_content"] == "+1"
             and epoch["reaction_actor_login"] == self.provider_identity["login"]
             and epoch["reaction_actor_type"] == self.provider_identity["type"]
@@ -1206,7 +1471,7 @@ class _ReportValidator:
         return (
             snapshot["owner"] == "parent-orchestrator"
             and snapshot["status"] == "complete"
-            and snapshot["repository"] == report["repository"]
+            and _same_repository(snapshot["repository"], report["repository"])
             and self._positive_int(snapshot["pull_request"])
             and snapshot["pull_request"] == report["pull_request"]
             and snapshot["head_sha"] == report["head_sha"]
@@ -1215,7 +1480,7 @@ class _ReportValidator:
             and snapshot["evidence_kind"] == evidence["kind"]
             and self._positive_int(snapshot["evidence_id"])
             and snapshot["evidence_id"] == evidence["id"]
-            and snapshot["evidence_url"] == evidence["url"]
+            and _same_github_url(snapshot["evidence_url"], evidence["url"])
             and snapshot["evidence_channel"] == evidence["channel"]
             and snapshot["artifact_commit"] == evidence["artifact_commit"]
             and snapshot["artifact_commit"] == report["head_sha"]
@@ -1234,22 +1499,147 @@ class _ReportValidator:
 
     @staticmethod
     def _safe_contract_path(value: object) -> bool:
-        if not isinstance(value, str) or not value or "\\" in value:
+        if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
             return False
         path = pathlib.PurePosixPath(value)
         return (
             not path.is_absolute()
+            and bool(path.parts)
             and path.as_posix() == value
             and all(part not in {"", ".", ".."} for part in path.parts)
         )
 
     @staticmethod
-    def _repository(value: object) -> bool:
-        return (
-            isinstance(value, str)
-            and len(value.split("/")) == 2
-            and all(value.split("/"))
+    def _github_workflow_path(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        path = pathlib.PurePosixPath(value)
+        return path.parent == pathlib.PurePosixPath(
+            ".github/workflows"
+        ) and path.suffix in {".yml", ".yaml"}
+
+    @staticmethod
+    def _action_manifest_directory(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if value in {"action.yml", "action.yaml"}:
+            return ""
+        path = pathlib.PurePosixPath(value)
+        if path.name not in {"action.yml", "action.yaml"}:
+            return None
+        return path.parent.as_posix()
+
+    @staticmethod
+    def _merge_status_reference_runtime_bound(
+        source_entry: dict[str, object],
+        reference: str,
+        target_entry: dict[str, object],
+    ) -> bool:
+        same_running_commit = (
+            _same_repository(source_entry["repository"], target_entry["repository"])
+            and source_entry["commit"] == target_entry["commit"]
         )
+        if reference.startswith("./"):
+            return (
+                source_entry["kind"] in {"workflow", "reusable-workflow"}
+                and target_entry["kind"] == "reusable-workflow"
+                and same_running_commit
+                and reference == f"./{target_entry['path']}"
+                and _ReportValidator._github_workflow_path(target_entry["path"])
+            )
+        if reference.startswith("../"):
+            return False
+        if reference.startswith("$/"):
+            relative_path = reference[2:]
+            if (
+                source_entry["kind"] in {"workflow", "reusable-workflow"}
+                and target_entry["kind"] == "reusable-workflow"
+            ):
+                return (
+                    same_running_commit
+                    and relative_path == target_entry["path"]
+                    and _ReportValidator._github_workflow_path(target_entry["path"])
+                )
+            if (
+                source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+                and target_entry["kind"] == "action"
+                and same_running_commit
+            ):
+                manifest_directory = _ReportValidator._action_manifest_directory(
+                    target_entry["path"]
+                )
+                return (
+                    manifest_directory is not None
+                    and relative_path == manifest_directory
+                )
+            return False
+        repository = target_entry["repository"]
+        path = target_entry["path"]
+        commit = target_entry["commit"]
+        kind = target_entry["kind"]
+        if (
+            kind == "reusable-workflow"
+            and source_entry["kind"] in {"workflow", "reusable-workflow"}
+            and _ReportValidator._github_workflow_path(path)
+        ):
+            selector_suffix = f"/{path}@{commit}"
+        elif (
+            kind == "action"
+            and source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+            and _ReportValidator._action_manifest_directory(path) not in {None, ""}
+        ):
+            selector_suffix = (
+                f"/{_ReportValidator._action_manifest_directory(path)}@{commit}"
+            )
+        elif (
+            kind == "action"
+            and source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+            and path in {"action.yml", "action.yaml"}
+        ):
+            selector_suffix = f"@{commit}"
+        else:
+            return False
+        return _repository_selector_matches(reference, repository, selector_suffix)
+
+    @staticmethod
+    def _merge_status_job_edge_matches(
+        edge: dict[str, object],
+        job_raw_ref: str,
+        job_entry: dict[str, object],
+    ) -> bool:
+        def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
+            return (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+
+        if entry_key(edge["target_entry"]) != entry_key(job_entry):
+            return False
+        if (
+            edge["source_entry"]["kind"] not in {"workflow", "reusable-workflow"}
+            or job_entry["kind"] != "reusable-workflow"
+        ):
+            return False
+        reference = edge["reference"]
+        if reference.startswith(("./", "$/")):
+            return (
+                _same_repository(
+                    edge["source_entry"]["repository"], job_entry["repository"]
+                )
+                and edge["source_entry"]["commit"] == job_entry["commit"]
+                and job_entry["kind"] == "reusable-workflow"
+            )
+        suffix = f"/{job_entry['path']}@{job_entry['commit']}"
+        return _repository_selector_matches(
+            reference, job_entry["repository"], suffix
+        ) and _repository_selector_matches(job_raw_ref, job_entry["repository"], suffix)
+
+    @staticmethod
+    def _repository(value: object) -> bool:
+        return _repository_identity(value) is not None
 
     def _merge_status_evidence(
         self, report: dict[str, object], evidence: object
@@ -1261,7 +1651,7 @@ class _ReportValidator:
             or not self._closed_parent_input(
                 parent_contract, "merge_status_parent_contract"
             )
-            or report["repository"] != parent_scope["repository"]
+            or not _same_repository(report["repository"], parent_scope["repository"])
             or report["pull_request"] != parent_scope["pull_request"]
             or report["head_sha"] != parent_scope["feature_head_sha"]
             or parent_contract["owner"] != "parent-orchestrator"
@@ -1304,19 +1694,22 @@ class _ReportValidator:
             )
             or evidence["server_time_field"] != "completed_at"
             or evidence["id"] != parent_contract["check_run_id"]
-            or evidence["url"] != parent_contract["check_run_url"]
+            or not _same_github_url(evidence["url"], parent_contract["check_run_url"])
         ):
             return False
 
-        parsed_url = urllib.parse.urlsplit(evidence["url"])
-        repository_parts = report["repository"].split("/")
+        strict_url = _strict_github_url_parts(evidence["url"])
+        if strict_url is None:
+            return False
+        parsed_url, _, _ = strict_url
+        path_parts = parsed_url.path.removeprefix("/").split("/")
         if (
             parsed_url.scheme != "https"
             or parsed_url.netloc != "github.com"
             or parsed_url.query
             or parsed_url.fragment
-            or parsed_url.path.removeprefix("/").split("/")
-            != [*repository_parts, "runs", str(evidence["id"])]
+            or not _repository_path_parts_match(path_parts, report["repository"])
+            or path_parts[2:] != ["runs", str(evidence["id"])]
         ):
             return False
 
@@ -1361,9 +1754,7 @@ class _ReportValidator:
             return False
         source_repository = contract["source_repository"]
         if (
-            not isinstance(source_repository, str)
-            or source_repository.count("/") != 1
-            or any(not part for part in source_repository.split("/"))
+            _repository_identity(source_repository) is None
             or not self._full_sha(contract["source_commit"])
             or not self._safe_contract_path(contract["source_path"])
             or not isinstance(contract["source_sha256"], str)
@@ -1428,12 +1819,12 @@ class _ReportValidator:
             association["kind"] != "parent-verified-repository-contract"
             or association["owner"] != "parent-orchestrator"
             or association["status"] != "complete"
-            or association["repository"] != report["repository"]
+            or not _same_repository(association["repository"], report["repository"])
             or association["pull_request"] != report["pull_request"]
             or association["feature_head_sha"] != report["head_sha"]
             or evidence["check_subject_sha"] != association["check_subject_sha"]
             or association["check_run_id"] != evidence["id"]
-            or association["check_run_url"] != evidence["url"]
+            or not _same_github_url(association["check_run_url"], evidence["url"])
             or association["check_name"] != check_name
             or association["app_id"] != app["id"]
             or association["app_slug"] != app["slug"]
@@ -1448,7 +1839,9 @@ class _ReportValidator:
                 )
             )
             or association["check_run_id"] != parent_contract["check_run_id"]
-            or association["check_run_url"] != parent_contract["check_run_url"]
+            or not _same_github_url(
+                association["check_run_url"], parent_contract["check_run_url"]
+            )
             or association["check_name"] != parent_contract["check_name"]
             or association["app_id"] != parent_contract["app_id"]
             or association["app_slug"] != parent_contract["app_slug"]
@@ -1521,6 +1914,7 @@ class _ReportValidator:
         candidate_commits = exclusion_receipt["candidate_commits"]
         if (
             not self._closed(descriptor, "merge_status_contract")
+            or _repository_identity(descriptor["source_repository"]) is None
             or not isinstance(source["identity"], str)
             or source["identity"]
             != (
@@ -1530,7 +1924,9 @@ class _ReportValidator:
             or source["sha256"] != descriptor["source_sha256"]
             or not isinstance(source["sha256"], str)
             or SHA256.fullmatch(source["sha256"]) is None
-            or exclusion_receipt["repository"] != report["repository"]
+            or not _same_repository(
+                exclusion_receipt["repository"], report["repository"]
+            )
             or exclusion_receipt["base_sha"] != parent_scope["merge_base_sha"]
             or exclusion_receipt["head_sha"] != report["head_sha"]
             or not self._type_preserving_equal(exclusion_receipt["source"], descriptor)
@@ -1547,7 +1943,7 @@ class _ReportValidator:
             or exclusion_receipt["candidate_commits_sha256"]
             != _commit_set_sha256(candidate_commits)
             or (
-                descriptor["source_repository"] == report["repository"]
+                _same_repository(descriptor["source_repository"], report["repository"])
                 and descriptor["source_commit"] in candidate_commits
             )
         ):
@@ -1556,13 +1952,15 @@ class _ReportValidator:
         source_kind = source["kind"]
         if source_kind == "target-branch-baseline":
             return (
-                descriptor["source_repository"] == report["repository"]
+                _same_repository(descriptor["source_repository"], report["repository"])
                 and descriptor["source_commit"] == parent_scope["base_tip_sha"]
             )
         if source_kind == "installed-trusted-release":
             return True
         if source_kind == "parent-fixed-external":
-            return descriptor["source_repository"] != report["repository"]
+            return not _same_repository(
+                descriptor["source_repository"], report["repository"]
+            )
         return False
 
     def _merge_status_producer_implementation_matches(
@@ -1579,7 +1977,7 @@ class _ReportValidator:
             or receipt["status"] != "complete"
             or receipt["profile"]
             != "github-codex-merge-status-producer-implementation-v1"
-            or receipt["repository"] != report["repository"]
+            or not _same_repository(receipt["repository"], report["repository"])
             or receipt["feature_head_sha"] != report["head_sha"]
             or not isinstance(receipt["run_ref"], str)
             or not receipt["run_ref"].startswith("refs/")
@@ -1605,7 +2003,7 @@ class _ReportValidator:
 
         def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
             return (
-                entry["repository"],
+                _repository_identity(entry["repository"]),
                 entry["commit"],
                 entry["path"],
                 entry["kind"],
@@ -1621,6 +2019,14 @@ class _ReportValidator:
             or SHA256.fullmatch(entry["blob_sha256"]) is None
             or entry["kind"]
             not in {"workflow", "reusable-workflow", "action", "script"}
+            or (
+                entry["kind"] in {"workflow", "reusable-workflow"}
+                and not self._github_workflow_path(entry["path"])
+            )
+            or (
+                entry["kind"] == "action"
+                and self._action_manifest_directory(entry["path"]) is None
+            )
             for entry in entries
         ):
             return False
@@ -1637,24 +2043,51 @@ class _ReportValidator:
                     entry, entry_by_key.get(entry_key(entry))
                 )
                 and identity["entry_sha256"] == _canonical_json_sha256(entry)
-                and identity["repository"] == entry["repository"]
+                and _same_repository(identity["repository"], entry["repository"])
                 and identity["path"] == entry["path"]
                 and identity["resolved_commit"] == entry["commit"]
                 and isinstance(identity["ref"], str)
-                and raw
-                == f"{identity['repository']}/{identity['path']}@{identity['ref']}"
+                and _repository_selector_matches(
+                    raw,
+                    identity["repository"],
+                    f"/{identity['path']}@{identity['ref']}",
+                )
             )
 
         entry_by_key = {entry_key(entry): entry for entry in entries}
         keys = [entry_key(entry) for entry in entries]
-        if keys != sorted(keys) or len(keys) != len(set(keys)):
+        path_keys = [
+            (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                entry["path"],
+            )
+            for entry in entries
+        ]
+        action_selector_keys = [
+            (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                self._action_manifest_directory(entry["path"]),
+            )
+            for entry in entries
+            if entry["kind"] == "action"
+        ]
+        if (
+            keys != sorted(keys)
+            or len(keys) != len(set(keys))
+            or len(path_keys) != len(set(path_keys))
+            or len(action_selector_keys) != len(set(action_selector_keys))
+        ):
             return False
         root_workflow_entries = (
             [
                 entry
                 for entry in entries
                 if entry["kind"] == "workflow"
-                and entry["repository"] == receipt["workflow_repository"]
+                and _same_repository(
+                    entry["repository"], receipt["workflow_repository"]
+                )
                 and entry["commit"] == receipt["workflow_sha"]
                 and entry["path"] == receipt["workflow_path"]
             ]
@@ -1663,7 +2096,7 @@ class _ReportValidator:
         )
         candidate_commits = exclusion["candidate_commits"]
         if any(
-            entry["repository"] == report["repository"]
+            _same_repository(entry["repository"], report["repository"])
             and entry["commit"] in candidate_commits
             for entry in entries
         ):
@@ -1674,8 +2107,12 @@ class _ReportValidator:
                 receipt["attestation_source"] == "github-actions-api"
                 and parent_contract["app_slug"] == "github-actions"
                 and self._repository(receipt["workflow_repository"])
-                and receipt["workflow_repository"] == receipt["repository"]
-                and receipt["workflow_repository"] == report["repository"]
+                and _same_repository(
+                    receipt["workflow_repository"], receipt["repository"]
+                )
+                and _same_repository(
+                    receipt["workflow_repository"], report["repository"]
+                )
                 and self._safe_contract_path(receipt["workflow_path"])
                 and self._full_sha(receipt["workflow_sha"])
                 and ref_identity_matches(
@@ -1684,8 +2121,10 @@ class _ReportValidator:
                 and ref_identity_matches(
                     receipt["job_workflow_ref"], receipt["job_workflow_ref_identity"]
                 )
-                and receipt["workflow_ref_identity"]["repository"]
-                == receipt["workflow_repository"]
+                and _same_repository(
+                    receipt["workflow_ref_identity"]["repository"],
+                    receipt["workflow_repository"],
+                )
                 and receipt["workflow_ref_identity"]["path"] == receipt["workflow_path"]
                 and receipt["workflow_ref_identity"]["resolved_commit"]
                 == receipt["workflow_sha"]
@@ -1697,32 +2136,28 @@ class _ReportValidator:
                     root_workflow_entries[0],
                 )
                 and (
-                    receipt["job_workflow_ref_identity"]["repository"]
-                    == report["repository"]
-                    or receipt["job_workflow_ref_identity"]["entry"]["kind"]
-                    == "reusable-workflow"
+                    self._type_preserving_equal(
+                        receipt["job_workflow_ref_identity"],
+                        receipt["workflow_ref_identity"],
+                    )
+                    or (
+                        not self._type_preserving_equal(
+                            receipt["job_workflow_ref_identity"]["entry"],
+                            receipt["workflow_ref_identity"]["entry"],
+                        )
+                        and (
+                            receipt["job_workflow_ref_identity"]["entry"]["kind"]
+                            == "reusable-workflow"
+                        )
+                    )
                 )
                 and receipt["external_implementation_id"] is None
             )
         if receipt["provider_kind"] == "external-app":
-            return (
-                receipt["attestation_source"] == "provider-authenticated-api"
-                and parent_contract["app_slug"] != "github-actions"
-                and all(
-                    receipt[field] is None
-                    for field in (
-                        "workflow_repository",
-                        "workflow_path",
-                        "workflow_sha",
-                        "workflow_ref",
-                        "workflow_ref_identity",
-                        "job_workflow_ref",
-                        "job_workflow_ref_identity",
-                    )
-                )
-                and isinstance(receipt["external_implementation_id"], str)
-                and bool(receipt["external_implementation_id"].strip())
-            )
+            # Version 1 has no provider-authenticated ID-to-root/closure
+            # binding profile. A self-digested opaque implementation ID cannot
+            # make an otherwise unrelated closure authoritative.
+            return False
         return False
 
     def _merge_status_dependency_resolution_matches(
@@ -1734,6 +2169,8 @@ class _ReportValidator:
         parent_scope = self.merge_status_parent_scope
         installed = self.merge_status_installed_release_provenance
         receipt = self.merge_status_dependency_resolution_receipt
+        if implementation.get("provider_kind") != "github-actions":
+            return False
         if (
             not self._closed_parent_input(
                 anchor, "merge_status_dependency_resolver_anchor"
@@ -1747,8 +2184,7 @@ class _ReportValidator:
                 "installed-trusted-release",
                 "parent-fixed-external",
             }
-            or not isinstance(anchor["repository"], str)
-            or anchor["repository"].count("/") != 1
+            or _repository_identity(anchor["repository"]) is None
             or not self._full_sha(anchor["commit"])
             or not self._safe_contract_path(anchor["path"])
             or not isinstance(anchor["sha256"], str)
@@ -1756,7 +2192,7 @@ class _ReportValidator:
             or anchor["candidate_range_exclusion_sha256"]
             != exclusion["candidate_commits_sha256"]
             or (
-                anchor["repository"] == report["repository"]
+                _same_repository(anchor["repository"], report["repository"])
                 and anchor["commit"] in exclusion["candidate_commits"]
             )
             or anchor["receipt_sha256"] != _receipt_sha256(anchor)
@@ -1774,13 +2210,12 @@ class _ReportValidator:
         ):
             return False
         if anchor["kind"] == "target-branch-baseline" and not (
-            anchor["repository"] == report["repository"]
+            _same_repository(anchor["repository"], report["repository"])
             and anchor["commit"] == parent_scope["base_tip_sha"]
         ):
             return False
-        if (
-            anchor["kind"] == "parent-fixed-external"
-            and anchor["repository"] == report["repository"]
+        if anchor["kind"] == "parent-fixed-external" and _same_repository(
+            anchor["repository"], report["repository"]
         ):
             return False
         if anchor["kind"] == "installed-trusted-release":
@@ -1792,7 +2227,7 @@ class _ReportValidator:
                 or installed["status"] != "complete"
                 or installed["profile"]
                 != "github-codex-installed-resolver-release-provenance-v1"
-                or installed["repository"] != anchor["repository"]
+                or not _same_repository(installed["repository"], anchor["repository"])
                 or installed["commit"] != anchor["commit"]
                 or not isinstance(installed["manifest_identity"], str)
                 or not installed["manifest_identity"]
@@ -1810,7 +2245,7 @@ class _ReportValidator:
 
         def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
             return (
-                entry["repository"],
+                _repository_identity(entry["repository"]),
                 entry["commit"],
                 entry["path"],
                 entry["kind"],
@@ -1859,6 +2294,7 @@ class _ReportValidator:
             ):
                 return False
             reference_keys: list[tuple[object, ...]] = []
+            selector_identities: list[tuple[object, ...]] = []
             for reference in references:
                 if not self._closed_parent_input(
                     reference, "merge_status_dependency_reference"
@@ -1875,9 +2311,15 @@ class _ReportValidator:
                     or not self._type_preserving_equal(
                         target, entry_by_key[entry_key(target)]
                     )
+                    or not self._merge_status_reference_runtime_bound(
+                        source, reference["reference"], target
+                    )
                 ):
                     return False
                 reference_keys.append((reference["reference"], *entry_key(target)))
+                selector_identities.append(
+                    _repository_selector_identity(reference["reference"], target)
+                )
                 derived_edges.append(
                     {
                         "source_entry": copy.deepcopy(source),
@@ -1885,8 +2327,10 @@ class _ReportValidator:
                         "target_entry": copy.deepcopy(target),
                     }
                 )
-            if reference_keys != sorted(reference_keys) or len(reference_keys) != len(
-                set(reference_keys)
+            if (
+                reference_keys != sorted(reference_keys)
+                or len(reference_keys) != len(set(reference_keys))
+                or len(selector_identities) != len(set(selector_identities))
             ):
                 return False
             record_keys.append(entry_key(source))
@@ -1897,9 +2341,41 @@ class _ReportValidator:
                 *entry_key(edge["target_entry"]),
             )
         )
+        root_entry = implementation["workflow_ref_identity"]["entry"]
+        if entry_key(root_entry) not in entry_by_key:
+            return False
+        root_key = entry_key(root_entry)
+        reachable = {root_key}
+        while True:
+            expanded = reachable | {
+                entry_key(edge["target_entry"])
+                for edge in derived_edges
+                if entry_key(edge["source_entry"]) in reachable
+            }
+            if expanded == reachable:
+                break
+            reachable = expanded
+        job_entry = implementation["job_workflow_ref_identity"]["entry"]
+        job_is_root = entry_key(job_entry) == root_key
+        job_inbound_edges = [
+            edge for edge in derived_edges if edge["target_entry"] == job_entry
+        ]
         return (
             record_keys == sorted(entry_by_key)
             and len(record_keys) == len(set(record_keys))
+            and reachable == set(entry_by_key)
+            and (
+                (job_is_root and not job_inbound_edges)
+                or (
+                    not job_is_root
+                    and len(job_inbound_edges) == 1
+                    and self._merge_status_job_edge_matches(
+                        job_inbound_edges[0],
+                        implementation["job_workflow_ref"],
+                        job_entry,
+                    )
+                )
+            )
             and all(
                 self._closed_parent_input(edge, "merge_status_dependency_edge")
                 for edge in edges
@@ -1911,8 +2387,11 @@ class _ReportValidator:
     def _clean_evidence_url_matches_scope(
         report: dict[str, object], evidence: dict[str, object]
     ) -> bool:
-        parsed = urllib.parse.urlsplit(evidence["url"])
-        repository_parts = report["repository"].split("/")
+        strict_url = _strict_github_url_parts(evidence["url"])
+        if strict_url is None:
+            return False
+        parsed, _, _ = strict_url
+        path_parts = parsed.path.removeprefix("/").split("/")
         fragment_prefix = {
             "issue-comment": "issuecomment-",
             "review": "pullrequestreview-",
@@ -1922,8 +2401,8 @@ class _ReportValidator:
             and parsed.scheme == "https"
             and parsed.netloc == "github.com"
             and not parsed.query
-            and parsed.path.removeprefix("/").split("/")
-            == [*repository_parts, "pull", str(report["pull_request"])]
+            and _repository_path_parts_match(path_parts, report["repository"])
+            and path_parts[2:] == ["pull", str(report["pull_request"])]
             and parsed.fragment == f"{fragment_prefix}{evidence['id']}"
         )
 
@@ -1931,14 +2410,17 @@ class _ReportValidator:
     def _reaction_evidence_url_matches_scope(
         report: dict[str, object], evidence: dict[str, object]
     ) -> bool:
-        parsed = urllib.parse.urlsplit(evidence["url"])
-        repository_parts = report["repository"].split("/")
+        strict_url = _strict_github_url_parts(evidence["url"])
+        if strict_url is None:
+            return False
+        parsed, _, _ = strict_url
+        path_parts = parsed.path.removeprefix("/").split("/")
         return (
             parsed.scheme == "https"
             and parsed.netloc == "github.com"
             and not parsed.query
-            and parsed.path.removeprefix("/").split("/")
-            == [*repository_parts, "pull", str(report["pull_request"])]
+            and _repository_path_parts_match(path_parts, report["repository"])
+            and path_parts[2:] == ["pull", str(report["pull_request"])]
             and parsed.fragment == f"issuecomment-{evidence['request_id']}"
         )
 
@@ -1949,14 +2431,14 @@ class _ReportValidator:
         finding: dict[str, object],
     ) -> bool:
         url = finding["url"]
-        if not isinstance(url, str):
+        strict_url = _strict_github_url_parts(url)
+        if strict_url is None:
             return False
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.query:
+        parsed, _, _ = strict_url
+        if parsed.query:
             return False
-        repository_parts = report["repository"].split("/")
         path_parts = parsed.path.removeprefix("/").split("/")
-        if path_parts[:2] != repository_parts:
+        if not _repository_path_parts_match(path_parts, report["repository"]):
             return False
         branch = finding["grammar_branch"]
         if branch == "top-level-finding-v1":
@@ -1965,19 +2447,13 @@ class _ReportValidator:
                 "review": "pullrequestreview-",
             }.get(evidence["channel"])
             return (
-                url == evidence["url"]
-                and path_parts
-                == [*repository_parts, "pull", str(report["pull_request"])]
+                _same_github_url(url, evidence["url"])
+                and path_parts[2:] == ["pull", str(report["pull_request"])]
                 and parsed.fragment == f"{fragment_prefix}{finding['id']}"
             )
         return (
             branch == "inline-parent-v1"
-            and path_parts
-            == [
-                *repository_parts,
-                "pull",
-                str(report["pull_request"]),
-            ]
+            and path_parts[2:] == ["pull", str(report["pull_request"])]
             and parsed.fragment == f"discussion_r{finding['id']}"
         )
 
@@ -2042,7 +2518,10 @@ class _ReportValidator:
             matched = FINDING.fullmatch(line)
             if matched is None:
                 return None
-            parsed = urllib.parse.urlsplit(matched.group(2))
+            strict_url = _strict_github_url_parts(matched.group(2))
+            if strict_url is None:
+                return None
+            parsed, _, _ = strict_url
             path = parsed.path.removeprefix("/").split("/")
             if len(path) < 4 or path[2] != "blob":
                 return None
@@ -2257,7 +2736,7 @@ class _ReportValidator:
             or receipt["history_mode"] != "full-dag"
             or receipt["base_is_unique_merge_base"] is not True
             or receipt["base_is_ancestor_of_head"] is not True
-            or receipt["repository"] != report["repository"]
+            or not _same_repository(receipt["repository"], report["repository"])
             or receipt["pull_request"] != report["pull_request"]
             or receipt["head_sha"] != report["head_sha"]
             or not self._positive_int(receipt["pull_request"])
@@ -2613,7 +3092,7 @@ class _ReportValidator:
             return resolution is None and commit_ref == expected_scope["head_sha"]
         return (
             isinstance(resolution, dict)
-            and resolution["repository"] == expected_scope["repository"]
+            and _same_repository(resolution["repository"], expected_scope["repository"])
             and resolution["commit_ref"] == commit_ref
             and resolution["initial_resolved_commit"] == expected_scope["head_sha"]
             and resolution["final_resolved_commit"] == expected_scope["head_sha"]
@@ -2683,12 +3162,41 @@ class _ReportValidator:
         )
 
     def validate(self, report: object) -> bool:
+        try:
+            return self._validate(report)
+        except VALIDATION_EXCEPTIONS:
+            return False
+
+    def _validate(self, report: object) -> bool:
+        try:
+            for value in (
+                report,
+                self.parent_selection_outcome,
+                self.direct_positive_parent_scope,
+                self.terminal_clean_parent_identity,
+                self.reaction_clean_parent_epoch,
+                self.merge_status_parent_scope,
+                self.merge_status_parent_contract,
+                self.resolved_inline_parent_snapshot,
+                self.complete_pr_parent_snapshot,
+                self.finding_carrier_parent_snapshot,
+                self.finding_range_parent_receipt,
+                self.finding_page_parent_receipt,
+                self.merge_status_contract_trust_anchor,
+                self.merge_status_candidate_range_exclusion_receipt,
+                self.merge_status_producer_implementation_receipt,
+                self.merge_status_dependency_resolver_anchor,
+                self.merge_status_dependency_resolution_receipt,
+                self.merge_status_installed_release_provenance,
+            ):
+                _require_rfc8785_integer_domain(value)
+        except ValueError:
+            return False
         if not self._closed(report, "report"):
             return False
         if (
             report["status"] not in self.schema["status_values"]
-            or not isinstance(report["repository"], str)
-            or report["repository"].count("/") != 1
+            or _repository_identity(report["repository"]) is None
             or not isinstance(report["unresolved_provider_findings"], list)
             or not isinstance(report["last_reason"], str)
             or not report["last_reason"]
@@ -3184,13 +3692,6 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     "blob_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
                     "kind": "action",
                 },
-                {
-                    "repository": "octo/review-gate",
-                    "commit": "2222222222222222222222222222222222222222",
-                    "path": "scripts/verify.sh",
-                    "blob_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
-                    "kind": "script",
-                },
             ],
             key=lambda entry: (
                 entry["repository"],
@@ -3229,12 +3730,12 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "entry_sha256": _canonical_json_sha256(implementation_closure[0]),
             },
             "job_workflow_ref": (
-                "octo/review-gate/.github/workflows/reusable-review.yml@refs/heads/feature/review"
+                "octo/review-gate/.github/workflows/reusable-review.yml@" + "2" * 40
             ),
             "job_workflow_ref_identity": {
                 "repository": "octo/review-gate",
                 "path": ".github/workflows/reusable-review.yml",
-                "ref": "refs/heads/feature/review",
+                "ref": "2" * 40,
                 "resolved_commit": "2" * 40,
                 "entry": copy.deepcopy(implementation_closure[1]),
                 "entry_sha256": _canonical_json_sha256(implementation_closure[1]),
@@ -3271,7 +3772,6 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         workflow_entry = implementation_closure[0]
         reusable_entry = implementation_closure[1]
         transitive_action_entry = implementation_closure[2]
-        transitive_script_entry = implementation_closure[3]
         resolution_records = [
             {
                 "source_entry": copy.deepcopy(workflow_entry),
@@ -3281,7 +3781,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     {
                         "reference": (
                             "octo/review-gate/.github/workflows/reusable-review.yml"
-                            "@refs/heads/feature/review"
+                            "@" + "2" * 40
                         ),
                         "target_entry": copy.deepcopy(reusable_entry),
                     }
@@ -3295,7 +3795,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "source_sha256": reusable_entry["blob_sha256"],
                 "discovered_references": [
                     {
-                        "reference": "./actions/verify",
+                        "reference": ("octo/review-gate/actions/verify@" + "2" * 40),
                         "target_entry": copy.deepcopy(transitive_action_entry),
                     }
                 ],
@@ -3306,19 +3806,6 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 "source_entry": copy.deepcopy(transitive_action_entry),
                 "parser_profile": "github-actions-dependency-resolver-v1",
                 "source_sha256": transitive_action_entry["blob_sha256"],
-                "discovered_references": [
-                    {
-                        "reference": "../../scripts/verify.sh",
-                        "target_entry": copy.deepcopy(transitive_script_entry),
-                    }
-                ],
-                "discovered_reference_count": 1,
-                "record_sha256": "",
-            },
-            {
-                "source_entry": copy.deepcopy(transitive_script_entry),
-                "parser_profile": "github-actions-dependency-resolver-v1",
-                "source_sha256": transitive_script_entry["blob_sha256"],
                 "discovered_references": [],
                 "discovered_reference_count": 0,
                 "record_sha256": "",
@@ -3332,20 +3819,14 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             {
                 "source_entry": copy.deepcopy(workflow_entry),
                 "reference": (
-                    "octo/review-gate/.github/workflows/reusable-review.yml"
-                    "@refs/heads/feature/review"
+                    "octo/review-gate/.github/workflows/reusable-review.yml@" + "2" * 40
                 ),
                 "target_entry": copy.deepcopy(reusable_entry),
             },
             {
                 "source_entry": copy.deepcopy(reusable_entry),
-                "reference": "./actions/verify",
+                "reference": "octo/review-gate/actions/verify@" + "2" * 40,
                 "target_entry": copy.deepcopy(transitive_action_entry),
-            },
-            {
-                "source_entry": copy.deepcopy(transitive_action_entry),
-                "reference": "../../scripts/verify.sh",
-                "target_entry": copy.deepcopy(transitive_script_entry),
             },
         ]
         cls.merge_status_dependency_resolution_receipt = {
@@ -3917,6 +4398,40 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         self.assertEqual(self.grammar["role"], "consumer-terminal-carrier-grammar")
         self.assertEqual(self.grammar["producer_contract"], "out-of-scope")
         self.assertEqual(self.grammar["fixture_patch_semantics"], "RFC7396")
+        self.assertEqual(
+            self.grammar["canonical_json_profile"]["profile"],
+            "rfc8785-fixed-ascii-keys-safe-integers-v1",
+        )
+        self.assertIn(
+            "-9007199254740991..9007199254740991",
+            self.grammar["canonical_json_profile"]["numbers"],
+        )
+        self.assertIn(
+            "lone surrogate",
+            self.grammar["canonical_json_profile"]["strings"],
+        )
+        self.assertIn(
+            "100000",
+            self.grammar["canonical_json_profile"]["containers"],
+        )
+        self.assertIn(
+            "same-repository same-running-commit reusable workflow",
+            self.grammar["required_report_schema"]["parent_input_rules"][
+                "merge_status_dependency_resolution_receipt"
+            ]["relative_runtime_binding"],
+        )
+        self.assertIn(
+            "untyped bare action-manifest-to-script relative ref",
+            self.grammar["required_report_schema"]["parent_input_rules"][
+                "merge_status_dependency_resolution_receipt"
+            ]["relative_runtime_binding"],
+        )
+        self.assertIn(
+            "profile set is empty",
+            self.grammar["required_report_schema"]["parent_input_rules"][
+                "merge_status_producer_implementation_receipt"
+            ]["external_app"],
+        )
         self.assertEqual(
             self.grammar["terminal_commit_binding"]["hashless_branches"], []
         )
@@ -4975,7 +5490,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     replacements=((original_root, attacked_root),),
                 )
                 validator = validator_for(implementation, resolution, str(index))
-                self.assertTrue(
+                self.assertFalse(
                     validator._merge_status_dependency_resolution_matches(report)
                 )
                 self.assertFalse(
@@ -5010,11 +5525,281 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             additions=((original_root, duplicate_root),),
         )
         validator = validator_for(implementation, resolution, "3")
+        self.assertFalse(validator._merge_status_dependency_resolution_matches(report))
+        self.assertFalse(
+            validator._merge_status_producer_implementation_matches(report)
+        )
+        self.assertFalse(validator.validate(report))
+
+        implementation = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        implementation["job_workflow_ref_identity"] = copy.deepcopy(
+            implementation["workflow_ref_identity"]
+        )
+        implementation["job_workflow_ref_identity"]["ref"] = "3" * 40
+        implementation["job_workflow_ref"] = (
+            f"{implementation['job_workflow_ref_identity']['repository']}/"
+            f"{implementation['job_workflow_ref_identity']['path']}@{'3' * 40}"
+        )
+        implementation["receipt_sha256"] = _receipt_sha256(implementation)
+        resolution = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+        resolution["implementation_receipt_sha256"] = implementation["receipt_sha256"]
+        resolution["receipt_sha256"] = _receipt_sha256(resolution)
+        validator = validator_for(implementation, resolution, "4")
         self.assertTrue(validator._merge_status_dependency_resolution_matches(report))
         self.assertFalse(
             validator._merge_status_producer_implementation_matches(report)
         )
         self.assertFalse(validator.validate(report))
+
+    def test_merge_status_relative_references_require_runtime_binding(self) -> None:
+        closure = self.merge_status_producer_implementation_receipt[
+            "implementation_closure"
+        ]
+        source_workflow = next(
+            entry for entry in closure if entry["kind"] == "reusable-workflow"
+        )
+        target_action = next(entry for entry in closure if entry["kind"] == "action")
+        exact_external_action = (
+            f"{target_action['repository']}/actions/verify@{target_action['commit']}"
+        )
+        self.assertTrue(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                source_workflow, exact_external_action, target_action
+            )
+        )
+        self.assertFalse(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                source_workflow, "evil/other/actions/verify@" + "9" * 40, target_action
+            )
+        )
+        self.assertFalse(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                source_workflow, "./actions/verify", target_action
+            )
+        )
+        self.assertFalse(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                source_workflow, "../actions/verify", target_action
+            )
+        )
+        self.assertTrue(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                source_workflow, "$/actions/verify", target_action
+            )
+        )
+        self.assertFalse(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                target_action,
+                "../../scripts/verify.sh",
+                {
+                    "repository": target_action["repository"],
+                    "commit": target_action["commit"],
+                    "path": "scripts/verify.sh",
+                    "blob_sha256": "7" * 64,
+                    "kind": "script",
+                },
+            )
+        )
+
+        for suffix in ("yml", "yaml"):
+            local_workflow = {
+                "repository": source_workflow["repository"],
+                "commit": source_workflow["commit"],
+                "path": f".github/workflows/local.{suffix}",
+                "blob_sha256": "8" * 64,
+                "kind": "reusable-workflow",
+            }
+            for prefix in ("./", "$/"):
+                reference = f"{prefix}{local_workflow['path']}"
+                with self.subTest(local_reusable_reference=reference):
+                    self.assertTrue(
+                        self.merge_report_validator._merge_status_reference_runtime_bound(
+                            source_workflow, reference, local_workflow
+                        )
+                    )
+        local_workflow = {
+            "repository": source_workflow["repository"],
+            "commit": source_workflow["commit"],
+            "path": ".github/workflows/local.yml",
+            "blob_sha256": "8" * 64,
+            "kind": "reusable-workflow",
+        }
+        for field, replacement in (
+            ("repository", "octo/different"),
+            ("commit", "3" * 40),
+            ("path", ".github/workflows/different.yml"),
+        ):
+            with self.subTest(local_reusable_mismatch=field):
+                mismatched = copy.deepcopy(local_workflow)
+                mismatched[field] = replacement
+                self.assertFalse(
+                    self.merge_report_validator._merge_status_reference_runtime_bound(
+                        source_workflow,
+                        "./.github/workflows/local.yml",
+                        mismatched,
+                    )
+                )
+        for bad_path in (
+            "scripts/not-a-workflow.yml",
+            ".github/workflows/nested/workflow.yml",
+            ".github/workflows/not-a-workflow.txt",
+        ):
+            bad_workflow = copy.deepcopy(local_workflow)
+            bad_workflow["path"] = bad_path
+            for reference in (
+                f"{bad_workflow['repository']}/{bad_path}@{bad_workflow['commit']}",
+                f"./{bad_path}",
+                f"$/{bad_path}",
+            ):
+                with self.subTest(bad_reusable_path=bad_path, reference=reference):
+                    self.assertFalse(
+                        self.merge_report_validator._merge_status_reference_runtime_bound(
+                            source_workflow, reference, bad_workflow
+                        )
+                    )
+        self.assertFalse(
+            self.merge_report_validator._merge_status_reference_runtime_bound(
+                target_action,
+                (
+                    f"{local_workflow['repository']}/{local_workflow['path']}@"
+                    f"{local_workflow['commit']}"
+                ),
+                local_workflow,
+            )
+        )
+
+        resolution = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+        for record in resolution["records"]:
+            if record["source_entry"] == source_workflow:
+                record["discovered_references"][0]["reference"] = "./actions/verify"
+                record["record_sha256"] = _canonical_json_sha256(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "record_sha256"
+                    }
+                )
+        resolution["records_sha256"] = _canonical_json_sha256(resolution["records"])
+        for edge in resolution["edges"]:
+            if edge["source_entry"] == source_workflow:
+                edge["reference"] = "./actions/verify"
+        resolution["edges_sha256"] = _canonical_json_sha256(resolution["edges"])
+        resolution["receipt_sha256"] = _receipt_sha256(resolution)
+        validator = self._validator_with_complete_snapshot(
+            self.merge_complete_pr_parent_snapshot,
+            merge_resolution_receipt=resolution,
+        )
+        self.assertFalse(
+            validator._merge_status_dependency_resolution_matches(
+                self.grammar["report_bases"]["merge_status"]
+            )
+        )
+
+        report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        implementation = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        root_entry = copy.deepcopy(implementation["workflow_ref_identity"]["entry"])
+        old_job_entry = copy.deepcopy(
+            implementation["job_workflow_ref_identity"]["entry"]
+        )
+        local_job_entry = copy.deepcopy(old_job_entry)
+        local_job_entry["repository"] = root_entry["repository"]
+        implementation["implementation_closure"] = [
+            (
+                copy.deepcopy(local_job_entry)
+                if entry == old_job_entry
+                else copy.deepcopy(entry)
+            )
+            for entry in implementation["implementation_closure"]
+        ]
+        implementation["implementation_closure"].sort(
+            key=lambda entry: (
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        implementation["job_workflow_ref_identity"].update(
+            repository=local_job_entry["repository"],
+            ref=implementation["run_ref"],
+            resolved_commit=local_job_entry["commit"],
+            entry=copy.deepcopy(local_job_entry),
+            entry_sha256=_canonical_json_sha256(local_job_entry),
+        )
+        implementation["job_workflow_ref"] = (
+            f"{local_job_entry['repository']}/{local_job_entry['path']}@"
+            f"{implementation['run_ref']}"
+        )
+        implementation["implementation_closure_sha256"] = _canonical_json_sha256(
+            implementation["implementation_closure"]
+        )
+        implementation["receipt_sha256"] = _receipt_sha256(implementation)
+
+        local_resolution = self._coupled_merge_resolution_for_entry_changes(
+            implementation,
+            replacements=((old_job_entry, local_job_entry),),
+        )
+        local_reference = f"./{local_job_entry['path']}"
+        for record in local_resolution["records"]:
+            if record["source_entry"] == root_entry:
+                record["discovered_references"][0]["reference"] = local_reference
+                record["record_sha256"] = _canonical_json_sha256(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "record_sha256"
+                    }
+                )
+        local_resolution["records_sha256"] = _canonical_json_sha256(
+            local_resolution["records"]
+        )
+        for edge in local_resolution["edges"]:
+            if (
+                edge["source_entry"] == root_entry
+                and edge["target_entry"] == local_job_entry
+            ):
+                edge["reference"] = local_reference
+        local_resolution["edges"].sort(
+            key=lambda edge: (
+                edge["source_entry"]["repository"],
+                edge["source_entry"]["commit"],
+                edge["source_entry"]["path"],
+                edge["source_entry"]["kind"],
+                edge["source_entry"]["blob_sha256"],
+                edge["reference"],
+                edge["target_entry"]["repository"],
+                edge["target_entry"]["commit"],
+                edge["target_entry"]["path"],
+                edge["target_entry"]["kind"],
+                edge["target_entry"]["blob_sha256"],
+            )
+        )
+        local_resolution["edges_sha256"] = _canonical_json_sha256(
+            local_resolution["edges"]
+        )
+        local_resolution["receipt_sha256"] = _receipt_sha256(local_resolution)
+        snapshot = self._merge_snapshot_for_report(report, "8", implementation)
+        for phase in ("initial", "final"):
+            snapshot[f"{phase}_basis_selection"]["merge_status"][
+                "producer_dependency_resolution_receipt_sha256"
+            ] = local_resolution["receipt_sha256"]
+        local_validator = self._validator_with_complete_snapshot(
+            snapshot,
+            merge_implementation_receipt=implementation,
+            merge_resolution_receipt=local_resolution,
+        )
+        self.assertTrue(
+            local_validator._merge_status_producer_implementation_matches(report)
+        )
+        self.assertTrue(
+            local_validator._merge_status_dependency_resolution_matches(report)
+        )
+        self.assertTrue(local_validator.validate(report))
 
     def test_merge_status_snapshot_requires_two_subject_bound_page_sets(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
@@ -5032,7 +5817,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             "reusable-workflow",
         )
         self.assertTrue(
-            {"action", "script"}
+            {"action"}
             <= {
                 entry["kind"]
                 for entry in self.merge_status_producer_implementation_receipt[
@@ -5566,14 +6351,23 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         rebuilt_alternate_snapshot = self._merge_snapshot_for_report(
             alternate_merge, "f", alternate_implementation
         )
-        self.assertTrue(
-            self._validator_with_complete_snapshot(
-                rebuilt_alternate_snapshot,
-                merge_contract=alternate_contract,
-                merge_anchor=alternate_anchor,
-                merge_implementation_receipt=alternate_implementation,
-            ).validate(alternate_merge)
+        external_validator = self._validator_with_complete_snapshot(
+            rebuilt_alternate_snapshot,
+            merge_contract=alternate_contract,
+            merge_anchor=alternate_anchor,
+            merge_implementation_receipt=alternate_implementation,
         )
+        self.assertFalse(
+            external_validator._merge_status_dependency_resolution_matches(
+                alternate_merge
+            )
+        )
+        self.assertFalse(
+            external_validator._merge_status_producer_implementation_matches(
+                alternate_merge
+            )
+        )
+        self.assertFalse(external_validator.validate(alternate_merge))
         for field in ("workflow_ref_identity", "job_workflow_ref_identity"):
             with self.subTest(external_app_identity=field):
                 invalid_external = copy.deepcopy(alternate_implementation)
@@ -5916,6 +6710,166 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 )
                 self.assertFalse(validator.validate(report))
 
+    def test_rfc8785_bound_numbers_use_the_safe_integer_domain(self) -> None:
+        self.assertEqual(
+            _repository_identity("OcTo/Review-Fixture"),
+            "octo/review-fixture",
+        )
+        for malformed_repository in (
+            "Öcto/review-fixture",
+            "octo/仓库",
+            "owner/",
+            "/repo",
+            "owner/..",
+            "owner/re po",
+            "owner/repo?",
+            "owner/repo#",
+            "owner/repo@",
+            "owner/repo%",
+            "owner/repo\\name",
+            f"owner/{'a' * 101}",
+        ):
+            with self.subTest(malformed_repository=malformed_repository):
+                self.assertIsNone(_repository_identity(malformed_repository))
+
+        self.assertEqual(
+            _canonical_json_sha256({"id": MAX_SAFE_INTEGER}),
+            hashlib.sha256(f'{{"id":{MAX_SAFE_INTEGER}}}'.encode()).hexdigest(),
+        )
+        for value in (
+            MAX_SAFE_INTEGER + 1,
+            -(MAX_SAFE_INTEGER + 1),
+            9_007_199_254_740_993,
+            {"nested": [MAX_SAFE_INTEGER + 1]},
+            {"non-ascii-key-\N{SNOWMAN}": 1},
+            "\ud800",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _canonical_json_sha256(value)
+
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        with self.assertRaises(ValueError):
+            _canonical_json_sha256(cyclic)
+
+        def nested_lists(depth: int) -> list[object]:
+            root: list[object] = []
+            cursor = root
+            for _ in range(depth - 1):
+                child: list[object] = []
+                cursor.append(child)
+                cursor = child
+            return root
+
+        at_depth_limit = nested_lists(MAX_CANONICAL_JSON_DEPTH)
+        _canonical_json_sha256(at_depth_limit)
+        deep = nested_lists(MAX_CANONICAL_JSON_DEPTH + 1)
+        with self.assertRaises(ValueError):
+            _canonical_json_sha256(deep)
+
+        at_node_limit = [None] * (MAX_CANONICAL_JSON_NODES - 1)
+        _require_rfc8785_integer_domain(at_node_limit)
+        over_node_limit = [None] * MAX_CANONICAL_JSON_NODES
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(over_node_limit)
+        overwide_object = {
+            f"key-{index}": None for index in range(MAX_CANONICAL_JSON_NODES)
+        }
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(overwide_object)
+
+        boundary_string = "a" * MAX_CANONICAL_JSON_STRING_UTF8_BYTES
+        _require_rfc8785_integer_domain(boundary_string)
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(boundary_string + "a")
+        aggregate_chunks = (
+            MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES
+            // MAX_CANONICAL_JSON_STRING_UTF8_BYTES
+        )
+        aggregate_boundary = [boundary_string] * (aggregate_chunks - 1) + [
+            {boundary_string: None}
+        ]
+        _require_rfc8785_integer_domain(aggregate_boundary)
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain([*aggregate_boundary, "a"])
+
+        constructor_validator = _ReportValidator(
+            self.grammar,
+            self.selected_parent_selection_outcome,
+            deep,
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+        )
+        self.assertFalse(
+            constructor_validator.validate(self.grammar["report_bases"]["merge_status"])
+        )
+        oversized_constructor_validator = _ReportValidator(
+            self.grammar,
+            self.selected_parent_selection_outcome,
+            boundary_string + "a",
+            self.terminal_clean_parent_identity,
+            self.reaction_clean_parent_epoch,
+            self.merge_status_parent_scope,
+            self.merge_status_parent_contract,
+            self.resolved_inline_parent_snapshot,
+        )
+        self.assertFalse(
+            oversized_constructor_validator.validate(
+                self.grammar["report_bases"]["merge_status"]
+            )
+        )
+        oversized_record = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        oversized_record["body"] = boundary_string + "a"
+        self.assertEqual(
+            self.classifier.classify(oversized_record)["classification"],
+            "malformed",
+        )
+
+        raw = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        raw["id"] = 9_007_199_254_740_993
+        self.assertEqual(
+            _ReferenceClassifier(self.grammar).classify(raw)["classification"],
+            "malformed",
+        )
+        raw["id"] = 1
+        raw["kind"] = []
+        self.assertEqual(
+            _ReferenceClassifier(self.grammar).classify(raw)["classification"],
+            "malformed",
+        )
+        self.assertEqual(
+            _ReferenceClassifier(self.grammar).classify(cyclic)["classification"],
+            "malformed",
+        )
+        self.assertEqual(
+            _ReferenceClassifier(self.grammar).classify(deep)["classification"],
+            "malformed",
+        )
+
+        implementation = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        implementation["run_id"] = 9_007_199_254_740_993
+        validator = self._validator_with_complete_snapshot(
+            self.merge_complete_pr_parent_snapshot,
+            merge_implementation_receipt=implementation,
+        )
+        self.assertFalse(
+            validator.validate(self.grammar["report_bases"]["merge_status"])
+        )
+
+        malformed_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        malformed_report["evidence"]["grammar_branch"] = []
+        self.assertFalse(self.merge_report_validator.validate(malformed_report))
+        surrogate_report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+        surrogate_report["last_reason"] = "\ud800"
+        self.assertFalse(self.merge_report_validator.validate(surrogate_report))
+        self.assertFalse(self.merge_report_validator.validate(cyclic))
+        self.assertFalse(self.merge_report_validator.validate(deep))
+
     def test_parent_scope_exact_integer_types_reject_pr_one_boolean_aliases(
         self,
     ) -> None:
@@ -6120,6 +7074,32 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 )
                 self.assertFalse(validator.validate(report))
 
+    def test_github_urls_preserve_all_non_repository_bytes(self) -> None:
+        def validate_url(url: str) -> bool:
+            report = copy.deepcopy(self.grammar["report_bases"]["merge_status"])
+            parent_contract = copy.deepcopy(self.merge_status_parent_contract)
+            report["evidence"]["url"] = url
+            report["evidence"]["association"]["check_run_url"] = url
+            parent_contract["check_run_url"] = url
+            snapshot = self._merge_snapshot_for_report(report, "6")
+            return self._validator_with_complete_snapshot(
+                snapshot,
+                merge_contract=parent_contract,
+            ).validate(report)
+
+        original = self.grammar["report_bases"]["merge_status"]["evidence"]["url"]
+        mixed_case_repository = original.replace(
+            "octo/review-fixture", "OcTo/Review-Fixture", 1
+        )
+        self.assertTrue(validate_url(mixed_case_repository))
+        for name, malformed_url in (
+            ("trailing-tab", original + "\t"),
+            ("uppercase-scheme", original.replace("https://", "HTTPS://", 1)),
+            ("empty-query-delimiter", original + "?"),
+        ):
+            with self.subTest(malformed_url=name):
+                self.assertFalse(validate_url(malformed_url))
+
     def test_merge_status_requires_candidate_range_external_trust_anchor(
         self,
     ) -> None:
@@ -6224,6 +7204,112 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                     candidate_contract
                 ),
             ).validate(candidate_report)
+        )
+
+        alias_report = copy.deepcopy(report)
+        alias_contract = copy.deepcopy(self.merge_status_parent_contract)
+        alias_descriptor = {
+            "source_repository": alias_report["repository"].upper(),
+            "source_commit": alias_report["head_sha"],
+            "source_path": ".github/workflows/codex-review.yml",
+            "source_sha256": "6" * 64,
+        }
+        alias_contract["contract_descriptor"] = copy.deepcopy(alias_descriptor)
+        alias_report["evidence"]["association"]["contract"] = copy.deepcopy(
+            alias_descriptor
+        )
+        alias_anchor = self._merge_anchor_for_contract(alias_contract)
+        alias_anchor["source"]["kind"] = "parent-fixed-external"
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(alias_report, "6"),
+                merge_contract=alias_contract,
+                merge_anchor=alias_anchor,
+                merge_exclusion_receipt=self._merge_exclusion_receipt_for_contract(
+                    alias_contract
+                ),
+            ).validate(alias_report)
+        )
+
+        for malformed_repository in ("Öcto/review-fixture", "owner/repo?"):
+            with self.subTest(malformed_external_repository=malformed_repository):
+                malformed_report = copy.deepcopy(report)
+                malformed_contract = copy.deepcopy(self.merge_status_parent_contract)
+                malformed_descriptor = copy.deepcopy(
+                    malformed_contract["contract_descriptor"]
+                )
+                malformed_descriptor["source_repository"] = malformed_repository
+                malformed_contract["contract_descriptor"] = copy.deepcopy(
+                    malformed_descriptor
+                )
+                malformed_report["evidence"]["association"]["contract"] = copy.deepcopy(
+                    malformed_descriptor
+                )
+                malformed_anchor = self._merge_anchor_for_contract(malformed_contract)
+                malformed_anchor["source"]["kind"] = "parent-fixed-external"
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(
+                        self._merge_snapshot_for_report(malformed_report, "6"),
+                        merge_contract=malformed_contract,
+                        merge_anchor=malformed_anchor,
+                        merge_exclusion_receipt=(
+                            self._merge_exclusion_receipt_for_contract(
+                                malformed_contract
+                            )
+                        ),
+                    ).validate(malformed_report)
+                )
+
+        for unsafe_source_path in (".", "contracts/source\0.json"):
+            with self.subTest(unsafe_source_path=unsafe_source_path):
+                unsafe_report = copy.deepcopy(report)
+                unsafe_contract = copy.deepcopy(self.merge_status_parent_contract)
+                unsafe_descriptor = copy.deepcopy(
+                    unsafe_contract["contract_descriptor"]
+                )
+                unsafe_descriptor["source_path"] = unsafe_source_path
+                unsafe_contract["contract_descriptor"] = copy.deepcopy(
+                    unsafe_descriptor
+                )
+                unsafe_report["evidence"]["association"]["contract"] = copy.deepcopy(
+                    unsafe_descriptor
+                )
+                unsafe_anchor = self._merge_anchor_for_contract(unsafe_contract)
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(
+                        self._merge_snapshot_for_report(unsafe_report, "6"),
+                        merge_contract=unsafe_contract,
+                        merge_anchor=unsafe_anchor,
+                        merge_exclusion_receipt=(
+                            self._merge_exclusion_receipt_for_contract(unsafe_contract)
+                        ),
+                    ).validate(unsafe_report)
+                )
+
+        alias_resolver = copy.deepcopy(self.merge_status_dependency_resolver_anchor)
+        alias_resolver.update(
+            repository=report["repository"].upper(),
+            commit="d" * 40,
+        )
+        alias_resolver["receipt_sha256"] = _receipt_sha256(alias_resolver)
+        alias_resolution = copy.deepcopy(
+            self.merge_status_dependency_resolution_receipt
+        )
+        alias_resolution["resolver_anchor_receipt_sha256"] = alias_resolver[
+            "receipt_sha256"
+        ]
+        alias_resolution["receipt_sha256"] = _receipt_sha256(alias_resolution)
+        alias_resolver_snapshot = self._merge_snapshot_for_report(report, "6")
+        for phase in ("initial", "final"):
+            alias_resolver_snapshot[f"{phase}_basis_selection"]["merge_status"][
+                "producer_dependency_resolution_receipt_sha256"
+            ] = alias_resolution["receipt_sha256"]
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                alias_resolver_snapshot,
+                merge_resolver_anchor=alias_resolver,
+                merge_resolution_receipt=alias_resolution,
+            ).validate(report)
         )
 
         non_head_report = copy.deepcopy(report)
@@ -6613,6 +7699,358 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 merge_resolution_receipt=forged_reference,
             ).validate(report)
         )
+
+        forged_selector = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+        for record in forged_selector["records"]:
+            for reference in record["discovered_references"]:
+                if reference["target_entry"]["kind"] == "action":
+                    reference["reference"] = "evil/other/actions/verify@" + "9" * 40
+                    record["record_sha256"] = _canonical_json_sha256(
+                        {
+                            key: value
+                            for key, value in record.items()
+                            if key != "record_sha256"
+                        }
+                    )
+        for edge in forged_selector["edges"]:
+            if edge["target_entry"]["kind"] == "action":
+                edge["reference"] = "evil/other/actions/verify@" + "9" * 40
+        finish(forged_selector)
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(report, "e"),
+                merge_resolution_receipt=forged_selector,
+            ).validate(report)
+        )
+
+        duplicate_job_inbound = copy.deepcopy(
+            self.merge_status_dependency_resolution_receipt
+        )
+        job_entry = self.merge_status_producer_implementation_receipt[
+            "job_workflow_ref_identity"
+        ]["entry"]
+        self_reference = {
+            "reference": f"$/{job_entry['path']}",
+            "target_entry": copy.deepcopy(job_entry),
+        }
+        for record in duplicate_job_inbound["records"]:
+            if record["source_entry"] == job_entry:
+                record["discovered_references"].append(self_reference)
+                record["discovered_references"].sort(
+                    key=lambda item: (
+                        item["reference"],
+                        item["target_entry"]["repository"],
+                        item["target_entry"]["commit"],
+                        item["target_entry"]["path"],
+                        item["target_entry"]["kind"],
+                        item["target_entry"]["blob_sha256"],
+                    )
+                )
+                record["discovered_reference_count"] = len(
+                    record["discovered_references"]
+                )
+                record["record_sha256"] = _canonical_json_sha256(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "record_sha256"
+                    }
+                )
+        duplicate_job_inbound["edges"].append(
+            {
+                "source_entry": copy.deepcopy(job_entry),
+                **copy.deepcopy(self_reference),
+            }
+        )
+        duplicate_job_inbound["edges"].sort(
+            key=lambda edge: (
+                edge["source_entry"]["repository"],
+                edge["source_entry"]["commit"],
+                edge["source_entry"]["path"],
+                edge["source_entry"]["kind"],
+                edge["source_entry"]["blob_sha256"],
+                edge["reference"],
+                edge["target_entry"]["repository"],
+                edge["target_entry"]["commit"],
+                edge["target_entry"]["path"],
+                edge["target_entry"]["kind"],
+                edge["target_entry"]["blob_sha256"],
+            )
+        )
+        finish(duplicate_job_inbound)
+        self.assertFalse(
+            self._validator_with_complete_snapshot(
+                self._merge_snapshot_for_report(report, "f"),
+                merge_resolution_receipt=duplicate_job_inbound,
+            ).validate(report)
+        )
+
+        mixed_case_selectors = copy.deepcopy(
+            self.merge_status_dependency_resolution_receipt
+        )
+        for record in mixed_case_selectors["records"]:
+            for dependency in record["discovered_references"]:
+                reference = dependency["reference"]
+                if not reference.startswith(("./", "$/")):
+                    owner, repository, suffix = reference.split("/", 2)
+                    dependency["reference"] = (
+                        f"{owner.upper()}/{repository.upper()}/{suffix}"
+                    )
+            record["record_sha256"] = _canonical_json_sha256(
+                {key: value for key, value in record.items() if key != "record_sha256"}
+            )
+        for edge in mixed_case_selectors["edges"]:
+            reference = edge["reference"]
+            owner, repository, suffix = reference.split("/", 2)
+            edge["reference"] = f"{owner.upper()}/{repository.upper()}/{suffix}"
+        finish(mixed_case_selectors)
+        mixed_case_snapshot = self._merge_snapshot_for_report(report, "1")
+        for phase in ("initial", "final"):
+            mixed_case_snapshot[f"{phase}_basis_selection"]["merge_status"][
+                "producer_dependency_resolution_receipt_sha256"
+            ] = mixed_case_selectors["receipt_sha256"]
+        self.assertTrue(
+            self._validator_with_complete_snapshot(
+                mixed_case_snapshot,
+                merge_resolution_receipt=mixed_case_selectors,
+            ).validate(report)
+        )
+
+        candidate_case_alias = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        candidate_case_alias["implementation_closure"].append(
+            {
+                "repository": report["repository"].upper(),
+                "commit": report["head_sha"],
+                "path": "scripts/case-alias.sh",
+                "blob_sha256": "1" * 64,
+                "kind": "script",
+            }
+        )
+        candidate_case_alias["implementation_closure"].sort(
+            key=lambda entry: (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        candidate_case_alias["implementation_closure_count"] = len(
+            candidate_case_alias["implementation_closure"]
+        )
+        candidate_case_alias["implementation_closure_sha256"] = _canonical_json_sha256(
+            candidate_case_alias["implementation_closure"]
+        )
+        candidate_case_alias["receipt_sha256"] = _receipt_sha256(candidate_case_alias)
+        candidate_alias_validator = self._validator_with_complete_snapshot(
+            self._merge_snapshot_for_report(report, "2"),
+            merge_implementation_receipt=candidate_case_alias,
+        )
+        self.assertFalse(
+            candidate_alias_validator._merge_status_producer_implementation_matches(
+                report
+            )
+        )
+
+        duplicate_case_alias = copy.deepcopy(
+            self.merge_status_producer_implementation_receipt
+        )
+        alias_entry = copy.deepcopy(duplicate_case_alias["implementation_closure"][1])
+        alias_entry["repository"] = alias_entry["repository"].replace(
+            "review-gate", "review-gATE"
+        )
+        duplicate_case_alias["implementation_closure"].append(alias_entry)
+        duplicate_case_alias["implementation_closure"].sort(
+            key=lambda entry: (
+                _repository_identity(entry["repository"]),
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        duplicate_case_alias["implementation_closure_count"] = len(
+            duplicate_case_alias["implementation_closure"]
+        )
+        duplicate_case_alias["implementation_closure_sha256"] = _canonical_json_sha256(
+            duplicate_case_alias["implementation_closure"]
+        )
+        duplicate_case_alias["receipt_sha256"] = _receipt_sha256(duplicate_case_alias)
+        duplicate_alias_validator = self._validator_with_complete_snapshot(
+            self._merge_snapshot_for_report(report, "3"),
+            merge_implementation_receipt=duplicate_case_alias,
+        )
+        self.assertFalse(
+            duplicate_alias_validator._merge_status_producer_implementation_matches(
+                report
+            )
+        )
+
+        def action_ambiguity_validator(
+            new_action_entry: dict[str, object], digest_character: str
+        ) -> _ReportValidator:
+            implementation = copy.deepcopy(
+                self.merge_status_producer_implementation_receipt
+            )
+            original_action = next(
+                entry
+                for entry in implementation["implementation_closure"]
+                if entry["kind"] == "action"
+            )
+            implementation["implementation_closure"].append(
+                copy.deepcopy(new_action_entry)
+            )
+            implementation["implementation_closure"].sort(
+                key=lambda entry: (
+                    entry["repository"],
+                    entry["commit"],
+                    entry["path"],
+                    entry["kind"],
+                    entry["blob_sha256"],
+                )
+            )
+            implementation["implementation_closure_count"] = len(
+                implementation["implementation_closure"]
+            )
+            implementation["implementation_closure_sha256"] = _canonical_json_sha256(
+                implementation["implementation_closure"]
+            )
+            implementation["receipt_sha256"] = _receipt_sha256(implementation)
+
+            resolution = copy.deepcopy(self.merge_status_dependency_resolution_receipt)
+            original_record = next(
+                record
+                for record in resolution["records"]
+                if record["source_entry"] == original_action
+            )
+            new_record = copy.deepcopy(original_record)
+            new_record["source_entry"] = copy.deepcopy(new_action_entry)
+            new_record["source_sha256"] = new_action_entry["blob_sha256"]
+            new_record["record_sha256"] = _canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in new_record.items()
+                    if key != "record_sha256"
+                }
+            )
+            resolution["records"].append(new_record)
+            inbound_record = next(
+                record
+                for record in resolution["records"]
+                if any(
+                    reference["target_entry"] == original_action
+                    for reference in record["discovered_references"]
+                )
+            )
+            original_reference = next(
+                reference
+                for reference in inbound_record["discovered_references"]
+                if reference["target_entry"] == original_action
+            )
+            duplicate_reference = copy.deepcopy(original_reference)
+            duplicate_reference["target_entry"] = copy.deepcopy(new_action_entry)
+            inbound_record["discovered_references"].append(duplicate_reference)
+            inbound_record["discovered_references"].sort(
+                key=lambda item: (
+                    item["reference"],
+                    item["target_entry"]["repository"],
+                    item["target_entry"]["commit"],
+                    item["target_entry"]["path"],
+                    item["target_entry"]["kind"],
+                    item["target_entry"]["blob_sha256"],
+                )
+            )
+            inbound_record["discovered_reference_count"] = len(
+                inbound_record["discovered_references"]
+            )
+            inbound_record["record_sha256"] = _canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in inbound_record.items()
+                    if key != "record_sha256"
+                }
+            )
+            resolution["records"].sort(
+                key=lambda record: (
+                    record["source_entry"]["repository"],
+                    record["source_entry"]["commit"],
+                    record["source_entry"]["path"],
+                    record["source_entry"]["kind"],
+                    record["source_entry"]["blob_sha256"],
+                )
+            )
+            resolution["edges"].append(
+                {
+                    "source_entry": copy.deepcopy(inbound_record["source_entry"]),
+                    "reference": duplicate_reference["reference"],
+                    "target_entry": copy.deepcopy(new_action_entry),
+                }
+            )
+            resolution["edges"].sort(
+                key=lambda edge: (
+                    edge["source_entry"]["repository"],
+                    edge["source_entry"]["commit"],
+                    edge["source_entry"]["path"],
+                    edge["source_entry"]["kind"],
+                    edge["source_entry"]["blob_sha256"],
+                    edge["reference"],
+                    edge["target_entry"]["repository"],
+                    edge["target_entry"]["commit"],
+                    edge["target_entry"]["path"],
+                    edge["target_entry"]["kind"],
+                    edge["target_entry"]["blob_sha256"],
+                )
+            )
+            resolution["implementation_receipt_sha256"] = implementation[
+                "receipt_sha256"
+            ]
+            finish(resolution)
+            snapshot = self._merge_snapshot_for_report(
+                report, digest_character, implementation
+            )
+            for phase in ("initial", "final"):
+                snapshot[f"{phase}_basis_selection"]["merge_status"][
+                    "producer_dependency_resolution_receipt_sha256"
+                ] = resolution["receipt_sha256"]
+            return self._validator_with_complete_snapshot(
+                snapshot,
+                merge_implementation_receipt=implementation,
+                merge_resolution_receipt=resolution,
+            )
+
+        baseline_action = next(
+            entry
+            for entry in self.merge_status_producer_implementation_receipt[
+                "implementation_closure"
+            ]
+            if entry["kind"] == "action"
+        )
+        for name, new_action in (
+            (
+                "same-path-different-blob",
+                {**copy.deepcopy(baseline_action), "blob_sha256": "a" * 64},
+            ),
+            (
+                "same-directory-alternate-manifest",
+                {
+                    **copy.deepcopy(baseline_action),
+                    "path": "actions/verify/action.yaml",
+                    "blob_sha256": "b" * 64,
+                },
+            ),
+        ):
+            with self.subTest(action_selector_ambiguity=name):
+                validator = action_ambiguity_validator(new_action, "9")
+                self.assertFalse(
+                    validator._merge_status_producer_implementation_matches(report)
+                )
+                self.assertFalse(
+                    validator._merge_status_dependency_resolution_matches(report)
+                )
+                self.assertFalse(validator.validate(report))
 
         duplicate_blob_path = copy.deepcopy(
             self.merge_status_producer_implementation_receipt

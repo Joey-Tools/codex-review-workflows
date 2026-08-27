@@ -8,11 +8,119 @@ import json
 import pathlib
 import re
 import unittest
+import urllib.parse
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REFERENCES = SKILL_ROOT / "references"
 FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+REPOSITORY_COMPONENT = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
+MAX_SAFE_INTEGER = (1 << 53) - 1
+MAX_CANONICAL_JSON_DEPTH = 256
+MAX_CANONICAL_JSON_NODES = 100_000
+MAX_CANONICAL_JSON_STRING_UTF8_BYTES = 1 << 20
+MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES = 16 << 20
+VALIDATION_EXCEPTIONS = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    OverflowError,
+    RecursionError,
+    TypeError,
+    ValueError,
+)
+
+
+def _repository_identity(value: object) -> str | None:
+    """Return GitHub's ASCII case-insensitive owner/name identity."""
+
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    parts = value.split("/")
+    if (
+        len(parts) != 2
+        or any(REPOSITORY_COMPONENT.fullmatch(part) is None for part in parts)
+        or any(part in {".", ".."} for part in parts)
+    ):
+        return None
+    return "/".join(part.lower() for part in parts)
+
+
+def _same_repository(left: object, right: object) -> bool:
+    left_identity = _repository_identity(left)
+    return left_identity is not None and left_identity == _repository_identity(right)
+
+
+def _repository_selector_matches(
+    reference: object, repository: object, exact_suffix: str
+) -> bool:
+    if (
+        not isinstance(reference, str)
+        or not exact_suffix
+        or not reference.endswith(exact_suffix)
+    ):
+        return False
+    return _same_repository(reference[: -len(exact_suffix)], repository)
+
+
+def _same_repository_selector(left: object, right: object, exact_suffix: str) -> bool:
+    if (
+        not isinstance(left, str)
+        or not isinstance(right, str)
+        or not left.endswith(exact_suffix)
+        or not right.endswith(exact_suffix)
+    ):
+        return False
+    return _same_repository(left[: -len(exact_suffix)], right[: -len(exact_suffix)])
+
+
+def _repository_selector_identity(
+    reference: str, target_entry: dict[str, object]
+) -> tuple[object, ...]:
+    if reference.startswith(("./", "../", "$/")):
+        return ("relative", reference)
+    kind = target_entry["kind"]
+    path = target_entry["path"]
+    commit = target_entry["commit"]
+    if kind == "reusable-workflow":
+        suffix = f"/{path}@{commit}"
+    elif kind == "action":
+        action_directory = pathlib.PurePosixPath(path).parent.as_posix()
+        suffix = (
+            f"@{commit}" if action_directory == "." else f"/{action_directory}@{commit}"
+        )
+    else:
+        return ("unsupported", reference)
+    repository = reference[: -len(suffix)] if reference.endswith(suffix) else None
+    return ("external", _repository_identity(repository), suffix)
+
+
+def _has_url_control_or_space(value: str) -> bool:
+    return any(
+        ord(character) <= 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
+    )
+
+
+def _repository_scoped_string_matches(
+    value: object, prefix: str, repository: object, exact_suffix: str
+) -> bool:
+    if (
+        not isinstance(value, str)
+        or _has_url_control_or_space(value)
+        or not value.startswith(prefix)
+        or not value.endswith(exact_suffix)
+    ):
+        return False
+    if prefix == "https://api.github.com/repos/":
+        parsed = urllib.parse.urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "api.github.com"
+            or urllib.parse.urlunsplit(parsed) != value
+        ):
+            return False
+    repository_text = value[len(prefix) : -len(exact_suffix)]
+    return _same_repository(repository_text, repository)
 
 
 def _read(path: pathlib.Path) -> str:
@@ -23,7 +131,92 @@ def _normalize(value: str) -> str:
     return " ".join(value.split()).lower()
 
 
+def _require_rfc8785_integer_domain(value: object) -> None:
+    stack: list[tuple[str, object, int, int]] = [("value", value, 0, 0)]
+    active_containers: set[int] = set()
+    node_count = 0
+    aggregate_string_bytes = 0
+    while stack:
+        frame_kind, current, container_depth, container_identity = stack.pop()
+        if frame_kind == "iterator":
+            try:
+                child = next(current)  # type: ignore[arg-type]
+            except StopIteration:
+                active_containers.remove(container_identity)
+                continue
+            stack.append(("iterator", current, container_depth, container_identity))
+            stack.append(("value", child, container_depth, 0))
+            continue
+        node_count += 1
+        if node_count > MAX_CANONICAL_JSON_NODES:
+            raise ValueError("canonical JSON exceeds the closed resource profile")
+        if type(current) is bool or current is None:
+            continue
+        if type(current) is str:
+            if len(current) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                raise ValueError("canonical JSON string exceeds the closed byte cap")
+            try:
+                encoded = current.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError(
+                    "canonical JSON strings must contain Unicode scalars"
+                ) from error
+            if len(encoded) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                raise ValueError("canonical JSON string exceeds the closed byte cap")
+            aggregate_string_bytes += len(encoded)
+            if aggregate_string_bytes > MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES:
+                raise ValueError("canonical JSON strings exceed the aggregate byte cap")
+            continue
+        if type(current) is int:
+            if not -MAX_SAFE_INTEGER <= current <= MAX_SAFE_INTEGER:
+                raise ValueError("integer is outside the RFC 8785 interoperable domain")
+            continue
+        if type(current) in {list, dict}:
+            next_depth = container_depth + 1
+            if next_depth > MAX_CANONICAL_JSON_DEPTH:
+                raise ValueError("canonical JSON exceeds the closed resource profile")
+            if node_count + len(current) > MAX_CANONICAL_JSON_NODES:
+                raise ValueError("canonical JSON exceeds the closed resource profile")
+            identity = id(current)
+            if identity in active_containers:
+                raise ValueError("canonical JSON containers must be acyclic")
+            active_containers.add(identity)
+            if type(current) is dict:
+                for key in current:
+                    if type(key) is not str or not key.isascii():
+                        raise ValueError(
+                            "canonical JSON object keys must be ASCII strings"
+                        )
+                    if len(key) > MAX_CANONICAL_JSON_STRING_UTF8_BYTES:
+                        raise ValueError(
+                            "canonical JSON object key exceeds the closed byte cap"
+                        )
+                    aggregate_string_bytes += len(key)
+                    if aggregate_string_bytes > MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES:
+                        raise ValueError(
+                            "canonical JSON strings exceed the aggregate byte cap"
+                        )
+                children = iter(current.values())
+            else:
+                children = iter(current)
+            stack.append(("iterator", children, next_depth, identity))
+            continue
+        raise ValueError("canonical JSON value is outside the integer-only profile")
+
+
+_MALFORMED_PARENT_INPUT = object()
+
+
+def _bounded_parent_copy(value: object) -> object:
+    try:
+        _require_rfc8785_integer_domain(value)
+        return copy.deepcopy(value)
+    except VALIDATION_EXCEPTIONS:
+        return _MALFORMED_PARENT_INPUT
+
+
 def _canonical_sha256(value: object) -> str:
+    _require_rfc8785_integer_domain(value)
     return hashlib.sha256(
         json.dumps(
             value,
@@ -76,20 +269,20 @@ class _RecoveryContractValidator:
     ) -> None:
         self.schema = schema
         self.fields = schema["closed_fields"]
-        self.producer_receipt = copy.deepcopy(producer_receipt)
-        self.producer_receipt_fields = producer_receipt_fields
-        self.platform_observation = copy.deepcopy(platform_observation)
-        self.dispatch_delivery_receipt = copy.deepcopy(dispatch_delivery_receipt)
+        self.producer_receipt = _bounded_parent_copy(producer_receipt)
+        self.producer_receipt_fields = _bounded_parent_copy(producer_receipt_fields)
+        self.platform_observation = _bounded_parent_copy(platform_observation)
+        self.dispatch_delivery_receipt = _bounded_parent_copy(dispatch_delivery_receipt)
         self.expected_delivery_receipt_sha256 = expected_delivery_receipt_sha256
-        self.expected_dependency_resolution_receipt = copy.deepcopy(
+        self.expected_dependency_resolution_receipt = _bounded_parent_copy(
             expected_dependency_resolution_receipt
         )
-        self.expected_resolver_anchor = copy.deepcopy(expected_resolver_anchor)
-        self.expected_pre_mutation_observation = copy.deepcopy(
+        self.expected_resolver_anchor = _bounded_parent_copy(expected_resolver_anchor)
+        self.expected_pre_mutation_observation = _bounded_parent_copy(
             expected_pre_mutation_observation
         )
-        self.post_current_observation = copy.deepcopy(post_current_observation)
-        self.acquisition_transaction_receipt = copy.deepcopy(
+        self.post_current_observation = _bounded_parent_copy(post_current_observation)
+        self.acquisition_transaction_receipt = _bounded_parent_copy(
             acquisition_transaction_receipt
         )
 
@@ -98,28 +291,180 @@ class _RecoveryContractValidator:
 
     @staticmethod
     def _positive_int(value: object) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 < value <= MAX_SAFE_INTEGER
+        )
 
     @staticmethod
     def _safe_path(value: object) -> bool:
-        if not isinstance(value, str) or not value or "\\" in value:
+        if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
             return False
         path = pathlib.PurePosixPath(value)
         return (
             not path.is_absolute()
+            and bool(path.parts)
             and path.as_posix() == value
             and all(part not in {"", ".", ".."} for part in path.parts)
         )
 
     @staticmethod
+    def _github_workflow_path(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        path = pathlib.PurePosixPath(value)
+        return path.parent == pathlib.PurePosixPath(
+            ".github/workflows"
+        ) and path.suffix in {".yml", ".yaml"}
+
+    @staticmethod
+    def _action_manifest_directory(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if value in {"action.yml", "action.yaml"}:
+            return ""
+        path = pathlib.PurePosixPath(value)
+        if path.name not in {"action.yml", "action.yaml"}:
+            return None
+        return path.parent.as_posix()
+
+    @staticmethod
     def _repository(value: object) -> bool:
-        return (
-            isinstance(value, str)
-            and len(value.split("/")) == 2
-            and all(value.split("/"))
+        return _repository_identity(value) is not None
+
+    @staticmethod
+    def _attempt_stable_reference(
+        source_entry: dict[str, object],
+        reference: str,
+        target_entry: dict[str, object],
+    ) -> bool:
+        same_running_commit = (
+            _same_repository(source_entry["repository"], target_entry["repository"])
+            and source_entry["commit"] == target_entry["commit"]
         )
+        if reference.startswith("./"):
+            return (
+                source_entry["kind"] in {"workflow", "reusable-workflow"}
+                and target_entry["kind"] == "reusable-workflow"
+                and same_running_commit
+                and reference == f"./{target_entry['path']}"
+                and _RecoveryContractValidator._github_workflow_path(
+                    target_entry["path"]
+                )
+            )
+        if reference.startswith("../"):
+            return False
+        if reference.startswith("$/"):
+            relative_path = reference[2:]
+            if (
+                source_entry["kind"] in {"workflow", "reusable-workflow"}
+                and target_entry["kind"] == "reusable-workflow"
+            ):
+                return (
+                    same_running_commit
+                    and relative_path == target_entry["path"]
+                    and _RecoveryContractValidator._github_workflow_path(
+                        target_entry["path"]
+                    )
+                )
+            if (
+                source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+                and target_entry["kind"] == "action"
+                and same_running_commit
+            ):
+                manifest_directory = (
+                    _RecoveryContractValidator._action_manifest_directory(
+                        target_entry["path"]
+                    )
+                )
+                if manifest_directory is not None:
+                    return relative_path == manifest_directory
+            return False
+        repository = target_entry["repository"]
+        path = target_entry["path"]
+        commit = target_entry["commit"]
+        kind = target_entry["kind"]
+        if (
+            kind == "reusable-workflow"
+            and source_entry["kind"] in {"workflow", "reusable-workflow"}
+            and _RecoveryContractValidator._github_workflow_path(path)
+        ):
+            selector_suffix = f"/{path}@{commit}"
+        elif (
+            kind == "action"
+            and source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+            and _RecoveryContractValidator._action_manifest_directory(path)
+            not in {None, ""}
+        ):
+            action_directory = _RecoveryContractValidator._action_manifest_directory(
+                path
+            )
+            selector_suffix = f"/{action_directory}@{commit}"
+        elif (
+            kind == "action"
+            and source_entry["kind"] in {"workflow", "reusable-workflow", "action"}
+            and path in {"action.yml", "action.yaml"}
+        ):
+            selector_suffix = f"@{commit}"
+        else:
+            return False
+        return _repository_selector_matches(reference, repository, selector_suffix)
+
+    @staticmethod
+    def _job_workflow_edge_matches(
+        edge: dict[str, object],
+        job_raw_ref: str,
+        job_entry: dict[str, object],
+    ) -> bool:
+        def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
+            return (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+
+        if entry_key(edge["target_entry"]) != entry_key(job_entry):
+            return False
+        if (
+            edge["source_entry"]["kind"] not in {"workflow", "reusable-workflow"}
+            or job_entry["kind"] != "reusable-workflow"
+        ):
+            return False
+        reference = edge["reference"]
+        if reference.startswith(("./", "$/")):
+            return (
+                _same_repository(
+                    edge["source_entry"]["repository"], job_entry["repository"]
+                )
+                and edge["source_entry"]["commit"] == job_entry["commit"]
+                and job_entry["kind"] == "reusable-workflow"
+            )
+        suffix = f"/{job_entry['path']}@{job_entry['commit']}"
+        return _repository_selector_matches(
+            reference, job_entry["repository"], suffix
+        ) and _repository_selector_matches(job_raw_ref, job_entry["repository"], suffix)
 
     def validate_preflight(self, contract: object) -> bool:
+        try:
+            return self._validate_preflight(contract)
+        except VALIDATION_EXCEPTIONS:
+            return False
+
+    def _validate_preflight(self, contract: object) -> bool:
+        try:
+            for value in (
+                contract,
+                self.producer_receipt,
+                self.expected_dependency_resolution_receipt,
+                self.expected_resolver_anchor,
+                self.expected_pre_mutation_observation,
+            ):
+                _require_rfc8785_integer_domain(value)
+        except ValueError:
+            return False
         if not self._closed(contract, "preflight_contract"):
             return False
         source = contract["source_descriptor"]
@@ -158,8 +503,7 @@ class _RecoveryContractValidator:
             return False
 
         if (
-            not isinstance(source["source_repository"], str)
-            or source["source_repository"].count("/") != 1
+            _repository_identity(source["source_repository"]) is None
             or FULL_SHA.fullmatch(source["source_commit"]) is None
             or not self._safe_path(source["source_path"])
             or SHA256.fullmatch(source["source_sha256"]) is None
@@ -178,7 +522,7 @@ class _RecoveryContractValidator:
                 f"{source['source_path']}"
             )
             or anchor["sha256"] != source["source_sha256"]
-            or anchor["repository"] != contract["repository"]
+            or not _same_repository(anchor["repository"], contract["repository"])
             or anchor["head_sha"] != contract["head_sha"]
             or FULL_SHA.fullmatch(anchor["base_sha"]) is None
         ):
@@ -190,7 +534,7 @@ class _RecoveryContractValidator:
             or exclusion["status"] != "complete"
             or exclusion["profile"]
             != "github-codex-recovery-candidate-range-exclusion-v1"
-            or exclusion["repository"] != contract["repository"]
+            or not _same_repository(exclusion["repository"], contract["repository"])
             or exclusion["base_sha"] != anchor["base_sha"]
             or exclusion["head_sha"] != contract["head_sha"]
             or exclusion["source"] != source
@@ -209,7 +553,7 @@ class _RecoveryContractValidator:
             or exclusion["candidate_commit_count"] != len(commits)
             or exclusion["candidate_commits_sha256"] != _commit_set_sha256(commits)
             or (
-                source["source_repository"] == contract["repository"]
+                _same_repository(source["source_repository"], contract["repository"])
                 and source["source_commit"] in commits
             )
         ):
@@ -235,8 +579,10 @@ class _RecoveryContractValidator:
             or producer["implementation_closure_complete"] is not True
             or producer["provider_kind"] != "github-actions"
             or producer["attestation_source"] != "github-actions-api"
-            or producer["repository"] != contract["repository"]
-            or producer["workflow_repository"] != contract["repository"]
+            or not _same_repository(producer["repository"], contract["repository"])
+            or not _same_repository(
+                producer["workflow_repository"], contract["repository"]
+            )
             or not isinstance(producer["run_ref"], str)
             or not producer["run_ref"].startswith("refs/")
             or not self._positive_int(producer["run_id"])
@@ -271,7 +617,7 @@ class _RecoveryContractValidator:
 
         def entry_key(entry: dict[str, object]) -> tuple[object, ...]:
             return (
-                entry["repository"],
+                _repository_identity(entry["repository"]),
                 entry["commit"],
                 entry["path"],
                 entry["kind"],
@@ -288,12 +634,42 @@ class _RecoveryContractValidator:
             or SHA256.fullmatch(entry["blob_sha256"]) is None
             or entry["kind"]
             not in {"workflow", "reusable-workflow", "action", "script"}
+            or (
+                entry["kind"] in {"workflow", "reusable-workflow"}
+                and not self._github_workflow_path(entry["path"])
+            )
+            or (
+                entry["kind"] == "action"
+                and self._action_manifest_directory(entry["path"]) is None
+            )
             for entry in entries
         ):
             return False
         entry_by_key = {entry_key(item): item for item in entries}
         entry_keys = [entry_key(item) for item in entries]
-        if entry_keys != sorted(entry_keys) or len(entry_keys) != len(set(entry_keys)):
+        path_keys = [
+            (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                entry["path"],
+            )
+            for entry in entries
+        ]
+        action_selector_keys = [
+            (
+                _repository_identity(entry["repository"]),
+                entry["commit"],
+                self._action_manifest_directory(entry["path"]),
+            )
+            for entry in entries
+            if entry["kind"] == "action"
+        ]
+        if (
+            entry_keys != sorted(entry_keys)
+            or len(entry_keys) != len(set(entry_keys))
+            or len(path_keys) != len(set(path_keys))
+            or len(action_selector_keys) != len(set(action_selector_keys))
+        ):
             return False
 
         def ref_identity_matches(raw: object, identity: object) -> bool:
@@ -305,12 +681,15 @@ class _RecoveryContractValidator:
                 and entry_key(entry) in entry_by_key
                 and entry == entry_by_key[entry_key(entry)]
                 and identity["entry_sha256"] == _canonical_sha256(entry)
-                and identity["repository"] == entry["repository"]
+                and _same_repository(identity["repository"], entry["repository"])
                 and identity["path"] == entry["path"]
                 and identity["resolved_commit"] == entry["commit"]
                 and isinstance(identity["ref"], str)
-                and raw
-                == f"{identity['repository']}/{identity['path']}@{identity['ref']}"
+                and _repository_selector_matches(
+                    raw,
+                    identity["repository"],
+                    f"/{identity['path']}@{identity['ref']}",
+                )
             )
 
         if (
@@ -323,18 +702,28 @@ class _RecoveryContractValidator:
             or not ref_identity_matches(
                 producer["job_workflow_ref"], producer["job_workflow_ref_identity"]
             )
-            or producer["workflow_ref_identity"]["repository"]
-            != producer["workflow_repository"]
+            or not _same_repository(
+                producer["workflow_ref_identity"]["repository"],
+                producer["workflow_repository"],
+            )
             or producer["workflow_ref_identity"]["path"] != producer["workflow_path"]
             or producer["workflow_ref_identity"]["resolved_commit"]
             != producer["workflow_sha"]
             or producer["workflow_ref_identity"]["ref"] != producer["run_ref"]
             or producer["workflow_ref_identity"]["entry"]["kind"] != "workflow"
             or (
-                producer["job_workflow_ref_identity"]["repository"]
-                != contract["repository"]
-                and producer["job_workflow_ref_identity"]["entry"]["kind"]
-                != "reusable-workflow"
+                producer["job_workflow_ref_identity"]["entry"]
+                == producer["workflow_ref_identity"]["entry"]
+                and producer["job_workflow_ref_identity"]
+                != producer["workflow_ref_identity"]
+            )
+            or (
+                producer["job_workflow_ref_identity"]["entry"]
+                != producer["workflow_ref_identity"]["entry"]
+                and (
+                    producer["job_workflow_ref_identity"]["entry"]["kind"]
+                    != "reusable-workflow"
+                )
             )
             or producer["external_implementation_id"] is not None
         ):
@@ -344,7 +733,7 @@ class _RecoveryContractValidator:
             item
             for item in producer["implementation_closure"]
             if item["kind"] == "workflow"
-            and item["repository"] == producer["workflow_repository"]
+            and _same_repository(item["repository"], producer["workflow_repository"])
             and item["commit"] == producer["workflow_sha"]
             and item["path"] == producer["workflow_path"]
         ]
@@ -358,7 +747,7 @@ class _RecoveryContractValidator:
             != "github-codex-recovery-dependency-edge-resolution-v1"
             or edges_receipt["implementation_receipt_sha256"]
             != producer["receipt_sha256"]
-            or edges_receipt["repository"] != contract["repository"]
+            or not _same_repository(edges_receipt["repository"], contract["repository"])
             or edges_receipt["head_sha"] != contract["head_sha"]
             or len(workflow_entries) != 1
             or producer["workflow_ref_identity"]["entry"] != workflow_entries[0]
@@ -374,8 +763,7 @@ class _RecoveryContractValidator:
                 "parent-fixed-external",
             }
             or FULL_SHA.fullmatch(resolver["commit"]) is None
-            or not isinstance(resolver["repository"], str)
-            or resolver["repository"].count("/") != 1
+            or _repository_identity(resolver["repository"]) is None
             or not self._safe_path(resolver["path"])
             or SHA256.fullmatch(resolver["sha256"]) is None
             or resolver["candidate_range_exclusion_sha256"]
@@ -383,7 +771,7 @@ class _RecoveryContractValidator:
             or (
                 resolver["kind"] == "target-branch-baseline"
                 and (
-                    resolver["repository"] != contract["repository"]
+                    not _same_repository(resolver["repository"], contract["repository"])
                     or resolver["commit"] != exclusion["base_sha"]
                     or resolver["installed_release_manifest_sha256"] is not None
                 )
@@ -391,7 +779,7 @@ class _RecoveryContractValidator:
             or (
                 resolver["kind"] == "parent-fixed-external"
                 and (
-                    resolver["repository"] == contract["repository"]
+                    _same_repository(resolver["repository"], contract["repository"])
                     or resolver["installed_release_manifest_sha256"] is not None
                 )
             )
@@ -403,7 +791,7 @@ class _RecoveryContractValidator:
                 is None
             )
             or (
-                resolver["repository"] == contract["repository"]
+                _same_repository(resolver["repository"], contract["repository"])
                 and resolver["commit"] in commits
             )
             or resolver["receipt_sha256"] != _receipt_sha256(resolver)
@@ -415,7 +803,7 @@ class _RecoveryContractValidator:
             or edges_receipt["edges_sha256"] != _canonical_sha256(edges)
             or edges_receipt["receipt_sha256"] != _receipt_sha256(edges_receipt)
             or any(
-                item["repository"] == contract["repository"]
+                _same_repository(item["repository"], contract["repository"])
                 and item["commit"] in commits
                 for item in entries
             )
@@ -452,7 +840,7 @@ class _RecoveryContractValidator:
                 )
                 or len(
                     {
-                        (item["reference"], entry_key(item["target_entry"]))
+                        item["reference"]
                         for item in references
                         if isinstance(item, dict)
                         and "reference" in item
@@ -468,6 +856,7 @@ class _RecoveryContractValidator:
             ):
                 return False
             record_keys.append(entry_key(source_entry))
+            selector_identities: list[tuple[object, ...]] = []
             for reference in references:
                 if not self._closed(reference, "recovery_dependency_reference"):
                     return False
@@ -478,8 +867,14 @@ class _RecoveryContractValidator:
                     or not isinstance(target, dict)
                     or entry_key(target) not in entry_by_key
                     or target != entry_by_key[entry_key(target)]
+                    or not self._attempt_stable_reference(
+                        source_entry, reference["reference"], target
+                    )
                 ):
                     return False
+                selector_identities.append(
+                    _repository_selector_identity(reference["reference"], target)
+                )
                 derived_edges.append(
                     {
                         "source_entry": copy.deepcopy(source_entry),
@@ -487,6 +882,8 @@ class _RecoveryContractValidator:
                         "target_entry": copy.deepcopy(target),
                     }
                 )
+            if len(selector_identities) != len(set(selector_identities)):
+                return False
         derived_edges.sort(
             key=lambda edge: (
                 *entry_key(edge["source_entry"]),
@@ -494,16 +891,43 @@ class _RecoveryContractValidator:
                 *entry_key(edge["target_entry"]),
             )
         )
+        root_key = entry_key(workflow_entries[0])
+        reachable = {root_key}
+        while True:
+            expanded = reachable | {
+                entry_key(edge["target_entry"])
+                for edge in derived_edges
+                if entry_key(edge["source_entry"]) in reachable
+            }
+            if expanded == reachable:
+                break
+            reachable = expanded
+        job_entry = producer["job_workflow_ref_identity"]["entry"]
+        job_is_root = entry_key(job_entry) == root_key
+        job_inbound_edges = [
+            edge for edge in derived_edges if edge["target_entry"] == job_entry
+        ]
         if (
             record_keys != sorted(entry_by_key)
             or len(record_keys) != len(set(record_keys))
             or edges != derived_edges
+            or reachable != set(entry_by_key)
+            or (job_is_root and job_inbound_edges)
+            or (
+                not job_is_root
+                and (
+                    len(job_inbound_edges) != 1
+                    or not self._job_workflow_edge_matches(
+                        job_inbound_edges[0], producer["job_workflow_ref"], job_entry
+                    )
+                )
+            )
         ):
             return False
 
         inputs = operation["inputs"]
         if (
-            operation["repository"] != contract["repository"]
+            not _same_repository(operation["repository"], contract["repository"])
             or operation["kind"]
             not in {
                 "existing-run-rerun-failed-jobs",
@@ -532,9 +956,13 @@ class _RecoveryContractValidator:
             before["owner"] == "parent-orchestrator"
             and before["status"] == "complete"
             and before["profile"] == "github-codex-pre-mutation-run-observation-v1"
-            and before["repository"] == contract["repository"]
-            and before["query_endpoint"]
-            == f"/repos/{contract['repository']}/actions/runs/{producer['run_id']}"
+            and _same_repository(before["repository"], contract["repository"])
+            and _repository_scoped_string_matches(
+                before["query_endpoint"],
+                "/repos/",
+                contract["repository"],
+                f"/actions/runs/{producer['run_id']}",
+            )
             and before["api_version"] == "2026-03-10"
             and before["http_method"] == "GET"
             and before["response_status"] == 200
@@ -550,9 +978,23 @@ class _RecoveryContractValidator:
             and before["workflow_id"] == producer["workflow_id"]
             and self._positive_int(before["workflow_id"])
             and before["workflow_sha"] == producer["workflow_sha"]
-            and before["workflow_ref"] == producer["workflow_ref"]
+            and _same_repository_selector(
+                before["workflow_ref"],
+                producer["workflow_ref"],
+                (
+                    f"/{producer['workflow_ref_identity']['path']}@"
+                    f"{producer['workflow_ref_identity']['ref']}"
+                ),
+            )
             and before["run_ref"] == producer["run_ref"]
-            and before["job_workflow_ref"] == producer["job_workflow_ref"]
+            and _same_repository_selector(
+                before["job_workflow_ref"],
+                producer["job_workflow_ref"],
+                (
+                    f"/{producer['job_workflow_ref_identity']['path']}@"
+                    f"{producer['job_workflow_ref_identity']['ref']}"
+                ),
+            )
             and self._closed(before["platform_identity"], "platform_identity")
             and before["platform_identity"]
             == {"source": "github-actions-api", "authenticated": True}
@@ -565,6 +1007,26 @@ class _RecoveryContractValidator:
     def validate_completion(
         self, completion: object, accepted_preflight: dict[str, object]
     ) -> bool:
+        try:
+            return self._validate_completion(completion, accepted_preflight)
+        except VALIDATION_EXCEPTIONS:
+            return False
+
+    def _validate_completion(
+        self, completion: object, accepted_preflight: dict[str, object]
+    ) -> bool:
+        try:
+            for value in (
+                completion,
+                accepted_preflight,
+                self.platform_observation,
+                self.post_current_observation,
+                self.acquisition_transaction_receipt,
+                self.dispatch_delivery_receipt,
+            ):
+                _require_rfc8785_integer_domain(value)
+        except ValueError:
+            return False
         if not self.validate_preflight(accepted_preflight) or not self._closed(
             completion, "completion_receipt"
         ):
@@ -583,7 +1045,9 @@ class _RecoveryContractValidator:
             or delivery["owner"] != "parent-orchestrator"
             or delivery["status"] != "complete"
             or delivery["profile"] != "github-codex-dispatch-delivery-receipt-v1"
-            or delivery["repository"] != accepted_preflight["repository"]
+            or not _same_repository(
+                delivery["repository"], accepted_preflight["repository"]
+            )
             or delivery["api_version"] != "2026-03-10"
             or delivery["http_method"] != "POST"
             or not isinstance(delivery["request_server_time"], str)
@@ -605,7 +1069,9 @@ class _RecoveryContractValidator:
             or observation["status"] != "complete"
             or observation["profile"]
             != "github-codex-platform-dispatch-run-observation-v1"
-            or observation["query_repository"] != accepted_preflight["repository"]
+            or not _same_repository(
+                observation["query_repository"], accepted_preflight["repository"]
+            )
             or observation["api_version"] != "2026-03-10"
             or observation["http_method"] != "GET"
             or observation["response_status"] != 200
@@ -643,10 +1109,16 @@ class _RecoveryContractValidator:
             or current_observation["status"] != "complete"
             or current_observation["profile"]
             != "github-codex-platform-dispatch-run-observation-v1"
-            or current_observation["query_repository"]
-            != accepted_preflight["repository"]
-            or current_observation["query_endpoint"]
-            != f"/repos/{accepted_preflight['repository']}/actions/runs/{observation['returned_run_id']}"
+            or not _same_repository(
+                current_observation["query_repository"],
+                accepted_preflight["repository"],
+            )
+            or not _repository_scoped_string_matches(
+                current_observation["query_endpoint"],
+                "/repos/",
+                accepted_preflight["repository"],
+                f"/actions/runs/{observation['returned_run_id']}",
+            )
             or current_observation["api_version"] != "2026-03-10"
             or current_observation["http_method"] != "GET"
             or current_observation["response_status"] != 200
@@ -675,15 +1147,11 @@ class _RecoveryContractValidator:
             return False
         frozen_identity_fields = (
             "id",
-            "repository",
             "run_attempt",
-            "previous_attempt_url",
             "head_sha",
             "workflow_id",
             "workflow_sha",
-            "workflow_ref",
             "run_ref",
-            "job_workflow_ref",
         )
         exact_started = _timestamp(run_object["run_started_at"])
         exact_updated = _timestamp(run_object["updated_at"])
@@ -703,6 +1171,43 @@ class _RecoveryContractValidator:
         if (
             {key: current_run_object[key] for key in frozen_identity_fields}
             != {key: run_object[key] for key in frozen_identity_fields}
+            or not _same_repository(
+                current_run_object["repository"], run_object["repository"]
+            )
+            or not _same_repository_selector(
+                current_run_object["workflow_ref"],
+                run_object["workflow_ref"],
+                (
+                    f"/{producer['workflow_ref_identity']['path']}@"
+                    f"{producer['workflow_ref_identity']['ref']}"
+                ),
+            )
+            or not _same_repository_selector(
+                current_run_object["job_workflow_ref"],
+                run_object["job_workflow_ref"],
+                (
+                    f"/{producer['job_workflow_ref_identity']['path']}@"
+                    f"{producer['job_workflow_ref_identity']['ref']}"
+                ),
+            )
+            or not _repository_scoped_string_matches(
+                current_run_object["previous_attempt_url"],
+                "https://api.github.com/repos/",
+                accepted_preflight["repository"],
+                (
+                    f"/actions/runs/{producer['run_id']}/attempts/"
+                    f"{producer['run_attempt']}"
+                ),
+            )
+            or not _repository_scoped_string_matches(
+                run_object["previous_attempt_url"],
+                "https://api.github.com/repos/",
+                accepted_preflight["repository"],
+                (
+                    f"/actions/runs/{producer['run_id']}/attempts/"
+                    f"{producer['run_attempt']}"
+                ),
+            )
             or None
             in {
                 exact_started,
@@ -735,7 +1240,9 @@ class _RecoveryContractValidator:
             or transaction["status"] != "complete"
             or transaction["profile"]
             != "github-codex-recovery-acquisition-transaction-v1"
-            or transaction["repository"] != accepted_preflight["repository"]
+            or not _same_repository(
+                transaction["repository"], accepted_preflight["repository"]
+            )
             or not self._positive_int(transaction["run_id"])
             or transaction["run_id"] != observation["returned_run_id"]
             or transaction["pre_observation_sha256"]
@@ -773,8 +1280,12 @@ class _RecoveryContractValidator:
         if (
             rerun_mode not in {"failed-jobs", "full"}
             or delivery["delivery_status"] != operation["kind"]
-            or delivery["request_endpoint"]
-            != f"/repos/{accepted_preflight['repository']}/actions/runs/{expected_run_id}/{endpoint_suffix}"
+            or not _repository_scoped_string_matches(
+                delivery["request_endpoint"],
+                "/repos/",
+                accepted_preflight["repository"],
+                f"/actions/runs/{expected_run_id}/{endpoint_suffix}",
+            )
             or delivery["request_body"] is not None
             or delivery["request_body_encoding"] != "absent-v1"
             or delivery["request_body_sha256"] != _canonical_sha256(None)
@@ -785,8 +1296,12 @@ class _RecoveryContractValidator:
             or not self._positive_int(run_object["run_attempt"])
             or run_object["run_attempt"] != producer_attempt + 1
             or run_object["run_attempt"] != operation["expected_run_attempt"]
-            or observation["query_endpoint"]
-            != f"/repos/{accepted_preflight['repository']}/actions/runs/{expected_run_id}/attempts/{producer_attempt + 1}"
+            or not _repository_scoped_string_matches(
+                observation["query_endpoint"],
+                "/repos/",
+                accepted_preflight["repository"],
+                (f"/actions/runs/{expected_run_id}/attempts/{producer_attempt + 1}"),
+            )
             or before_at is None
             or requested_at is None
             or observed_at is None
@@ -809,47 +1324,68 @@ class _RecoveryContractValidator:
             < _timestamp(current_run_object["run_started_at"])
             or _timestamp(current_run_object["updated_at"])
             > _timestamp(current_observation["response_date"])
-            or run_object["previous_attempt_url"]
-            != f"https://api.github.com/repos/{accepted_preflight['repository']}/actions/runs/{expected_run_id}/attempts/{producer_attempt}"
+            or not _repository_scoped_string_matches(
+                run_object["previous_attempt_url"],
+                "https://api.github.com/repos/",
+                accepted_preflight["repository"],
+                f"/actions/runs/{expected_run_id}/attempts/{producer_attempt}",
+            )
             or current_run_object["run_attempt"] != producer_attempt + 1
-            or current_run_object["previous_attempt_url"]
-            != run_object["previous_attempt_url"]
+            or not _repository_scoped_string_matches(
+                current_run_object["previous_attempt_url"],
+                "https://api.github.com/repos/",
+                accepted_preflight["repository"],
+                f"/actions/runs/{expected_run_id}/attempts/{producer_attempt}",
+            )
             or {
                 key: current_run_object[key]
                 for key in (
                     "id",
-                    "repository",
                     "run_attempt",
-                    "previous_attempt_url",
                     "head_sha",
                     "workflow_id",
                     "workflow_sha",
-                    "workflow_ref",
                     "run_ref",
-                    "job_workflow_ref",
                 )
             }
             != {
                 key: run_object[key]
                 for key in (
                     "id",
-                    "repository",
                     "run_attempt",
-                    "previous_attempt_url",
                     "head_sha",
                     "workflow_id",
                     "workflow_sha",
-                    "workflow_ref",
                     "run_ref",
-                    "job_workflow_ref",
                 )
             }
+            or not _same_repository(
+                current_run_object["repository"], run_object["repository"]
+            )
+            or not _same_repository_selector(
+                current_run_object["workflow_ref"],
+                run_object["workflow_ref"],
+                (
+                    f"/{producer['workflow_ref_identity']['path']}@"
+                    f"{producer['workflow_ref_identity']['ref']}"
+                ),
+            )
+            or not _same_repository_selector(
+                current_run_object["job_workflow_ref"],
+                run_object["job_workflow_ref"],
+                (
+                    f"/{producer['job_workflow_ref_identity']['path']}@"
+                    f"{producer['job_workflow_ref_identity']['ref']}"
+                ),
+            )
             or not self._closed(transaction, "recovery_acquisition_transaction_receipt")
             or transaction["owner"] != "parent-orchestrator"
             or transaction["status"] != "complete"
             or transaction["profile"]
             != "github-codex-recovery-acquisition-transaction-v1"
-            or transaction["repository"] != accepted_preflight["repository"]
+            or not _same_repository(
+                transaction["repository"], accepted_preflight["repository"]
+            )
             or transaction["run_id"] != expected_run_id
             or transaction["pre_observation_sha256"]
             != accepted_preflight["pre_mutation_run_observation"]["receipt_sha256"]
@@ -899,9 +1435,12 @@ class _RecoveryContractValidator:
             and self._positive_int(completion["returned_run_id"])
             and completion["returned_run_id"] == expected_run_id
             and completion["returned_run_id"] == observation["returned_run_id"]
-            and completion["observed_repository"]
-            == run_object["repository"]
-            == accepted_preflight["repository"]
+            and _same_repository(
+                completion["observed_repository"], run_object["repository"]
+            )
+            and _same_repository(
+                run_object["repository"], accepted_preflight["repository"]
+            )
             and self._positive_int(completion["observed_run_attempt"])
             and completion["observed_run_attempt"] == run_object["run_attempt"]
             and completion["observed_head_sha"]
@@ -914,15 +1453,41 @@ class _RecoveryContractValidator:
             and completion["observed_workflow_sha"]
             == run_object["workflow_sha"]
             == producer["workflow_sha"]
-            and completion["observed_workflow_ref"]
-            == run_object["workflow_ref"]
-            == producer["workflow_ref"]
+            and _same_repository_selector(
+                completion["observed_workflow_ref"],
+                run_object["workflow_ref"],
+                (
+                    f"/{producer['workflow_ref_identity']['path']}@"
+                    f"{producer['workflow_ref_identity']['ref']}"
+                ),
+            )
+            and _same_repository_selector(
+                run_object["workflow_ref"],
+                producer["workflow_ref"],
+                (
+                    f"/{producer['workflow_ref_identity']['path']}@"
+                    f"{producer['workflow_ref_identity']['ref']}"
+                ),
+            )
             and completion["observed_run_ref"]
             == run_object["run_ref"]
             == operation["ref"]
-            and completion["observed_job_workflow_ref"]
-            == run_object["job_workflow_ref"]
-            == producer["job_workflow_ref"]
+            and _same_repository_selector(
+                completion["observed_job_workflow_ref"],
+                run_object["job_workflow_ref"],
+                (
+                    f"/{producer['job_workflow_ref_identity']['path']}@"
+                    f"{producer['job_workflow_ref_identity']['ref']}"
+                ),
+            )
+            and _same_repository_selector(
+                run_object["job_workflow_ref"],
+                producer["job_workflow_ref"],
+                (
+                    f"/{producer['job_workflow_ref_identity']['path']}@"
+                    f"{producer['job_workflow_ref_identity']['ref']}"
+                ),
+            )
             and completion["completion_sha256"]
             == _canonical_sha256(
                 {
@@ -969,13 +1534,6 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 "blob_sha256": "9" * 64,
                 "kind": "action",
             },
-            {
-                "repository": "octo/z-recovery-policy",
-                "commit": "2" * 40,
-                "path": "scripts/verify.sh",
-                "blob_sha256": "a" * 64,
-                "kind": "script",
-            },
         ]
         cls.producer_receipt = {
             "owner": "parent-orchestrator",
@@ -1006,12 +1564,12 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 "entry_sha256": _canonical_sha256(producer_closure[0]),
             },
             "job_workflow_ref": (
-                "octo/z-recovery-policy/.github/workflows/reconcile.yml@refs/heads/feature/review"
+                "octo/z-recovery-policy/.github/workflows/reconcile.yml@" + "2" * 40
             ),
             "job_workflow_ref_identity": {
                 "repository": "octo/z-recovery-policy",
                 "path": ".github/workflows/reconcile.yml",
-                "ref": "refs/heads/feature/review",
+                "ref": "2" * 40,
                 "resolved_commit": "2" * 40,
                 "entry": copy.deepcopy(producer_closure[1]),
                 "entry_sha256": _canonical_sha256(producer_closure[1]),
@@ -1088,7 +1646,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 {
                     "reference": (
                         "octo/z-recovery-policy/.github/workflows/reconcile.yml"
-                        "@refs/heads/feature/review"
+                        "@" + "2" * 40
                     ),
                     "target_entry": copy.deepcopy(producer_closure[1]),
                 }
@@ -1105,7 +1663,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "source_sha256": producer_closure[1]["blob_sha256"],
             "discovered_references": [
                 {
-                    "reference": "./actions/verify",
+                    "reference": ("octo/z-recovery-policy/actions/verify@" + "2" * 40),
                     "target_entry": copy.deepcopy(producer_closure[2]),
                 }
             ],
@@ -1119,35 +1677,18 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "source_entry": copy.deepcopy(producer_closure[2]),
             "parser_profile": "github-actions-dependency-resolver-v1",
             "source_sha256": producer_closure[2]["blob_sha256"],
-            "discovered_references": [
-                {
-                    "reference": "../../scripts/verify.sh",
-                    "target_entry": copy.deepcopy(producer_closure[3]),
-                }
-            ],
-            "discovered_reference_count": 1,
-            "record_sha256": "",
-        }
-        transitive_action_record["record_sha256"] = _canonical_sha256(
-            {k: v for k, v in transitive_action_record.items() if k != "record_sha256"}
-        )
-        transitive_script_record = {
-            "source_entry": copy.deepcopy(producer_closure[3]),
-            "parser_profile": "github-actions-dependency-resolver-v1",
-            "source_sha256": producer_closure[3]["blob_sha256"],
             "discovered_references": [],
             "discovered_reference_count": 0,
             "record_sha256": "",
         }
-        transitive_script_record["record_sha256"] = _canonical_sha256(
-            {k: v for k, v in transitive_script_record.items() if k != "record_sha256"}
+        transitive_action_record["record_sha256"] = _canonical_sha256(
+            {k: v for k, v in transitive_action_record.items() if k != "record_sha256"}
         )
         resolution_records = sorted(
             [
                 resolution_record,
                 action_record,
                 transitive_action_record,
-                transitive_script_record,
             ],
             key=lambda record: (
                 record["source_entry"]["repository"],
@@ -1161,20 +1702,14 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             {
                 "source_entry": copy.deepcopy(producer_closure[0]),
                 "reference": (
-                    "octo/z-recovery-policy/.github/workflows/reconcile.yml"
-                    "@refs/heads/feature/review"
+                    "octo/z-recovery-policy/.github/workflows/reconcile.yml@" + "2" * 40
                 ),
                 "target_entry": copy.deepcopy(producer_closure[1]),
             },
             {
                 "source_entry": copy.deepcopy(producer_closure[1]),
-                "reference": "./actions/verify",
+                "reference": ("octo/z-recovery-policy/actions/verify@" + "2" * 40),
                 "target_entry": copy.deepcopy(producer_closure[2]),
-            },
-            {
-                "source_entry": copy.deepcopy(producer_closure[2]),
-                "reference": "../../scripts/verify.sh",
-                "target_entry": copy.deepcopy(producer_closure[3]),
             },
         ]
         edge_receipt = {
@@ -1186,10 +1721,10 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "head_sha": head_sha,
             "resolver_anchor": resolver_anchor,
             "records": resolution_records,
-            "record_count": 4,
+            "record_count": 3,
             "records_sha256": _canonical_sha256(resolution_records),
             "edges": resolution_edges,
-            "edge_count": 3,
+            "edge_count": 2,
             "edges_sha256": _canonical_sha256(resolution_edges),
             "receipt_sha256": "",
         }
@@ -1454,6 +1989,30 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             self.recovery_schema["role"], "machine-readable-reference-and-test-only"
         )
         self.assertEqual(self.recovery_schema["production_consumer"], "out-of-scope")
+        self.assertIn(
+            "canonical repository/workflow-path@full-commit",
+            self.recovery_schema["rules"]["attempt_stable_dependencies"],
+        )
+        self.assertIn(
+            "conservative rule applies to both full and failed-jobs reruns",
+            self.recovery_schema["rules"]["attempt_stable_dependencies"],
+        )
+        self.assertIn(
+            "runtime resolution bases",
+            self.recovery_schema["rules"]["attempt_stable_dependencies"],
+        )
+        self.assertIn(
+            "exactly one total inbound edge",
+            self.recovery_schema["rules"]["attempt_stable_dependencies"],
+        )
+        self.assertIn(
+            "complete dependency graph to be attempt-stable",
+            " ".join(self.authority.split()),
+        )
+        self.assertIn(
+            "complete dependency graph attempt-stable",
+            " ".join(self.probes.split()),
+        )
         self.assertTrue(
             self.recovery_validator.validate_preflight(self.recovery_contract)
         )
@@ -1524,6 +2083,672 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             }
         )
         self.assertFalse(self.recovery_validator.validate_preflight(manual_dispatch))
+
+    def test_recovery_requires_attempt_stable_dependency_references(self) -> None:
+        self.assertTrue(
+            self.recovery_validator.validate_preflight(self.recovery_contract)
+        )
+
+        source_workflow = copy.deepcopy(
+            self.producer_receipt["implementation_closure"][1]
+        )
+        target_action = copy.deepcopy(
+            self.producer_receipt["implementation_closure"][2]
+        )
+        self.assertTrue(
+            self.recovery_validator._attempt_stable_reference(
+                source_workflow,
+                "octo/z-recovery-policy/actions/verify@" + "2" * 40,
+                target_action,
+            )
+        )
+        for reference in (
+            "./actions/verify",
+            "../actions/verify",
+            "octo/z-recovery-policy/actions/verify/action.yml@" + "2" * 40,
+            "octo/z-recovery-policy/actions/verify@" + "3" * 40,
+        ):
+            with self.subTest(reference=reference):
+                self.assertFalse(
+                    self.recovery_validator._attempt_stable_reference(
+                        source_workflow, reference, target_action
+                    )
+                )
+        self.assertTrue(
+            self.recovery_validator._attempt_stable_reference(
+                source_workflow, "$/actions/verify", target_action
+            )
+        )
+        self.assertFalse(
+            self.recovery_validator._attempt_stable_reference(
+                source_workflow,
+                "$/actions/verify@" + "2" * 40,
+                target_action,
+            )
+        )
+        root_action = copy.deepcopy(target_action)
+        root_action["path"] = "action.yaml"
+        self.assertTrue(
+            self.recovery_validator._attempt_stable_reference(
+                source_workflow,
+                "octo/z-recovery-policy@" + "2" * 40,
+                root_action,
+            )
+        )
+        invalid_action = copy.deepcopy(target_action)
+        invalid_action["path"] = "actions/verify/manifest.yml"
+        self.assertFalse(
+            self.recovery_validator._attempt_stable_reference(
+                source_workflow,
+                "octo/z-recovery-policy/actions/verify@" + "2" * 40,
+                invalid_action,
+            )
+        )
+
+        for suffix in ("yml", "yaml"):
+            local_workflow = {
+                "repository": source_workflow["repository"],
+                "commit": source_workflow["commit"],
+                "path": f".github/workflows/local.{suffix}",
+                "blob_sha256": "b" * 64,
+                "kind": "reusable-workflow",
+            }
+            for prefix in ("./", "$/"):
+                reference = f"{prefix}{local_workflow['path']}"
+                with self.subTest(reference=reference):
+                    self.assertTrue(
+                        self.recovery_validator._attempt_stable_reference(
+                            source_workflow, reference, local_workflow
+                        )
+                    )
+        local_workflow = {
+            "repository": source_workflow["repository"],
+            "commit": source_workflow["commit"],
+            "path": ".github/workflows/local.yml",
+            "blob_sha256": "b" * 64,
+            "kind": "reusable-workflow",
+        }
+        for field, value in (
+            ("repository", "octo/different"),
+            ("commit", "3" * 40),
+            ("path", ".github/workflows/different.yml"),
+        ):
+            with self.subTest(local_workflow_mismatch=field):
+                mismatched = copy.deepcopy(local_workflow)
+                mismatched[field] = value
+                self.assertFalse(
+                    self.recovery_validator._attempt_stable_reference(
+                        source_workflow,
+                        "./.github/workflows/local.yml",
+                        mismatched,
+                    )
+                )
+        for bad_path in (
+            "scripts/not-a-workflow.yml",
+            ".github/workflows/nested/workflow.yml",
+            ".github/workflows/not-a-workflow.txt",
+        ):
+            bad_workflow = copy.deepcopy(local_workflow)
+            bad_workflow["path"] = bad_path
+            for reference in (
+                f"{bad_workflow['repository']}/{bad_path}@{bad_workflow['commit']}",
+                f"./{bad_path}",
+                f"$/{bad_path}",
+            ):
+                with self.subTest(bad_reusable_path=bad_path, reference=reference):
+                    self.assertFalse(
+                        self.recovery_validator._attempt_stable_reference(
+                            source_workflow, reference, bad_workflow
+                        )
+                    )
+        target_script = {
+            "repository": target_action["repository"],
+            "commit": target_action["commit"],
+            "path": "scripts/verify.sh",
+            "blob_sha256": "c" * 64,
+            "kind": "script",
+        }
+        self.assertFalse(
+            self.recovery_validator._attempt_stable_reference(
+                target_action, "../../scripts/verify.sh", target_script
+            )
+        )
+
+        def local_reusable_validator(
+            reference_prefix: str,
+            *,
+            job_commit: str = "2" * 40,
+            job_path: str = ".github/workflows/reconcile.yml",
+            duplicate_inbound: bool = False,
+        ) -> tuple[_RecoveryContractValidator, dict[str, object]]:
+            producer = copy.deepcopy(self.producer_receipt)
+            contract = copy.deepcopy(self.recovery_contract)
+            root_entry = copy.deepcopy(producer["workflow_ref_identity"]["entry"])
+            old_job_entry = copy.deepcopy(
+                producer["job_workflow_ref_identity"]["entry"]
+            )
+            local_job_entry = copy.deepcopy(old_job_entry)
+            local_job_entry.update(
+                repository=root_entry["repository"],
+                commit=job_commit,
+                path=job_path,
+            )
+            producer["implementation_closure"] = [
+                (
+                    copy.deepcopy(local_job_entry)
+                    if entry == old_job_entry
+                    else copy.deepcopy(entry)
+                )
+                for entry in producer["implementation_closure"]
+            ]
+            producer["implementation_closure"].sort(
+                key=lambda entry: (
+                    entry["repository"],
+                    entry["commit"],
+                    entry["path"],
+                    entry["kind"],
+                    entry["blob_sha256"],
+                )
+            )
+            producer["job_workflow_ref_identity"].update(
+                repository=local_job_entry["repository"],
+                path=local_job_entry["path"],
+                ref=producer["run_ref"],
+                resolved_commit=local_job_entry["commit"],
+                entry=copy.deepcopy(local_job_entry),
+                entry_sha256=_canonical_sha256(local_job_entry),
+            )
+            producer["job_workflow_ref"] = (
+                f"{local_job_entry['repository']}/{local_job_entry['path']}@"
+                f"{producer['run_ref']}"
+            )
+            producer["implementation_closure_sha256"] = _canonical_sha256(
+                producer["implementation_closure"]
+            )
+            producer["receipt_sha256"] = _receipt_sha256(producer)
+            contract["implementation_receipt_identity"]["receipt_sha256"] = producer[
+                "receipt_sha256"
+            ]
+
+            resolution = contract["dependency_edge_resolution_receipt"]
+            local_reference = f"{reference_prefix}.github/workflows/reconcile.yml"
+            for record in resolution["records"]:
+                if record["source_entry"] == old_job_entry:
+                    record["source_entry"] = copy.deepcopy(local_job_entry)
+                    record["source_sha256"] = local_job_entry["blob_sha256"]
+                for dependency in record["discovered_references"]:
+                    if dependency["target_entry"] == old_job_entry:
+                        dependency["target_entry"] = copy.deepcopy(local_job_entry)
+                        dependency["reference"] = local_reference
+                record["record_sha256"] = _canonical_sha256(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "record_sha256"
+                    }
+                )
+            if duplicate_inbound:
+                job_record = next(
+                    record
+                    for record in resolution["records"]
+                    if record["source_entry"] == local_job_entry
+                )
+                job_record["discovered_references"].append(
+                    {
+                        "reference": f"$/{local_job_entry['path']}",
+                        "target_entry": copy.deepcopy(local_job_entry),
+                    }
+                )
+                job_record["discovered_references"].sort(
+                    key=lambda item: (
+                        item["reference"],
+                        item["target_entry"]["repository"],
+                        item["target_entry"]["commit"],
+                        item["target_entry"]["path"],
+                        item["target_entry"]["kind"],
+                        item["target_entry"]["blob_sha256"],
+                    )
+                )
+                job_record["discovered_reference_count"] = len(
+                    job_record["discovered_references"]
+                )
+                job_record["record_sha256"] = _canonical_sha256(
+                    {
+                        key: value
+                        for key, value in job_record.items()
+                        if key != "record_sha256"
+                    }
+                )
+            resolution["records"].sort(
+                key=lambda record: (
+                    record["source_entry"]["repository"],
+                    record["source_entry"]["commit"],
+                    record["source_entry"]["path"],
+                    record["source_entry"]["kind"],
+                    record["source_entry"]["blob_sha256"],
+                )
+            )
+            resolution["implementation_receipt_sha256"] = producer["receipt_sha256"]
+            resolution["records_sha256"] = _canonical_sha256(resolution["records"])
+            for edge in resolution["edges"]:
+                if edge["source_entry"] == old_job_entry:
+                    edge["source_entry"] = copy.deepcopy(local_job_entry)
+                if edge["target_entry"] == old_job_entry:
+                    edge["target_entry"] = copy.deepcopy(local_job_entry)
+                    edge["reference"] = local_reference
+            if duplicate_inbound:
+                resolution["edges"].append(
+                    {
+                        "source_entry": copy.deepcopy(local_job_entry),
+                        "reference": f"$/{local_job_entry['path']}",
+                        "target_entry": copy.deepcopy(local_job_entry),
+                    }
+                )
+            resolution["edges"].sort(
+                key=lambda edge: (
+                    edge["source_entry"]["repository"],
+                    edge["source_entry"]["commit"],
+                    edge["source_entry"]["path"],
+                    edge["source_entry"]["kind"],
+                    edge["source_entry"]["blob_sha256"],
+                    edge["reference"],
+                    edge["target_entry"]["repository"],
+                    edge["target_entry"]["commit"],
+                    edge["target_entry"]["path"],
+                    edge["target_entry"]["kind"],
+                    edge["target_entry"]["blob_sha256"],
+                )
+            )
+            resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            before = contract["pre_mutation_run_observation"]
+            before["job_workflow_ref"] = producer["job_workflow_ref"]
+            before["receipt_sha256"] = _receipt_sha256(before)
+            contract["preflight_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in contract.items()
+                    if key != "preflight_sha256"
+                }
+            )
+            validator = _RecoveryContractValidator(
+                self.recovery_schema,
+                producer,
+                self.carriers["required_report_schema"]["parent_input_profiles"][
+                    "merge_status_producer_implementation_receipt"
+                ],
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                resolution["resolver_anchor"],
+                before,
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+            return validator, contract
+
+        for reference_prefix in ("./", "$/"):
+            with self.subTest(local_reusable_full_contract=reference_prefix):
+                validator, contract = local_reusable_validator(reference_prefix)
+                self.assertTrue(validator.validate_preflight(contract))
+        for mismatch, kwargs in (
+            ("commit", {"job_commit": "3" * 40}),
+            ("path", {"job_path": ".github/workflows/different.yml"}),
+        ):
+            with self.subTest(local_reusable_full_contract_mismatch=mismatch):
+                validator, contract = local_reusable_validator("./", **kwargs)
+                self.assertFalse(validator.validate_preflight(contract))
+        duplicate_validator, duplicate_contract = local_reusable_validator(
+            "./", duplicate_inbound=True
+        )
+        self.assertFalse(duplicate_validator.validate_preflight(duplicate_contract))
+
+        for operation_kind in (
+            "existing-run-rerun-full",
+            "existing-run-rerun-failed-jobs",
+        ):
+            for resolved_ref in (
+                "refs/heads/feature/review",
+                "v2",
+                "${{ github.ref }}",
+                "3" * 40,
+            ):
+                with self.subTest(
+                    operation_kind=operation_kind, resolved_ref=resolved_ref
+                ):
+                    producer = copy.deepcopy(self.producer_receipt)
+                    contract = copy.deepcopy(self.recovery_contract)
+                    contract["operation_intent"]["kind"] = operation_kind
+                    identity = producer["job_workflow_ref_identity"]
+                    identity["ref"] = resolved_ref
+                    producer["job_workflow_ref"] = (
+                        f"{identity['repository']}/{identity['path']}@{resolved_ref}"
+                    )
+                    producer["receipt_sha256"] = _receipt_sha256(producer)
+                    contract["implementation_receipt_identity"]["receipt_sha256"] = (
+                        producer["receipt_sha256"]
+                    )
+
+                    resolution = contract["dependency_edge_resolution_receipt"]
+                    resolution["implementation_receipt_sha256"] = producer[
+                        "receipt_sha256"
+                    ]
+                    external_reference = producer["job_workflow_ref"]
+                    resolution["records"][0]["discovered_references"][0][
+                        "reference"
+                    ] = external_reference
+                    resolution["records"][0]["record_sha256"] = _canonical_sha256(
+                        {
+                            key: value
+                            for key, value in resolution["records"][0].items()
+                            if key != "record_sha256"
+                        }
+                    )
+                    resolution["records_sha256"] = _canonical_sha256(
+                        resolution["records"]
+                    )
+                    resolution["edges"][0]["reference"] = external_reference
+                    resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+                    resolution["receipt_sha256"] = _receipt_sha256(resolution)
+
+                    before = contract["pre_mutation_run_observation"]
+                    before["job_workflow_ref"] = external_reference
+                    before["receipt_sha256"] = _receipt_sha256(before)
+                    contract["repeat_safety"]["operation_identity_sha256"] = (
+                        _canonical_sha256(contract["operation_intent"])
+                    )
+                    contract["preflight_sha256"] = _canonical_sha256(
+                        {
+                            key: value
+                            for key, value in contract.items()
+                            if key != "preflight_sha256"
+                        }
+                    )
+                    validator = _RecoveryContractValidator(
+                        self.recovery_schema,
+                        producer,
+                        self.carriers["required_report_schema"][
+                            "parent_input_profiles"
+                        ]["merge_status_producer_implementation_receipt"],
+                        self.platform_observation,
+                        self.dispatch_delivery_receipt,
+                        self.dispatch_delivery_receipt["receipt_sha256"],
+                        resolution,
+                        resolution["resolver_anchor"],
+                        before,
+                        self.post_current_observation,
+                        self.acquisition_transaction,
+                    )
+                    self.assertFalse(validator.validate_preflight(contract))
+
+        for operation_kind in (
+            "existing-run-rerun-full",
+            "existing-run-rerun-failed-jobs",
+        ):
+            with self.subTest(operation_kind=operation_kind, mismatch="job-edge"):
+                producer = copy.deepcopy(self.producer_receipt)
+                contract = copy.deepcopy(self.recovery_contract)
+                contract["operation_intent"]["kind"] = operation_kind
+                identity = producer["job_workflow_ref_identity"]
+                identity["ref"] = "refs/heads/main"
+                producer["job_workflow_ref"] = (
+                    f"{identity['repository']}/{identity['path']}@{identity['ref']}"
+                )
+                producer["receipt_sha256"] = _receipt_sha256(producer)
+                contract["implementation_receipt_identity"]["receipt_sha256"] = (
+                    producer["receipt_sha256"]
+                )
+                resolution = contract["dependency_edge_resolution_receipt"]
+                resolution["implementation_receipt_sha256"] = producer["receipt_sha256"]
+                resolution["receipt_sha256"] = _receipt_sha256(resolution)
+                before = contract["pre_mutation_run_observation"]
+                before["job_workflow_ref"] = producer["job_workflow_ref"]
+                before["receipt_sha256"] = _receipt_sha256(before)
+                contract["repeat_safety"]["operation_identity_sha256"] = (
+                    _canonical_sha256(contract["operation_intent"])
+                )
+                contract["preflight_sha256"] = _canonical_sha256(
+                    {
+                        key: value
+                        for key, value in contract.items()
+                        if key != "preflight_sha256"
+                    }
+                )
+                validator = _RecoveryContractValidator(
+                    self.recovery_schema,
+                    producer,
+                    self.carriers["required_report_schema"]["parent_input_profiles"][
+                        "merge_status_producer_implementation_receipt"
+                    ],
+                    self.platform_observation,
+                    self.dispatch_delivery_receipt,
+                    self.dispatch_delivery_receipt["receipt_sha256"],
+                    resolution,
+                    resolution["resolver_anchor"],
+                    before,
+                    self.post_current_observation,
+                    self.acquisition_transaction,
+                )
+                self.assertFalse(validator.validate_preflight(contract))
+
+    def test_recovery_rfc8785_inputs_use_the_safe_integer_domain(self) -> None:
+        self.assertEqual(
+            _repository_identity("OcTo/Review-Fixture"),
+            "octo/review-fixture",
+        )
+        for malformed_repository in (
+            "Öcto/review-fixture",
+            "octo/仓库",
+            "owner/",
+            "/repo",
+            "owner/..",
+            "owner/re po",
+            "owner/repo?",
+            "owner/repo#",
+            "owner/repo@",
+            "owner/repo%",
+            "owner/repo\\name",
+            f"owner/{'a' * 101}",
+        ):
+            with self.subTest(malformed_repository=malformed_repository):
+                self.assertIsNone(_repository_identity(malformed_repository))
+
+        self.assertEqual(
+            _canonical_sha256({"id": MAX_SAFE_INTEGER}),
+            hashlib.sha256(f'{{"id":{MAX_SAFE_INTEGER}}}'.encode()).hexdigest(),
+        )
+        for value in (
+            MAX_SAFE_INTEGER + 1,
+            -(MAX_SAFE_INTEGER + 1),
+            {"nested": [9_007_199_254_740_993]},
+            {"non-ascii-key-\N{SNOWMAN}": 1},
+            "\ud800",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _canonical_sha256(value)
+
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        with self.assertRaises(ValueError):
+            _canonical_sha256(cyclic)
+
+        def nested_lists(depth: int) -> list[object]:
+            root: list[object] = []
+            cursor = root
+            for _ in range(depth - 1):
+                child: list[object] = []
+                cursor.append(child)
+                cursor = child
+            return root
+
+        at_depth_limit = nested_lists(MAX_CANONICAL_JSON_DEPTH)
+        _canonical_sha256(at_depth_limit)
+        deep = nested_lists(MAX_CANONICAL_JSON_DEPTH + 1)
+        with self.assertRaises(ValueError):
+            _canonical_sha256(deep)
+
+        at_node_limit = [None] * (MAX_CANONICAL_JSON_NODES - 1)
+        _require_rfc8785_integer_domain(at_node_limit)
+        over_node_limit = [None] * MAX_CANONICAL_JSON_NODES
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(over_node_limit)
+        overwide_object = {
+            f"key-{index}": None for index in range(MAX_CANONICAL_JSON_NODES)
+        }
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(overwide_object)
+
+        boundary_string = "a" * MAX_CANONICAL_JSON_STRING_UTF8_BYTES
+        _require_rfc8785_integer_domain(boundary_string)
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain(boundary_string + "a")
+        aggregate_chunks = (
+            MAX_CANONICAL_JSON_AGGREGATE_UTF8_BYTES
+            // MAX_CANONICAL_JSON_STRING_UTF8_BYTES
+        )
+        aggregate_boundary = [boundary_string] * (aggregate_chunks - 1) + [
+            {boundary_string: None}
+        ]
+        _require_rfc8785_integer_domain(aggregate_boundary)
+        with self.assertRaises(ValueError):
+            _require_rfc8785_integer_domain([*aggregate_boundary, "a"])
+
+        constructor_validator = _RecoveryContractValidator(
+            self.recovery_schema,
+            deep,
+            self.carriers["required_report_schema"]["parent_input_profiles"][
+                "merge_status_producer_implementation_receipt"
+            ],
+            self.platform_observation,
+            self.dispatch_delivery_receipt,
+            self.dispatch_delivery_receipt["receipt_sha256"],
+            self.recovery_contract["dependency_edge_resolution_receipt"],
+            self.recovery_contract["dependency_edge_resolution_receipt"][
+                "resolver_anchor"
+            ],
+            self.recovery_contract["pre_mutation_run_observation"],
+            self.post_current_observation,
+            self.acquisition_transaction,
+        )
+        self.assertFalse(
+            constructor_validator.validate_preflight(self.recovery_contract)
+        )
+        oversized_constructor_validator = _RecoveryContractValidator(
+            self.recovery_schema,
+            boundary_string + "a",
+            self.carriers["required_report_schema"]["parent_input_profiles"][
+                "merge_status_producer_implementation_receipt"
+            ],
+            self.platform_observation,
+            self.dispatch_delivery_receipt,
+            self.dispatch_delivery_receipt["receipt_sha256"],
+            self.recovery_contract["dependency_edge_resolution_receipt"],
+            self.recovery_contract["dependency_edge_resolution_receipt"][
+                "resolver_anchor"
+            ],
+            self.recovery_contract["pre_mutation_run_observation"],
+            self.post_current_observation,
+            self.acquisition_transaction,
+        )
+        self.assertFalse(
+            oversized_constructor_validator.validate_preflight(self.recovery_contract)
+        )
+
+        unsafe_contract = copy.deepcopy(self.recovery_contract)
+        unsafe_contract["operation_intent"]["run_id"] = 9_007_199_254_740_993
+        self.assertFalse(self.recovery_validator.validate_preflight(unsafe_contract))
+
+        surrogate_contract = copy.deepcopy(self.recovery_contract)
+        surrogate_contract["operation_intent"]["kind"] = "\ud800"
+        self.assertFalse(self.recovery_validator.validate_preflight(surrogate_contract))
+        malformed_shape = copy.deepcopy(self.recovery_contract)
+        malformed_shape["operation_intent"]["kind"] = []
+        self.assertFalse(self.recovery_validator.validate_preflight(malformed_shape))
+        self.assertFalse(self.recovery_validator.validate_preflight(cyclic))
+        self.assertFalse(self.recovery_validator.validate_preflight(deep))
+
+        overflow_attempt = copy.deepcopy(self.recovery_contract)
+        overflow_attempt["operation_intent"]["pre_run_attempt"] = MAX_SAFE_INTEGER
+        overflow_attempt["operation_intent"]["expected_run_attempt"] = (
+            MAX_SAFE_INTEGER + 1
+        )
+        self.assertFalse(self.recovery_validator.validate_preflight(overflow_attempt))
+
+        unsafe_completion = copy.deepcopy(self.completion_receipt)
+        unsafe_completion["returned_run_id"] = 9_007_199_254_740_993
+        self.assertFalse(
+            self.recovery_validator.validate_completion(
+                unsafe_completion, self.recovery_contract
+            )
+        )
+        self.assertFalse(
+            self.recovery_validator.validate_completion(cyclic, self.recovery_contract)
+        )
+
+    def test_recovery_refs_and_endpoints_preserve_non_repository_bytes(self) -> None:
+        def validate_before(**updates: str) -> bool:
+            contract = copy.deepcopy(self.recovery_contract)
+            before = contract["pre_mutation_run_observation"]
+            before.update(updates)
+            before["receipt_sha256"] = _receipt_sha256(before)
+            contract["preflight_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in contract.items()
+                    if key != "preflight_sha256"
+                }
+            )
+            validator = _RecoveryContractValidator(
+                self.recovery_schema,
+                self.producer_receipt,
+                self.carriers["required_report_schema"]["parent_input_profiles"][
+                    "merge_status_producer_implementation_receipt"
+                ],
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                contract["dependency_edge_resolution_receipt"],
+                contract["dependency_edge_resolution_receipt"]["resolver_anchor"],
+                before,
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+            return validator.validate_preflight(contract)
+
+        workflow_ref = self.producer_receipt["workflow_ref"]
+        mixed_case_ref = workflow_ref.replace(
+            "octo/review-fixture", "OcTo/Review-Fixture", 1
+        )
+        self.assertTrue(validate_before(workflow_ref=mixed_case_ref))
+        for name, updates in (
+            ("ref-trailing-tab", {"workflow_ref": workflow_ref + "\t"}),
+            ("ref-empty-query", {"workflow_ref": workflow_ref + "?"}),
+            (
+                "endpoint-trailing-tab",
+                {
+                    "query_endpoint": (
+                        self.recovery_contract["pre_mutation_run_observation"][
+                            "query_endpoint"
+                        ]
+                        + "\t"
+                    )
+                },
+            ),
+            (
+                "endpoint-empty-query",
+                {
+                    "query_endpoint": (
+                        self.recovery_contract["pre_mutation_run_observation"][
+                            "query_endpoint"
+                        ]
+                        + "?"
+                    )
+                },
+            ),
+        ):
+            with self.subTest(malformed_recovery_value=name):
+                self.assertFalse(validate_before(**updates))
 
     def test_existing_rerun_modes_repository_and_attempt_chain(self) -> None:
         def rebuild_contract(contract: dict[str, object]) -> None:
@@ -1760,6 +2985,12 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             "cross-mode-endpoint": lambda value: value.update(
                 request_endpoint="/repos/octo/review-fixture/actions/runs/801/rerun"
             ),
+            "endpoint-trailing-tab": lambda value: value.update(
+                request_endpoint=value["request_endpoint"] + "\t"
+            ),
+            "endpoint-empty-query": lambda value: value.update(
+                request_endpoint=value["request_endpoint"] + "?"
+            ),
             "wrong-status": lambda value: value.update(response_status=200),
             "body-present": lambda value: value.update(
                 request_body={},
@@ -1838,6 +3069,17 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                     "https://api.github.com/repos/octo/review-fixture/actions/"
                     "runs/801/attempts/9"
                 )
+            ),
+            "previous-uppercase-scheme": lambda run: run.update(
+                previous_attempt_url=run["previous_attempt_url"].replace(
+                    "https://", "HTTPS://", 1
+                )
+            ),
+            "previous-empty-query": lambda run: run.update(
+                previous_attempt_url=run["previous_attempt_url"] + "?"
+            ),
+            "previous-trailing-tab": lambda run: run.update(
+                previous_attempt_url=run["previous_attempt_url"] + "\t"
             ),
         }.items():
             with self.subTest(observation=name):
@@ -2327,13 +3569,13 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             self.producer_receipt["job_workflow_ref_identity"]["entry"]["kind"],
             "reusable-workflow",
         )
-        self.assertTrue(
-            {"action", "script"}
-            <= {
+        self.assertIn(
+            "action",
+            {
                 entry["kind"]
                 for entry in self.producer_receipt["implementation_closure"]
                 if entry["repository"] != self.recovery_contract["repository"]
-            }
+            },
         )
 
         for root_kind in ("action", "script"):
@@ -2405,6 +3647,157 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         validator = rebuild(producer, contract)
         self.assertFalse(validator.validate_preflight(contract))
 
+        def add_action_target(
+            new_action_entry: dict[str, object], reference: str
+        ) -> tuple[_RecoveryContractValidator, dict[str, object]]:
+            producer = copy.deepcopy(self.producer_receipt)
+            contract = copy.deepcopy(self.recovery_contract)
+            original_action = next(
+                entry
+                for entry in producer["implementation_closure"]
+                if entry["kind"] == "action"
+            )
+            producer["implementation_closure"].append(copy.deepcopy(new_action_entry))
+            producer["implementation_closure"].sort(
+                key=lambda entry: (
+                    entry["repository"],
+                    entry["commit"],
+                    entry["path"],
+                    entry["kind"],
+                    entry["blob_sha256"],
+                )
+            )
+            producer["implementation_closure_count"] = len(
+                producer["implementation_closure"]
+            )
+
+            resolution = contract["dependency_edge_resolution_receipt"]
+            original_record = next(
+                record
+                for record in resolution["records"]
+                if record["source_entry"] == original_action
+            )
+            new_record = copy.deepcopy(original_record)
+            new_record["source_entry"] = copy.deepcopy(new_action_entry)
+            new_record["source_sha256"] = new_action_entry["blob_sha256"]
+            new_record["record_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in new_record.items()
+                    if key != "record_sha256"
+                }
+            )
+            resolution["records"].append(new_record)
+            inbound_record = next(
+                record
+                for record in resolution["records"]
+                if any(
+                    dependency["target_entry"] == original_action
+                    for dependency in record["discovered_references"]
+                )
+            )
+            inbound_record["discovered_references"].append(
+                {
+                    "reference": reference,
+                    "target_entry": copy.deepcopy(new_action_entry),
+                }
+            )
+            inbound_record["discovered_references"].sort(
+                key=lambda item: (
+                    item["reference"],
+                    item["target_entry"]["repository"],
+                    item["target_entry"]["commit"],
+                    item["target_entry"]["path"],
+                    item["target_entry"]["kind"],
+                    item["target_entry"]["blob_sha256"],
+                )
+            )
+            inbound_record["discovered_reference_count"] = len(
+                inbound_record["discovered_references"]
+            )
+            inbound_record["record_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in inbound_record.items()
+                    if key != "record_sha256"
+                }
+            )
+            resolution["records"].sort(
+                key=lambda record: (
+                    record["source_entry"]["repository"],
+                    record["source_entry"]["commit"],
+                    record["source_entry"]["path"],
+                    record["source_entry"]["kind"],
+                    record["source_entry"]["blob_sha256"],
+                )
+            )
+            resolution["record_count"] = len(resolution["records"])
+            resolution["records_sha256"] = _canonical_sha256(resolution["records"])
+            resolution["edges"].append(
+                {
+                    "source_entry": copy.deepcopy(inbound_record["source_entry"]),
+                    "reference": reference,
+                    "target_entry": copy.deepcopy(new_action_entry),
+                }
+            )
+            resolution["edges"].sort(
+                key=lambda edge: (
+                    edge["source_entry"]["repository"],
+                    edge["source_entry"]["commit"],
+                    edge["source_entry"]["path"],
+                    edge["source_entry"]["kind"],
+                    edge["source_entry"]["blob_sha256"],
+                    edge["reference"],
+                    edge["target_entry"]["repository"],
+                    edge["target_entry"]["commit"],
+                    edge["target_entry"]["path"],
+                    edge["target_entry"]["kind"],
+                    edge["target_entry"]["blob_sha256"],
+                )
+            )
+            resolution["edge_count"] = len(resolution["edges"])
+            resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+            return rebuild(producer, contract), contract
+
+        baseline_action = next(
+            entry
+            for entry in self.producer_receipt["implementation_closure"]
+            if entry["kind"] == "action"
+        )
+        independent_action = {
+            **copy.deepcopy(baseline_action),
+            "path": "actions/other/action.yaml",
+            "blob_sha256": "b" * 64,
+        }
+        independent_validator, independent_contract = add_action_target(
+            independent_action,
+            f"{independent_action['repository']}/actions/other@"
+            f"{independent_action['commit']}",
+        )
+        self.assertTrue(independent_validator.validate_preflight(independent_contract))
+
+        for name, new_action, reference in (
+            (
+                "same-path-different-blob",
+                {**copy.deepcopy(baseline_action), "blob_sha256": "a" * 64},
+                f"{baseline_action['repository']}/actions/verify@"
+                f"{baseline_action['commit']}",
+            ),
+            (
+                "same-directory-alternate-manifest",
+                {
+                    **copy.deepcopy(baseline_action),
+                    "path": "actions/verify/action.yaml",
+                    "blob_sha256": "c" * 64,
+                },
+                f"{baseline_action['repository']}/actions/verify@"
+                f"{baseline_action['commit']}",
+            ),
+        ):
+            with self.subTest(action_selector_ambiguity=name):
+                validator, attacked_contract = add_action_target(new_action, reference)
+                self.assertFalse(validator.validate_preflight(attacked_contract))
+
         for name, mutate in {
             "invalid-kind": lambda entry: entry.update(kind="local-action"),
             "unsafe-path": lambda entry: entry.update(path="actions/../action.yml"),
@@ -2458,8 +3851,8 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 producer = copy.deepcopy(self.producer_receipt)
                 contract = copy.deepcopy(self.recovery_contract)
                 mutate(producer)
-                validator = rebuild(producer, contract)
-                self.assertFalse(validator.validate_preflight(contract))
+                with self.assertRaises(ValueError):
+                    rebuild(producer, contract)
 
         for name, mutate in {
             "malformed-nested-entry": lambda producer: producer[
@@ -2475,6 +3868,260 @@ class GitHubRecoveryContractTest(unittest.TestCase):
                 mutate(producer)
                 validator = rebuild(producer, contract)
                 self.assertFalse(validator.validate_preflight(contract))
+
+    def test_recovery_repository_identity_is_case_insensitive(self) -> None:
+        producer_fields = self.carriers["required_report_schema"][
+            "parent_input_profiles"
+        ]["merge_status_producer_implementation_receipt"]
+
+        def validator_for(
+            contract: dict[str, object],
+            producer: dict[str, object] | None = None,
+        ) -> _RecoveryContractValidator:
+            selected_producer = producer or self.producer_receipt
+            resolution = contract["dependency_edge_resolution_receipt"]
+            return _RecoveryContractValidator(
+                self.recovery_schema,
+                selected_producer,
+                producer_fields,
+                self.platform_observation,
+                self.dispatch_delivery_receipt,
+                self.dispatch_delivery_receipt["receipt_sha256"],
+                resolution,
+                resolution["resolver_anchor"],
+                contract["pre_mutation_run_observation"],
+                self.post_current_observation,
+                self.acquisition_transaction,
+            )
+
+        def rehash_resolution(contract: dict[str, object]) -> None:
+            resolution = contract["dependency_edge_resolution_receipt"]
+            for record in resolution["records"]:
+                record["record_sha256"] = _canonical_sha256(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key != "record_sha256"
+                    }
+                )
+            resolution["record_count"] = len(resolution["records"])
+            resolution["records_sha256"] = _canonical_sha256(resolution["records"])
+            resolution["edge_count"] = len(resolution["edges"])
+            resolution["edges_sha256"] = _canonical_sha256(resolution["edges"])
+            resolution["resolver_anchor"]["receipt_sha256"] = _receipt_sha256(
+                resolution["resolver_anchor"]
+            )
+            resolution["receipt_sha256"] = _receipt_sha256(resolution)
+            contract["preflight_sha256"] = _canonical_sha256(
+                {
+                    key: value
+                    for key, value in contract.items()
+                    if key != "preflight_sha256"
+                }
+            )
+
+        mixed_case_contract = copy.deepcopy(self.recovery_contract)
+        mixed_resolution = mixed_case_contract["dependency_edge_resolution_receipt"]
+        for record in mixed_resolution["records"]:
+            for dependency in record["discovered_references"]:
+                owner, repository, suffix = dependency["reference"].split("/", 2)
+                dependency["reference"] = (
+                    f"{owner.upper()}/{repository.upper()}/{suffix}"
+                )
+        for edge in mixed_resolution["edges"]:
+            owner, repository, suffix = edge["reference"].split("/", 2)
+            edge["reference"] = f"{owner.upper()}/{repository.upper()}/{suffix}"
+        rehash_resolution(mixed_case_contract)
+        self.assertTrue(
+            validator_for(mixed_case_contract).validate_preflight(mixed_case_contract)
+        )
+
+        candidate_alias_contract = copy.deepcopy(self.recovery_contract)
+        source = candidate_alias_contract["source_descriptor"]
+        source.update(
+            source_repository=candidate_alias_contract["repository"].upper(),
+            source_commit="d" * 40,
+        )
+        source_anchor = candidate_alias_contract["source_trust_anchor"]
+        source_anchor["identity"] = (
+            f"{source['source_repository']}@{source['source_commit']}:"
+            f"{source['source_path']}"
+        )
+        exclusion = candidate_alias_contract["candidate_range_exclusion_receipt"]
+        exclusion["source"] = copy.deepcopy(source)
+        alias_resolution = candidate_alias_contract[
+            "dependency_edge_resolution_receipt"
+        ]
+        alias_resolution["resolver_anchor"]["candidate_range_exclusion_sha256"] = (
+            _canonical_sha256(exclusion)
+        )
+        rehash_resolution(candidate_alias_contract)
+        self.assertFalse(
+            validator_for(candidate_alias_contract).validate_preflight(
+                candidate_alias_contract
+            )
+        )
+
+        for malformed_repository in ("Öcto/review-fixture", "owner/repo?"):
+            with self.subTest(malformed_external_source=malformed_repository):
+                malformed_contract = copy.deepcopy(self.recovery_contract)
+                malformed_source = malformed_contract["source_descriptor"]
+                malformed_source["source_repository"] = malformed_repository
+                malformed_anchor = malformed_contract["source_trust_anchor"]
+                malformed_anchor["identity"] = (
+                    f"{malformed_source['source_repository']}@"
+                    f"{malformed_source['source_commit']}:"
+                    f"{malformed_source['source_path']}"
+                )
+                malformed_exclusion = malformed_contract[
+                    "candidate_range_exclusion_receipt"
+                ]
+                malformed_exclusion["source"] = copy.deepcopy(malformed_source)
+                malformed_resolution = malformed_contract[
+                    "dependency_edge_resolution_receipt"
+                ]
+                malformed_resolution["resolver_anchor"][
+                    "candidate_range_exclusion_sha256"
+                ] = _canonical_sha256(malformed_exclusion)
+                rehash_resolution(malformed_contract)
+                self.assertFalse(
+                    validator_for(malformed_contract).validate_preflight(
+                        malformed_contract
+                    )
+                )
+
+            with self.subTest(malformed_external_resolver=malformed_repository):
+                malformed_contract = copy.deepcopy(self.recovery_contract)
+                malformed_resolution = malformed_contract[
+                    "dependency_edge_resolution_receipt"
+                ]
+                malformed_resolution["resolver_anchor"]["repository"] = (
+                    malformed_repository
+                )
+                rehash_resolution(malformed_contract)
+                self.assertFalse(
+                    validator_for(malformed_contract).validate_preflight(
+                        malformed_contract
+                    )
+                )
+
+        for unsafe_resolver_path in (".", "resolvers/resolve\0.py"):
+            with self.subTest(unsafe_resolver_path=unsafe_resolver_path):
+                unsafe_contract = copy.deepcopy(self.recovery_contract)
+                unsafe_resolution = unsafe_contract[
+                    "dependency_edge_resolution_receipt"
+                ]
+                unsafe_resolution["resolver_anchor"]["path"] = unsafe_resolver_path
+                rehash_resolution(unsafe_contract)
+                self.assertFalse(
+                    validator_for(unsafe_contract).validate_preflight(unsafe_contract)
+                )
+
+        duplicate_producer = copy.deepcopy(self.producer_receipt)
+        duplicate_contract = copy.deepcopy(self.recovery_contract)
+        original_action = next(
+            entry
+            for entry in duplicate_producer["implementation_closure"]
+            if entry["kind"] == "action"
+        )
+        alias_action = copy.deepcopy(original_action)
+        alias_action["repository"] = alias_action["repository"].replace(
+            "z-recovery-policy", "z-RECOVERY-POLICY"
+        )
+        duplicate_producer["implementation_closure"].append(alias_action)
+        duplicate_producer["implementation_closure"].sort(
+            key=lambda entry: (
+                _repository_identity(entry["repository"]),
+                entry["repository"],
+                entry["commit"],
+                entry["path"],
+                entry["kind"],
+                entry["blob_sha256"],
+            )
+        )
+        duplicate_producer["implementation_closure_count"] = len(
+            duplicate_producer["implementation_closure"]
+        )
+        duplicate_producer["implementation_closure_sha256"] = _canonical_sha256(
+            duplicate_producer["implementation_closure"]
+        )
+        duplicate_producer["receipt_sha256"] = _receipt_sha256(duplicate_producer)
+        duplicate_contract["implementation_receipt_identity"]["receipt_sha256"] = (
+            duplicate_producer["receipt_sha256"]
+        )
+        duplicate_resolution = duplicate_contract["dependency_edge_resolution_receipt"]
+        duplicate_resolution["implementation_receipt_sha256"] = duplicate_producer[
+            "receipt_sha256"
+        ]
+        alias_record = {
+            "source_entry": copy.deepcopy(alias_action),
+            "parser_profile": "github-actions-dependency-resolver-v1",
+            "source_sha256": alias_action["blob_sha256"],
+            "discovered_references": [],
+            "discovered_reference_count": 0,
+            "record_sha256": "",
+        }
+        duplicate_resolution["records"].append(alias_record)
+        inbound_record = next(
+            record
+            for record in duplicate_resolution["records"]
+            if any(
+                dependency["target_entry"] == original_action
+                for dependency in record["discovered_references"]
+            )
+        )
+        alias_reference = {
+            "reference": (
+                f"{alias_action['repository']}/actions/verify@{alias_action['commit']}"
+            ),
+            "target_entry": copy.deepcopy(alias_action),
+        }
+        inbound_record["discovered_references"].append(alias_reference)
+        inbound_record["discovered_references"].sort(
+            key=lambda item: (item["reference"],)
+        )
+        inbound_record["discovered_reference_count"] = len(
+            inbound_record["discovered_references"]
+        )
+        duplicate_resolution["records"].sort(
+            key=lambda record: (
+                _repository_identity(record["source_entry"]["repository"]),
+                record["source_entry"]["repository"],
+                record["source_entry"]["commit"],
+                record["source_entry"]["path"],
+                record["source_entry"]["kind"],
+                record["source_entry"]["blob_sha256"],
+            )
+        )
+        duplicate_resolution["edges"].append(
+            {
+                "source_entry": copy.deepcopy(inbound_record["source_entry"]),
+                **copy.deepcopy(alias_reference),
+            }
+        )
+        duplicate_resolution["edges"].sort(
+            key=lambda edge: (
+                _repository_identity(edge["source_entry"]["repository"]),
+                edge["source_entry"]["repository"],
+                edge["source_entry"]["commit"],
+                edge["source_entry"]["path"],
+                edge["source_entry"]["kind"],
+                edge["source_entry"]["blob_sha256"],
+                edge["reference"],
+                _repository_identity(edge["target_entry"]["repository"]),
+                edge["target_entry"]["repository"],
+                edge["target_entry"]["commit"],
+                edge["target_entry"]["path"],
+                edge["target_entry"]["kind"],
+                edge["target_entry"]["blob_sha256"],
+            )
+        )
+        rehash_resolution(duplicate_contract)
+        self.assertFalse(
+            validator_for(duplicate_contract, duplicate_producer).validate_preflight(
+                duplicate_contract
+            )
+        )
 
     def test_actions_repeat_requires_external_repeat_safety_contract_and_authorization(
         self,

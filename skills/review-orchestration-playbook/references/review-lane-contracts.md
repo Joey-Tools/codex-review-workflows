@@ -634,6 +634,25 @@ Read [canonical-claude-lane.md](canonical-claude-lane.md).
 Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) before producer or consumer work.
 
 - The lane is current-head and PR-scoped.
+- Every repository field is a valid ASCII `owner/name`. Semantic repository
+  joins compare its two components case-insensitively, including same-repo
+  decisions, closure/reachability keys, selector repository segments,
+  candidate exclusion, action-directory uniqueness, and repository-scoped
+  URL/ref joins. Preserve the original spelling in raw and digest-bound records;
+  paths, SHAs, refs, and URL suffix/query/fragment fields remain exact. This
+  implements GitHub's case-insensitive owner/repo identity without following
+  Actions/reusable-workflow renames or claiming an immutable repository ID.
+- GitHub web/API URLs must be raw ASCII without C0/space/DEL, use the exact
+  lowercase `https://github.com/` or `https://api.github.com/` field prefix,
+  and parse/recompose byte-for-byte. Only `owner/name` is case-insensitive;
+  every suffix and delimiter remains exact. Safe canonical repository paths
+  are nonempty relative POSIX paths with at least one component; reject `.`,
+  NUL, backslash, absolute paths, dot components, and noncanonical forms.
+- Every parent/report value covered by canonical JSON is bounded before copy or
+  digest: exact acyclic list/dict containers, 256 container levels, 100,000
+  value nodes, 1 MiB of UTF-8 per string or key, and 16 MiB of aggregate UTF-8
+  for all strings and keys. A code-point count above 1 MiB rejects a string
+  before bounded encoding; malformed and over-limit values are status-only.
 - Base/merge-base coverage is established locally. A feature-head producer
   result does not enlarge that claim; a trusted synthetic-merge producer may
   additionally report only the exact contract-bound current merge scope, which
@@ -655,10 +674,23 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   bytes cannot close that set by assertion: a separate anchored parent-owned
   resolver supplies exact canonical-entry coverage records and a bijective
   full-entry dependency-edge projection, and the stable snapshot binds its
-  independent receipt digest. Candidate
-  implementation bytes, an unbound actual run, or an external App without
-  equivalent provider-authenticated immutable identity makes merge-status
-  unavailable. With zero applicable
+  independent receipt digest. The closed selector union accepts external
+  reusable-workflow selectors only from workflow/reusable-workflow sources and
+  external action selectors only from workflow/reusable-workflow/action
+  sources, with canonical target repository/path plus target full commit SHA;
+  an action selector names its manifest directory or repository root. It also
+  accepts same-repository, same-running-commit reusable-workflow calls via exact
+  `./.github/workflows/...` or `$/.github/workflows/...`, plus `$/` action calls
+  that exactly select the same-commit manifest directory. Other relative local
+  actions and untyped bare action-manifest-to-script refs are status-only. Every
+  entry is root-reachable; the exact root job identity has no inbound edge; and
+  each non-root reusable-workflow job identity has exactly one total inbound
+  edge that semantically matches its external-full-SHA or
+  same-running-commit-local job ref; the external edge reference must equal its
+  canonical raw job identity ref exactly. Candidate implementation bytes or an unbound
+  actual run makes merge-status unavailable. Version 1 also has an empty
+  accepted external-App ID-to-root-to-closure binding profile, so an
+  external-App check uses terminal-clean fallback. With zero applicable
   unresolved findings it passes without a second terminal clean artifact.
   Generic successful checks and service-start markers do not qualify.
 - A trustworthy terminal clean provider comment/review at the latest head plus
@@ -690,7 +722,8 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   declaring repeat safety independently of authorization. Existing-run reruns
   retain and must match their original `GITHUB_SHA`/`GITHUB_REF`; mutation
   attempts stop at the provider or contract cap. The trusted root workflow
-  repository equals the operation and contract repository; a cross-repository
+  repository must have canonical identity equal to the operation and contract
+  repository identity; a cross-repository
   job identity must be a reusable workflow. A new `workflow_dispatch` is
   outside the accepted automatic-recovery union because the API accepts a
   branch/tag ref and documents no atomic expected-SHA or `If-Match`
@@ -715,6 +748,42 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   replay or a possible intervening rerun is status-only. Any later status from
   a manual dispatch is consumed only through an independent ordinary
   producer/status contract.
+  Before either automatic rerun, apply the ordinary merge-status dependency
+  semantics to the complete graph. An external reusable-workflow selector from
+  a workflow or reusable-workflow source must exactly name the target canonical
+  repository/workflow-path, which must be a direct
+  `.github/workflows/*.yml` or `.github/workflows/*.yaml` child rather than a
+  nested path, and end in its lowercase full commit SHA. Each
+  canonical-repository-identity/commit/path identifies one kind and blob, each
+  source-entry/raw-selector pair identifies one target, and each
+  canonical-repository-identity/commit/action-manifest directory identifies at most one action
+  entry; a competing `action.yml` and `action.yaml` pair is status-only. An
+  external action selector from a workflow, reusable-workflow, or action source
+  must exactly name the target canonical repository plus its action-manifest
+  directory—or repository root for a root manifest—and end in its lowercase
+  full commit SHA. A workflow or reusable workflow may instead bind a
+  same-repository, same-running-commit reusable workflow by exact
+  `./.github/workflows/...` or `$/.github/workflows/...`; a `$/` action selector
+  from a workflow, reusable workflow, or action may bind the source repository
+  and running commit to the exact target action-manifest directory.
+  Workflow/reusable-workflow `./` or `../` local actions and all untyped bare
+  action-manifest-to-script relative refs are status-only because version 1
+  cannot close their runtime resolution bases. Every closure entry is reachable
+  from the authenticated root. The root job identity exactly equals the root
+  workflow identity and has no inbound edge. Every non-root job identity is a
+  reusable-workflow entry with exactly one total inbound edge that semantically
+  matches its job ref from a workflow or reusable-workflow source. The external
+  arm requires a full-SHA raw selector and identity ref equal to the resolved
+  commit, and the external edge reference must equal the canonical raw job
+  identity ref exactly. A same-repository local `./` or `$/` arm may retain its
+  platform-authenticated branch-like raw job identity ref only while target and
+  resolved commit equal the source running commit and the unique local edge
+  exactly matches repository and workflow path. Tags, expressions, mismatched
+  repository/commit/path, disconnected entries, and unknown forms remain
+  status-only. Apply the conservative dependency rule to both rerun modes;
+  GitHub's narrower
+  failed-jobs reusable-workflow reuse guarantee does not bind every external
+  action dependency in this version.
   Missing or mismatched proof leaves
   status-only hourly monitoring, which has no time ceiling. Current mutation
   authorization and single-flight remain separate; comment creation is never

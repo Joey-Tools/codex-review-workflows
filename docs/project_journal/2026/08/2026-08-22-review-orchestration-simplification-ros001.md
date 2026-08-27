@@ -2171,6 +2171,135 @@ superseded_by:
   supplies its closed skill-facing evidence contract and test-only reference
   validators without claiming they are the deployed integration.
 
+### Final follow-up review findings after `a1e034a`
+
+- A fresh-context GPT-5.6 Sol Ultra reviewer inspected the complete signed
+  `a439793df9483943991c258e16f4ddf705736643..a1e034a18c7c1deacce42c3fc3dc3f46b50c975a`
+  range in an independently prepared clean workspace. It found three remaining
+  fail-closed gaps; that result is findings-only and does not count as a clean
+  local lane.
+- GitHub documents different dependency behavior for the two accepted rerun
+  modes: a full rerun re-resolves a non-SHA reusable-workflow reference, while
+  a failed-jobs rerun reuses the reusable-workflow commit from the first
+  attempt. Version 1 now applies one conservative rule to both modes because
+  its platform evidence does not prove every external action dependency. Every
+  external reusable-workflow or action selector must name the target closure
+  entry's canonical repository identity, exact workflow path or action-manifest
+  directory, and lowercase full commit SHA. Same-repository reusable workflows
+  may instead use GitHub's `./.github/workflows/...` form or the contract's
+  `$/...` running-commit form when source and target are at the same commit;
+  `$/...` may likewise bind an action-manifest directory from workflow,
+  reusable-workflow, or action content. Branches, tags, expressions, mismatched
+  SHAs, unbound workflow `./`/`../` actions, bare untyped action-to-script
+  paths, and unknown forms are status-only. This closes the coupled
+  receipt-rehash attack without pretending the two GitHub modes behave
+  identically.
+- The external-App merge/status branch is disabled in version 1. A provider
+  implementation ID plus a self-digested closure does not authenticate the
+  provider-owned ID-to-root-to-transitive-closure relation; therefore the
+  accepted external-App binding-profile set is empty and such repositories use
+  ordinary terminal-clean fallback. A future profile must introduce separate
+  provider-authenticated binding and graph-reachability evidence before this
+  branch can become positive.
+- RFC 8785 digests use the closed version-1 numeric profile
+  `-9007199254740991..9007199254740991`, with non-Boolean integers, fixed ASCII
+  keys, and no floating-point values. Public reference validators reject
+  out-of-domain reports and parent inputs before digesting, so distinct JSON
+  integers cannot alias through an IEEE-754 implementation. A future GitHub ID
+  outside that range requires a new grammar carrying the value as a decimal
+  string.
+- The first repaired focused carrier/recovery run passed all 48 tests. The
+  next independent implementation audit then found six stronger boundary
+  cases that those tests did not exercise. GitHub resolves a workflow's
+  `./path/to/action` against the checked-out runner workspace, so matching only
+  the declaring workflow's repository and commit could bind different bytes.
+  Recovery and ordinary merge-status now accept canonical exact-SHA external
+  reusable-workflow and action selectors, map action selectors to the
+  action-manifest directory, accept exact same-commit local reusable-workflow
+  `./` and `$/` edges, and accept an exact same-commit `$/` action edge from a
+  workflow, reusable workflow, or action. They reject unbound workflow-local
+  `./` or `../` action edges and every bare untyped action-manifest-to-script
+  path; a future typed metadata-field and resolution-base schema is required
+  before such script edges can become positive.
+- The same audit showed that an external non-root `job_workflow_ref` could
+  remain branch-like while a different dependency edge claimed an exact SHA.
+  Both contracts now require every closure entry to be reachable from the
+  authenticated root and count all inbound edges to the non-root job identity:
+  exactly one is allowed, its source must be workflow or reusable-workflow
+  content, and it must semantically match the raw job ref. An external edge
+  therefore forces the raw selector to use the resolved full SHA. A
+  same-repository `./` or `$/` reusable-workflow edge may retain the
+  platform-reported branch-like raw job identity because its separately bound
+  resolved commit and target entry equal the source running commit. A root job
+  identity must equal the complete root workflow identity and have no inbound
+  edge.
+- Canonical input validation now rejects lone Unicode surrogate code points,
+  cyclic containers, nesting beyond 256 containers, more than 100,000 JSON
+  value nodes, a string value or object key beyond 1 MiB of UTF-8, aggregate
+  string-plus-key UTF-8 beyond 16 MiB, and invalid JSON-like shapes before
+  canonicalization. A code-point-count precheck rejects an already over-limit
+  string before bounded UTF-8 encoding, followed by the exact encoded-byte
+  check. The
+  iterator-frame walk rejects an over-wide list or object before allocating a
+  child-frame fan-out, and parent inputs are bounded before defensive copying.
+  All four public reference entrypoints and their constructor boundary map
+  malformed Python objects to `malformed` or false rather than leaking
+  `UnicodeEncodeError`, `RecursionError`, or `TypeError`.
+- The next fresh-context audit found two remaining coupled-selector ambiguity
+  families. A closure could carry the same repository/commit/path with a
+  different kind or blob, and one action directory could carry both
+  `action.yml` and `action.yaml` while the same raw selector named either one.
+  The closed grammar now requires direct `.github/workflows/*.yml` or
+  `.github/workflows/*.yaml` targets, one kind/blob per canonical repository
+  identity/commit/path, one target per source-entry/raw-selector identity, and
+  at most one action-manifest entry per canonical repository
+  identity/commit/directory. Both
+  ordinary merge-status and recovery apply those constraints before selector
+  resolution; targeted terminal and recovery regressions cover different-blob,
+  alternate-manifest, wrong-directory, nested-workflow, and wrong-suffix
+  variants.
+- The following independent audit found that the GitHub repository component
+  was still treated byte-exact in some semantic keys. GitHub's REST API says
+  [`owner` and `repo` names are not case
+  sensitive](https://docs.github.com/en/rest/repos/repos#get-a-repository), so a
+  case alias could otherwise evade candidate-range exclusion, closure
+  uniqueness, action-directory uniqueness, selector joins, or reachability.
+  The contract now accepts only valid ASCII `owner/name` and applies one
+  case-insensitive canonical repository identity to every repository-semantic
+  join, including repository-scoped URL/ref joins. Workflow/action paths,
+  commits, refs, URL suffix/query/fragment fields, and the original raw records
+  remain exact and type-preserving in their digests. GitHub also says Actions
+  and reusable workflows [do not follow rename
+  redirects](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#limitations-of-reusable-workflows),
+  so the correction deliberately does not infer rename continuity or an
+  immutable repository ID.
+- The same audit observed that node/depth caps alone still allowed very large
+  strings to be encoded and copied. The closed canonical-JSON profile therefore
+  adds the 1 MiB per-string/key and 16 MiB aggregate UTF-8 limits above.
+- Two final targeted audits exposed lexical normalization gaps rather than a
+  new policy branch. `PurePosixPath(".")` has no parts and had passed the
+  vacuous component check, while NUL is not representable in a Git tree path.
+  Safe canonical paths now require at least one component and explicitly reject
+  `.` and NUL. Separately, Python's URL parser can strip tab/newline/control
+  bytes, normalize scheme parsing, and discard an empty `?` or `#` delimiter.
+  GitHub web/API URLs now require raw ASCII without C0/space/DEL, the exact
+  lowercase field-specific scheme/host prefix, and byte-identical
+  parse/recomposition; only the `owner/name` segment receives case-insensitive
+  semantic comparison. Fully rehashed terminal and recovery regressions cover
+  dot/NUL paths, mixed-case repositories, trailing tab, uppercase scheme, empty
+  delimiters, and endpoint/ref variants.
+- After those repairs and documentation synchronization, the main orchestrator
+  independently passed the focused carrier/recovery matrix at `52/52`, the
+  four-module contract matrix at `98/98`, Ruff format/check, JSON parsing,
+  `git diff --check`, skill validation, and project-journal validation. The
+  final full review-playbook suite then passed `3,243` tests in `1,657.587`
+  seconds with six conditional skips under CPython 3.13 and
+  `ResourceWarning` promoted to an error.
+- The final signed head still
+  requires complete local validation, exact-secret admission, and a new
+  independent clean-workspace review; no earlier review or test result will be
+  reused for the advanced head.
+
 ## Next Steps
 
 - Complete focused and full validation of the canonical follow-up, obtain one
