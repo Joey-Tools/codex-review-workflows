@@ -3,7 +3,7 @@ id: 20260822-ros001
 title: Simplify Review Orchestration And Workspace Preparation
 status: completed
 created: 2026-08-22
-updated: 2026-08-26
+updated: 2026-08-27
 branch: review-orchestration-simplification
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/108
 supersedes: [20260807-wme001, 20260805-wpe001]
@@ -1968,13 +1968,450 @@ superseded_by:
   canonical source fix; the private overlay must advance its source lock and
   regenerate rather than carrying a hand-edited runtime copy.
 
+### Canonical follow-up after private-overlay whole-range review
+
+- Canonical PR #110 squash-merged as
+  `a439793df9483943991c258e16f4ddf705736643` with tree
+  `76633f7ac00736ab8309a8f22413839dea04267` after its current-head local and
+  GitHub Codex gates passed. The private overlay then bound that exact source
+  identity and generated PR #181 instead of carrying a divergent copy.
+- A fresh ephemeral GPT-5.6 Sol Ultra review of private PR #181 range
+  `58e44edb8aa57bfe8e18adceac01489f85f2bf19..5f78907def147c231a09a5ff39a705d9d0c8eafa`
+  ran from an independent clean workspace under installed immutable control
+  release `f9e596f458a119fa88b89789c24c2290c37b4857`. Its terminal artifact
+  SHA-256 was
+  `93dbff2dd357d33e8a96da65718dcedba8192cce6df7d2967a75768d16fb768a`.
+- That review found three cross-repository contract gaps, so no private-head
+  clean result is carried forward. First, equality of an Actions
+  repository/PR/head/workflow/ref/operation/input tuple identifies a repeat
+  but cannot make an arbitrary workflow idempotent. Automatic mutation is now
+  limited to the exact Codex reconcile operation that a candidate-range-
+  external, parent-owned closed contract explicitly declares idempotent or
+  reentrant, in addition to current authorization and single-flight. The
+  agreed recovery cadence remains 1, 2, 4, 8, 16, 32, and 60 minutes, then
+  hourly without a fixed attempt limit; at 60 minutes the active thread is
+  informed, Automation wakes that same thread when available, cancellable
+  sleep remains the fallback, and private repositories retain the lower-cost
+  cadence.
+- Second, a merge/status check cannot establish GitHub Codex provider-clean
+  merely because candidate-head bytes introduce a contract that calls an
+  ordinary success clean. The reference schema now requires a separately
+  frozen parent trust anchor outside the candidate range. Its source and
+  stable producer identity join the dynamic App/workflow/run/check evidence;
+  a parent-owned candidate-range commit receipt also prevents a non-head
+  candidate commit from masquerading as an installed trusted release. This is
+  a normative machine-readable reference plus a test consumer; the separate
+  GitHub Action/status/ruleset workstream still owns the production consumer.
+- Third, the published sanitized-Git-prefix receipt consumer checked UID,
+  mode, link count, identity, and content but omitted Darwin extended ACLs.
+  Its protected access-policy property is now owner-private access: the bound
+  parent and receipt descriptors reject allow/grant ACL entries on acquisition
+  and both revalidation passes, while deny-only ACLs remain acceptable and
+  non-Darwin POSIX mode behavior remains unchanged. Real Darwin ACL tests cover
+  initial grants, drift before the first revalidation, drift before the final
+  revalidation, and deny-only entries.
+- The first warning-strict whole-skill run exposed one additional stale copy of
+  the old retry policy in `review-prompt-templates.md` and its matching exact-
+  text test. Both now require the same trusted recovery contract as the active
+  lane/authority documents; no model-facing prompt says that tuple equality
+  creates idempotency. That restricted run otherwise passed 3,220 of 3,222
+  tests with six conditional skips; its other failure was the known outer-
+  sandbox rejection of a nested `sandbox-exec` broker. The exact broker test
+  passed outside that nesting restriction in 2.455 seconds. After the prompt
+  correction, the authoritative non-nested warning-strict run passed all
+  3,222 tests with six conditional skips in 1,650.381 seconds. The 330-test
+  named-lane module, 83-test GitHub/local-contract matrix, Ruff lint/format,
+  JSON parsing, skill validation, project-journal validation, and whitespace
+  checks also passed.
+- Signed checkpoint `8d62cbc22c6078f3f3b5e8b5f7ac29dd2a2790a0`
+  then received a completely fresh, ephemeral GPT-5.6 Sol Ultra review of
+  `a439793df9483943991c258e16f4ddf705736643..8d62cbc22c6078f3f3b5e8b5f7ac29dd2a2790a0`
+  from an independent workspace prepared by immutable control release
+  `f9e596f458a119fa88b89789c24c2290c37b4857`. Materialize and every
+  pre/post validation agreed on two commits, one parent edge, parent-graph
+  SHA-256
+  `e89fcd746f44d76afc770661daccd6e414c246e08a166e0281ea21f379f774b2`,
+  and local-config SHA-256
+  `07990c1d83a78ea34a87e3f51883e3164c3098b21770082207e00a3a898ab24f`.
+  The 8,343-byte prompt SHA-256 was
+  `632ca52e7a3215e8f798900c850eeb4c9ef7522052a44478ed8746e88399e3a3`;
+  the terminal artifact SHA-256 was
+  `6bd08a31a31ce5911cd126e43a1f72143327be139e36cfec595571778b7f497c`
+  after 497,693 reviewer tokens. A first outer-sandbox launch failed before
+  model startup because Codex could not open its state database; it produced
+  no terminal artifact and does not count as a lane.
+- The valid review found three more GitHub contract gaps, so `8d62cbc` is not
+  a clean checkpoint. A merge-status pass still bound a trusted declaration
+  without proving which workflow revision and transitive producer code the
+  actual run executed. The guarded recovery text still illustrated
+  `workflow_dispatch` against a mutable feature-branch ref, which cannot
+  atomically bind the frozen head. Finally, `recovery_operation_contract`
+  remained prose rather than a versioned closed schema and reference consumer.
+  The remediation therefore binds actual producer implementation evidence,
+  removes automatic new dispatch from authoritative recovery, admits an
+  existing-run rerun only after its original head and implementation are
+  bound, and adds a closed machine-readable recovery contract plus
+  candidate-range exclusion and negative tests. A manually confirmed dispatch
+  and its receipts remain status-only because branch/tag dispatch has no
+  documented atomic expected-SHA or `If-Match` precondition; a later run/check
+  can count only through an independent ordinary producer/status contract.
+  GitHub's documented
+  maximum of 50 reruns limits state-changing rerun attempts; monitoring itself
+  may continue hourly without a fixed limit.
+- The exact GitHub rule name remains **Require branches to be up to date before
+  merging**, distinct from **Require linear history**. If freshness blocks and
+  no merge queue owns the update, merge the current base into the feature
+  branch with a signed merge commit and rerun the complete test, review,
+  GitHub, CI, conversation, policy, and final-reread gates. Intermediate merge
+  commits are valid members of `base..head`; neither this recovery nor the
+  workspace contract requires linear history.
+- The `8d62cbc` findings were closed through parent-owned evidence rather than
+  another candidate assertion. A preferred merge/status pass now joins the
+  exact dynamic App/workflow/run/check identities to platform-authenticated
+  run and job workflow identities, parsed workflow references, and a complete
+  immutable implementation closure. A separately anchored dependency resolver
+  records one exact source-resolution result for every canonical
+  repository/commit/path/kind/blob entry, including an explicit empty
+  reference list, and derives the complete edge set in both directions. The
+  stable PR snapshot binds both implementation and resolution receipt digests.
+  Candidate-range workflow or dependency bytes, root-only closure omission,
+  self-declared `complete`, forged raw references, and identical blobs at
+  distinct paths all fail closed. An external App without equivalent
+  provider-authenticated immutable implementation identity cannot use the
+  merge/status basis and falls back to terminal provider evidence.
+- Resolver source trust is relation-specific rather than merely "not in the PR
+  range." A target-branch baseline must be the exact current base tip, a
+  parent-fixed external source must be in another repository, and an installed
+  trusted release must carry an independent parent-owned manifest/provenance
+  receipt. This prevents a same-repository off-range commit created by a
+  candidate author from becoming its own resolver authority.
+- GitHub authoritative recovery is a closed two-phase contract whose accepted
+  union contains only full and failed-jobs reruns of an exact existing run. The
+  preflight binds the repository, PR, frozen head, operation intent,
+  repeat-safety declaration, trusted producer implementation, resolved
+  dependency closure, and original platform run observation. The rerun joins
+  the original `GITHUB_SHA`, `GITHUB_REF`, workflow SHA/ref, and job workflow
+  identity; GitHub preserves those values. The completion receipt cannot
+  authorize a mutation retroactively and is accepted only when separate
+  parent-owned authenticated exact-attempt/current-run observations join the
+  accepted preflight and operation identity.
+- A new workflow dispatch remains outside that accepted union even when the
+  REST response returns a run ID and URLs: the branch/tag ref still has no
+  documented pre-POST atomic expected-SHA comparison, so post-creation identity
+  checks cannot prevent an already-started substituted workflow from causing
+  side effects. A separately caller-confirmed manual dispatch and its receipt
+  are status-only; any later current-head check must qualify independently
+  through the ordinary producer/status contract.
+- The final fresh-context review exposed four additional recovery-boundary
+  gaps that focused self-tests had not found: target repository identity did
+  not cross every receipt boundary; the recovery resolver could still omit a
+  dependency edge or supply its own trust anchor; an existing-run rerun could
+  reuse an older run snapshot; and failed-job versus full reruns shared an
+  ambiguous operation kind. The repaired contract now carries exact target
+  repository equality through producer, operation, delivery, observation, and
+  completion; freezes resolver anchor, provenance, and full-entry resolution
+  independently from the candidate preflight; and maps failed-job/full reruns
+  to separate GitHub REST operations with distinct operation identities.
+- Existing-run recovery now joins a mutation-before authenticated current-run
+  observation, an exact HTTP 201 no-body delivery receipt, an exact-attempt
+  observation, a mutation-after current-run observation, and a closed
+  acquisition transaction. Both post observations must describe attempt
+  `n + 1` with the same immutable run identity and platform start time, while
+  the start must follow the POST boundary. A stale historical attempt, an
+  intervening rerun, a cross-mode endpoint, or a coupled digest rewrite is
+  status-only. Exact-attempt and current-run `updated_at` values are validated
+  against their own response windows rather than compared across endpoints;
+  live GitHub samples showed that those endpoint projections may differ by one
+  second even for the same attempt.
+- Repeat safety and mutation authority remain separate. Equality of an
+  operation tuple identifies a requested repeat but does not make arbitrary
+  Actions idempotent or reentrant. Only a candidate-range-external closed
+  recovery contract may declare repeat safety, and the current task must still
+  authorize the mutation. Mutation attempts stop at provider or contract caps,
+  including GitHub's total rerun maximum of 50; read-only monitoring continues
+  on the `1/2/4/8/16/32/60` minute then hourly schedule without a terminal time
+  ceiling. Private repositories retain cost throttling, public repositories may
+  retry more freely within the same authority, Automation wakes the active
+  thread when available, and cancellable hourly waiting remains the fallback.
+- No new instruction, tombstone, or navigation points at the retired
+  supplied-diff review helper. The active skill describes only the clean
+  independent workspace and current local/GitHub lane contracts; unadvertised
+  compatibility internals remain outside named review shapes.
+- Multiple rounds of coupled-mutation audit progressively rejected forged
+  producer references, root-only and empty-edge closure claims, fake source
+  anchors, arbitrary existing-run refs, unbound gate entries, pre/post phase
+  conflation, substituted dispatch runs, incomplete REST response envelopes,
+  the internal-list-versus-API-object request-body mismatch, cross-repository
+  receipt substitution, a candidate-controlled installed-release resolver,
+  stale historical attempts after a new rerun POST, and cross-mode rerun
+  substitution. The first focused audit returned `CLEAN`, but the later formal
+  fresh-context review correctly found four stronger coupled attacks; each
+  original attack author then re-ran its probe against the repaired contract
+  and returned `CLEAN`. A later formal pass additionally established that
+  recovery consumes the canonical closed producer-entry profile (`action`, not
+  an invented kind), and the external-App union nulls both raw and parsed
+  workflow identities. The subsequent formal review removed automatic new
+  dispatch from the accepted recovery union and bound the trusted root workflow
+  repository to the operation/contract repository; cross-repository reusable
+  workflow identity remains valid only as the job identity. Coupled
+  final-window, malformed-entry, provider-union, root-repository, and manual-
+  dispatch authority attacks now fail mechanically. The focused
+  contract/carrier/recovery/local-lane matrix passes all 90 tests after this
+  downgrade and repository-binding revision.
+- The same formal review found that the Darwin published-receipt ACL check had
+  implemented a stricter property than its owner-private contract by rejecting
+  a redundant allow entry for the exact file owner. The live descriptor-bound
+  check now resolves an owner UUID only when an allow entry exists, accepts
+  deny entries and exact-owner allows, and rejects any allow for another
+  principal plus every unknown, malformed, or uninspectable entry. Stronger
+  control-object contracts that intentionally require an empty ACL remain
+  unchanged.
+  The GitHub Action/status/ruleset thread remains
+  responsible for the production producer and consumer; this workstream
+  supplies its closed skill-facing evidence contract and test-only reference
+  validators without claiming they are the deployed integration.
+
+### Final follow-up review findings after `a1e034a`
+
+- A fresh-context GPT-5.6 Sol Ultra reviewer inspected the complete signed
+  `a439793df9483943991c258e16f4ddf705736643..a1e034a18c7c1deacce42c3fc3dc3f46b50c975a`
+  range in an independently prepared clean workspace. It found three remaining
+  fail-closed gaps; that result is findings-only and does not count as a clean
+  local lane.
+- GitHub documents different dependency behavior for the two accepted rerun
+  modes: a full rerun re-resolves a non-SHA reusable-workflow reference, while
+  a failed-jobs rerun reuses the reusable-workflow commit from the first
+  attempt. Version 1 now applies one conservative rule to both modes because
+  its platform evidence does not prove every external action dependency. Every
+  external reusable-workflow or action selector must name the target closure
+  entry's canonical repository identity, exact workflow path or action-manifest
+  directory, and lowercase full commit SHA. Same-repository reusable workflows
+  may instead use GitHub's `./.github/workflows/...` form or the contract's
+  `$/...` running-commit form when source and target are at the same commit;
+  `$/...` may likewise bind an action-manifest directory from workflow,
+  reusable-workflow, or action content. Branches, tags, expressions, mismatched
+  SHAs, unbound workflow `./`/`../` actions, bare untyped action-to-script
+  paths, and unknown forms are status-only. This closes the coupled
+  receipt-rehash attack without pretending the two GitHub modes behave
+  identically.
+- The external-App merge/status branch is disabled in version 1. A provider
+  implementation ID plus a self-digested closure does not authenticate the
+  provider-owned ID-to-root-to-transitive-closure relation; therefore the
+  accepted external-App binding-profile set is empty and such repositories use
+  ordinary terminal-clean fallback. A future profile must introduce separate
+  provider-authenticated binding and graph-reachability evidence before this
+  branch can become positive.
+- RFC 8785 digests use the closed version-1 numeric profile
+  `-9007199254740991..9007199254740991`, with non-Boolean integers, fixed ASCII
+  keys, and no floating-point values. Public reference validators reject
+  out-of-domain reports and parent inputs before digesting, so distinct JSON
+  integers cannot alias through an IEEE-754 implementation. A future GitHub ID
+  outside that range requires a new grammar carrying the value as a decimal
+  string.
+- The first repaired focused carrier/recovery run passed all 48 tests. The
+  next independent implementation audit then found six stronger boundary
+  cases that those tests did not exercise. GitHub resolves a workflow's
+  `./path/to/action` against the checked-out runner workspace, so matching only
+  the declaring workflow's repository and commit could bind different bytes.
+  Recovery and ordinary merge-status now accept canonical exact-SHA external
+  reusable-workflow and action selectors, map action selectors to the
+  action-manifest directory, accept exact same-commit local reusable-workflow
+  `./` and `$/` edges, and accept an exact same-commit `$/` action edge from a
+  workflow, reusable workflow, or action. They reject unbound workflow-local
+  `./` or `../` action edges and every bare untyped action-manifest-to-script
+  path; a future typed metadata-field and resolution-base schema is required
+  before such script edges can become positive.
+- The same audit showed that an external non-root `job_workflow_ref` could
+  remain branch-like while a different dependency edge claimed an exact SHA.
+  Both contracts now require every closure entry to be reachable from the
+  authenticated root and count all inbound edges to the non-root job identity:
+  exactly one is allowed, its source must be workflow or reusable-workflow
+  content, and it must semantically match the raw job ref. An external edge
+  therefore forces the raw selector to use the resolved full SHA. A
+  same-repository `./` or `$/` reusable-workflow edge may retain the
+  platform-reported branch-like raw job identity because its separately bound
+  resolved commit and target entry equal the source running commit. A root job
+  identity must equal the complete root workflow identity and have no inbound
+  edge.
+- Canonical input validation now rejects lone Unicode surrogate code points,
+  cyclic containers, nesting beyond 256 containers, more than 100,000 JSON
+  value nodes, a string value or object key beyond 1 MiB of UTF-8, aggregate
+  string-plus-key UTF-8 beyond 16 MiB, and invalid JSON-like shapes before
+  canonicalization. A code-point-count precheck rejects an already over-limit
+  string before bounded UTF-8 encoding, followed by the exact encoded-byte
+  check. The
+  iterator-frame walk rejects an over-wide list or object before allocating a
+  child-frame fan-out, and parent inputs are bounded before defensive copying.
+  All four public reference entrypoints and their constructor boundary map
+  malformed Python objects to `malformed` or false rather than leaking
+  `UnicodeEncodeError`, `RecursionError`, or `TypeError`.
+- The next fresh-context audit found two remaining coupled-selector ambiguity
+  families. A closure could carry the same repository/commit/path with a
+  different kind or blob, and one action directory could carry both
+  `action.yml` and `action.yaml` while the same raw selector named either one.
+  The closed grammar now requires direct `.github/workflows/*.yml` or
+  `.github/workflows/*.yaml` targets, one kind/blob per canonical repository
+  identity/commit/path, one target per source-entry/raw-selector identity, and
+  at most one action-manifest entry per canonical repository
+  identity/commit/directory. Both
+  ordinary merge-status and recovery apply those constraints before selector
+  resolution; targeted terminal and recovery regressions cover different-blob,
+  alternate-manifest, wrong-directory, nested-workflow, and wrong-suffix
+  variants.
+- The following independent audit found that the GitHub repository component
+  was still treated byte-exact in some semantic keys. GitHub's REST API says
+  [`owner` and `repo` names are not case
+  sensitive](https://docs.github.com/en/rest/repos/repos#get-a-repository), so a
+  case alias could otherwise evade candidate-range exclusion, closure
+  uniqueness, action-directory uniqueness, selector joins, or reachability.
+  The contract now accepts only valid ASCII `owner/name` and applies one
+  case-insensitive canonical repository identity to every repository-semantic
+  join, including repository-scoped URL/ref joins. Workflow/action paths,
+  commits, refs, URL suffix/query/fragment fields, and the original raw records
+  remain exact and type-preserving in their digests. GitHub also says Actions
+  and reusable workflows [do not follow rename
+  redirects](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#limitations-of-reusable-workflows),
+  so the correction deliberately does not infer rename continuity or an
+  immutable repository ID.
+- The same audit observed that node/depth caps alone still allowed very large
+  strings to be encoded and copied. The closed canonical-JSON profile therefore
+  adds the 1 MiB per-string/key and 16 MiB aggregate UTF-8 limits above.
+- Two final targeted audits exposed lexical normalization gaps rather than a
+  new policy branch. `PurePosixPath(".")` has no parts and had passed the
+  vacuous component check, while NUL is not representable in a Git tree path.
+  Safe canonical paths now require at least one component and explicitly reject
+  `.` and NUL. Separately, Python's URL parser can strip tab/newline/control
+  bytes, normalize scheme parsing, and discard an empty `?` or `#` delimiter.
+  GitHub web/API URLs now require raw ASCII without C0/space/DEL, the exact
+  lowercase field-specific scheme/host prefix, and byte-identical
+  parse/recomposition; only the `owner/name` segment receives case-insensitive
+  semantic comparison. Fully rehashed terminal and recovery regressions cover
+  dot/NUL paths, mixed-case repositories, trailing tab, uppercase scheme, empty
+  delimiters, and endpoint/ref variants.
+- After those repairs and documentation synchronization, the main orchestrator
+  independently passed the focused carrier/recovery matrix at `52/52`, the
+  four-module contract matrix at `98/98`, Ruff format/check, JSON parsing,
+  `git diff --check`, skill validation, and project-journal validation. The
+  first full review-playbook suite then passed `3,243` tests in `1,657.587`
+  seconds with six conditional skips under CPython 3.13 and
+  `ResourceWarning` promoted to an error.
+- A committed-range exact-secret admission for
+  `a439793df9483943991c258e16f4ddf705736643..dacb26847dad27f219dab26c794c7baf20bdcd77`
+  was clean with complete temporary cleanup. The installed specialized
+  `reviewer` role was temporarily unavailable at launch, so the parent used the
+  contract's peer-adapter fallback: one zero-inherited-context
+  `gpt-5.6-sol` / `ultra` subagent over an exact-pack detached workspace from
+  the installed trusted release. Prepare and validation agreed on seven
+  commits and 360 range objects; the issued and live-consumed sanitized Git
+  prefix receipts were byte-identical. Post-review trusted validation remained
+  clean and the guard completed workspace cleanup.
+- That review found three remaining fail-closed gaps. The recovery validator
+  did not bind each source trust-anchor kind to its required repository/base
+  relation; Python Boolean/integer equality could satisfy implementation run
+  and dependency-count bindings; and the candidate grammar used permissive
+  `json.loads` without duplicate-key, non-finite-number, whole-resource, or
+  closed top-level checks. The repairs now apply kind-specific source
+  relationships, exact non-Boolean integer domains plus type-preserving
+  equality, and one strict whole-grammar loader. Fully rehashed regressions
+  reach each intended check rather than failing on stale digest evidence.
+- Recovery and terminal focused modules passed `18/18` and `37/37`; the joined
+  four-module matrix passed `101/101`. Two independent closure audits returned
+  clean for exact file SHA-256 values
+  `364680bdec20adbd9bb8ac84f5fef9176f0f4cc6c79a1bce99c38fdbb448434b`
+  and
+  `274737adb251de68c7fe224f5f3b588e16c41ac4aa2c0662a4f384a00b7445eb`.
+  The post-fix full review-playbook suite passed `3,246` tests in `2,027.495`
+  seconds with six conditional skips under the same strict warning profile.
+  Because the repairs advance the head, the earlier admission and review are
+  evidence for the repair loop only; final-head admission and fresh review are
+  rerun rather than reused.
+- A later zero-inherited-context `gpt-5.6-sol` / `ultra` peer-subagent review
+  inspected the complete merge-inclusive range
+  `a439793df9483943991c258e16f4ddf705736643..c3951fe8236da5f5993df4e557613c50dfb0d89e`
+  in a freshly validated exact-pack workspace. It found two remaining consumer
+  inconsistencies: recovery count/attempt comparisons could still admit Python
+  Boolean aliases at equality-compatible values, and independently acquired
+  parent scopes compared repository spelling byte-for-byte instead of using
+  GitHub's ASCII case-insensitive repository identity. The repairs validate
+  every count and attempt as an exact non-Boolean safe integer before equality,
+  and compare only each scope's `repository` field semantically while keeping
+  all other fields type- and byte-exact and preserving every raw spelling.
+  Fully rehashed Boolean regressions and independent mixed-case scope matrices
+  cover clean, reaction, merge-status, trust-anchor, and finding evidence.
+- The two repaired modules passed `58/58` focused tests. The complete
+  review-playbook suite then ran all `3,249` tests with six conditional skips
+  in `2,103.706` seconds; its only failure was the known outer-sandbox refusal
+  to nest macOS `sandbox-exec` for the Claude keychain broker
+  (`sandbox_apply: Operation not permitted`). That exact broker test passed in
+  `1.928` seconds when rerun outside only the demonstrated outer restriction.
+  The journal-only evidence update receives lightweight validation; the signed
+  repaired head still receives new exact-secret admission and a fresh
+  whole-range review rather than reusing the reviewed `c3951fe` result.
+- The next zero-inherited-context `gpt-5.6-sol` / `ultra` peer review of the
+  signed `493957a` head found one remaining resource-ordering defect in the
+  fixed terminal-carrier grammar loader: the resource was read without a raw
+  byte bound and integer tokens reached Python's integer constructor before
+  the post-decode resource walk. A fixed 2 MiB source cap now applies through
+  one descriptor-bound regular-file read of at most `cap + 1` bytes before
+  strict UTF-8 decoding or JSON parsing. The loader rejects symlink traversal
+  where the host supplies `O_NOFOLLOW`, floating-point tokens, non-finite
+  constants, and integer tokens outside the safe digit/range profile; the
+  integer digit check precedes `int()` so Python 3.10 cannot spend unbounded
+  work on a giant literal. The existing node, depth, individual-string, and
+  aggregate-string caps remain the decoded-value checks.
+- A separate Ultra audit accepted that implementation but found that the first
+  regressions proved only the eventual error, not the ordering property. The
+  strengthened tests use an oversized invalid-UTF-8 file, prohibit
+  `Path.read_text`, observe the exact bounded read request, and mock `int()` to
+  prove that an over-limit token is rejected before conversion. The follow-up
+  audit returned no findings. The carrier module passed `39/39` under both
+  CPython 3.10 and 3.13, and the joined four-module contract matrix passed
+  `104/104`. Outside the previously demonstrated outer macOS sandbox
+  restriction, the complete review-playbook suite then passed all `3,249`
+  tests in `1,952.505` seconds with six conditional skips and no failures.
+- The fresh whole-range review of signed head `f5bbaa3` found two remaining
+  Python Boolean/integer alias joins: recovery implementation, operation, and
+  authenticated platform evidence still used ordinary equality in several
+  trust/ID relationships, and merge-status parent scope could match Boolean
+  `true` to pull request `1`. Recovery now validates every linked run,
+  workflow, attempt, delivery, observation, transaction, and completion ID as
+  a positive non-Boolean safe integer before comparison, requires each
+  authentication bit with `is True`, and recursively compares independently
+  supplied implementation, dependency, pre-mutation, and resolver receipts
+  type for type. Merge-status requires a positive parent PR number and uses the
+  repository-aware scope comparator, so only repository spelling is
+  case-insensitive while PR number and head remain type- and byte-exact.
+- The first closure audit found that the embedded pre-mutation receipt was
+  strict but its independent parent-owned expected copy still joined through
+  ordinary dictionary equality. A second audit then found that the initial
+  regression rehashed the malformed parent copy, allowing unequal digest
+  strings to mask the intended join. The final end-to-end regressions preserve
+  identical embedded/parent digest bytes, explicitly prove that Python's old
+  dictionary equality accepts the one-sided `True`/`1` aliases, and prove the
+  recursive type-preserving join and validator reject them. The final Ultra
+  closure audit returned no findings. Both repaired modules passed `61/61`
+  under CPython 3.10 and 3.13, the joined four-module matrix passed `107/107`,
+  and Ruff plus whitespace validation passed. The next complete suite ran all
+  `3,252` tests with six conditional skips in `3,842.232` seconds. Four
+  `test_named_lane` subprocess calls exhausted approximately `1.965`-second
+  deadlines while the suite took roughly twice its preceding wall time; no
+  recovery or terminal-carrier assertion failed. The persisted runner output
+  retained two exact IDs but truncated the other two before durable capture.
+  Both retained failures passed an immediate exact rerun, and the complete
+  `74`-test supervisor/signal/session/output group spanning their unittest
+  ordering interval then passed in `276.937` seconds with no residual fixture
+  process. This classifies the four errors as host-load deadline artifacts,
+  while retaining the earlier post-loader full-suite clean result as the
+  complete green baseline for unchanged named-lane code.
+
 ## Next Steps
 
-- Deliver the canonical UTF-8 correction through the skill-repository Codex
-  gate and an immutable default-branch commit.
-- Advance the private overlay source lock to that canonical descendant,
-  regenerate the activation branch, and rerun its complete local, GitHub,
-  release, and installation gates.
+- Keep final-head delivery evidence—exact-secret admission, fresh local Codex,
+  current-head GitHub Codex, CI, conversation, and ruleset readiness—in the PR
+  rather than advancing the reviewed head for journal-only status prose.
+- Let the private overlay consume the canonical merge through its generated
+  sync workflow. Do not hand-edit the generated overlay; release and installed
+  verification remain downstream delivery evidence.
 
 ## Evidence
 
@@ -2012,8 +2449,11 @@ superseded_by:
   tests with the same six skips in `999.845` seconds.
 - Combined `test_contracts`, `test_github_terminal_carriers`,
   `test_github_recovery_contracts`, and `test_local_codex_lane_contracts`
-  matrix (`81` focused policy, distribution, carrier, report, and self-policy
-  contracts).
+  matrix (`90` focused policy, distribution, carrier, report, recovery, and
+  self-policy contracts). Signed head `65a36ce` passed the complete
+  `3,227`-test suite with six conditional skips in `1,562.494` seconds; the
+  final repaired head will be validated and reported as PR evidence before
+  publication.
 - Skill quick validation for `review-orchestration-playbook`,
   `change-delivery-workflow`, and `synthetic-token-fixtures`; reviewer TOML
   parse; source-only Python compile; Ruff lint; Markdown relative-link check;

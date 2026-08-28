@@ -3956,12 +3956,16 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "exact typed GraphQL thread resolution",
             "later trustworthy provider correction",
             "machine-decidable transient pending or infrastructure reason",
-            "Repetition of that exact tuple is idempotent without a repository predeclaration",
-            "current authorization for the external mutation",
+            "validate the versioned closed parent-owned `github-codex-recovery-operation-two-phase-v1` reference schema",
+            "existing-run reruns retain and must match their original `GITHUB_SHA`/`GITHUB_REF`",
+            "new `workflow_dispatch` is outside the accepted automatic-recovery union",
+            "manual dispatch is status-only and supplies no recovery or pass authority",
+            "independent ordinary producer/status contract",
+            "status-only hourly monitoring, which has no time ceiling",
             "at most one possibly delivered exact `@codex review` issue-comment POST",
             "An ambiguous POST outcome consumes the comment-mutation budget",
             "never repeat the comment POST in that epoch",
-            "Only the separately authorized exact repository-Action tuple is idempotently repeatable",
+            "Only a separately authorized exact repository-Action operation accepted by the versioned recovery contract",
             "neither alone changes code, creates a head, or invalidates stable local reviews",
             "If resolving a finding changes code",
         ):
@@ -3975,9 +3979,20 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "never repeat the comment post in that epoch", normalized_prompts.lower()
         )
         self.assertIn("never authorizes another post", normalized_prompts.lower())
-        self.assertIn("needs no repository predeclaration", normalized_prompts.lower())
-        self.assertIn("changed scope", normalized_prompts.lower())
-        self.assertIn("ordinary confirmation", normalized_prompts.lower())
+        self.assertIn(
+            "`github-codex-recovery-operation-two-phase-v1` reference schema",
+            normalized_prompts.lower(),
+        )
+        self.assertIn(
+            "existing-run reruns must retain and match their original",
+            normalized_prompts.lower(),
+        )
+        self.assertIn(
+            "tuple equality never creates repeat safety",
+            normalized_prompts.lower(),
+        )
+        self.assertIn("status-only monitoring", normalized_prompts.lower())
+        self.assertIn("separate completion receipt", normalized_prompts.lower())
 
         for retired in (
             "Explicit provider findings block.",
@@ -3987,6 +4002,8 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "same exact `@codex review` POST may be repeated",
             "idempotent delivery retry",
             "repository-predeclared",
+            "needs no repository predeclaration",
+            "repetition of that same tuple is idempotent",
         ):
             self.assertNotIn(retired, contracts + "\n" + prompts)
 

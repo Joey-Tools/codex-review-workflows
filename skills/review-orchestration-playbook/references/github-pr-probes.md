@@ -11,6 +11,26 @@ Prefer typed `gh` output and exact REST or GraphQL fields. Keep large raw page
 sets in a task-scoped bounded artifact and surface only IDs, URLs, times,
 states, and decisive findings.
 
+Use the evidence authority's repository-identity profile for semantic joins:
+accept only valid ASCII `owner/name` and compare the two components
+case-insensitively. GitHub's REST repository parameters are
+[not case sensitive](https://docs.github.com/en/rest/repos/repos#get-a-repository),
+while GitHub Actions and reusable workflows [do not follow rename
+redirects](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#limitations-of-reusable-workflows).
+Therefore apply canonical repository identity to PR/source equality, closure
+and reachability keys, selector repository segments, candidate exclusion,
+action-directory uniqueness, and repository-scoped URL/ref joins, but never
+infer rename continuity or an immutable repository ID. Preserve original raw
+repository strings and compare paths, SHAs, refs, and URL suffix/query/fragment
+fields exactly; canonical-JSON digests remain over the unchanged raw records.
+Reject every GitHub web/API URL that is non-ASCII, contains C0/space/DEL, lacks
+the exact lowercase `https://github.com/` or `https://api.github.com/` prefix
+required by its field, or fails a byte-identical parse/recompose check. Empty
+query/fragment delimiters that disappear on recomposition are malformed. A
+safe canonical repository path must be a nonempty relative POSIX path with at
+least one component; reject `.`, NUL, backslash, absolute paths, dot
+components, and noncanonical spellings.
+
 This probe layer owns acquisition, not interpretation. Preserve every complete
 raw REST and GraphQL page used by a finding decision so the parent can freeze a
 current-scope `finding_page_receipt`. Independently provide the exact full-DAG
@@ -34,11 +54,11 @@ gh pr view <number-or-url> --repo <owner/repo> \
   --json url,number,state,isDraft,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,statusCheckRollup,reviewDecision
 ```
 
-Record exact repository, PR number, `baseRefName`, `baseRefOid`, and
+Record the exact raw repository spelling, PR number, `baseRefName`, `baseRefOid`, and
 `headRefOid`. Use commit OIDs rather than mutable branch names for range
-comparisons, but keep exact repository plus `baseRefName` as the target-ref
-identity. Keep the exact `baseRefOid` as another independent readiness binding
-rather than collapsing it into the unique merge base.
+comparisons, but use canonical repository identity plus exact `baseRefName` as
+the target-ref identity. Keep the exact `baseRefOid` as another independent
+readiness binding rather than collapsing it into the unique merge base.
 
 ## Fetch Complete Provider Evidence
 
@@ -72,8 +92,10 @@ opaque `endCursor` for the next request. A terminal page is one with typed
 `hasNextPage == false`.
 
 Bind every GraphQL response back to raw `repository.nameWithOwner` and
-`pullRequest.number`. Normalize IDs only for comparison; preserve the raw
-records. Never synthesize `thread_resolved` on REST comments.
+`pullRequest.number`. Compare `nameWithOwner` through canonical repository
+identity and the PR number type-preservingly, while preserving the exact raw
+records and their repository spelling. Normalize other IDs only for comparison.
+Never synthesize `thread_resolved` on REST comments.
 
 Derive the parent-owned `finding_range_receipt` independently from the exact
 range's complete reachable DAG rather than treating ancestry embedded in a
@@ -107,7 +129,7 @@ Post the exact body:
 @codex review
 ```
 
-Define one comment-mutation epoch by the exact repository, PR, and feature
+Define one comment-mutation epoch by the canonical repository identity, exact PR, and feature
 head. In each epoch, permit at most one possibly delivered create-comment
 POST. Before that POST, reread the unchanged PR head and completely enumerate
 every page of the visible exact-request set for the current epoch. If an exact
@@ -159,17 +181,29 @@ subject only through the verified producer contract:
    it.
 2. Select a candidate only when its App identity, `details_url`, check suite,
    external ID, or documented repository contract associates it with the
-   GitHub Codex review or merge aggregation.
+   GitHub Codex review or merge aggregation, and the contract has a closed
+   parent-owned source trust anchor outside the candidate range. Candidate-head
+   workflow or contract bytes cannot supply that anchor. Join the anchor to a
+   separate parent-owned receipt containing the complete byte-sorted
+   `merge_base..head` commit set, exact count, and digest; reject a
+   same-repository source commit found anywhere in that set.
 3. If that contract declares `github-synthetic-merge`, independently read the
    current base ref/tip, locally proved unique merge base, PR
    `merge_commit_sha`, and complete check/status collections for that subject.
    If it declares `feature-head`, require the subject SHA to equal
    `headRefOid` and make no base-coverage claim.
 4. Follow the associated run URL or API identity to the exact workflow run and
-   jobs.
+   jobs. For GitHub Actions, retain platform-authenticated `workflow_sha`,
+   `workflow_ref`, and every job workflow identity. Independently enumerate the
+   immutable workflow blob plus every transitive local or reusable
+   workflow/action/script dependency capable of deciding clean. For an external
+   App, version 1 has no accepted authenticated ID-to-root-to-closure binding
+   profile, so make merge-status unavailable and use terminal-clean fallback.
 5. Preserve the App ID/slug, workflow ID, run ID/attempt, check-suite ID, check
    ID/name/URL, feature head, base ref/tip, merge base, subject kind/SHA,
-   status, conclusion, server time, and producer-contract descriptor.
+   status, conclusion, server time, producer-contract descriptor, and its
+   candidate-range-external trust anchor, candidate-range exclusion receipt,
+   and producer-implementation receipt digest.
 
 A name substring is a hint for discovery, not proof. A check attached to an
 older head, a generic App success, or a run found only by static name guessing
@@ -177,9 +211,37 @@ is not a valid basis.
 
 When a trustworthy related merge/status check exists, prefer it as the
 positive GitHub-lane basis, while still enumerating unresolved Codex-provider
-findings. Its independently verified contract must define successful completion
-as `github-codex-provider-clean`, require zero unresolved applicable findings,
-and declare either `latest-feature-head` or `current-merge-scope`. The former
+findings. Its independently verified contract and candidate-range-external
+source anchor must define successful completion as
+`github-codex-provider-clean`, require zero unresolved applicable findings,
+declare either `latest-feature-head` or `current-merge-scope`, and bind the
+actual run to the candidate-range-external immutable implementation closure.
+Require a separate anchored parent-owned resolver and resolution receipt whose
+records exactly cover every canonical closure entry with parser/source digests
+and complete discovered references, and whose full-entry edges are the exact
+bijective reference projection. Bind its digest into the stable snapshot.
+Accept external reusable-workflow selectors only from workflow or
+reusable-workflow sources and external action selectors only from workflow,
+reusable-workflow, or action sources; each selector must canonically name its
+target canonical repository identity plus exact path and end in the target full commit SHA, with an
+action path selecting its manifest directory or repository root. Workflow
+targets must be direct `.github/workflows/*.yml` or
+`.github/workflows/*.yaml` children, not nested paths. Each
+canonical-repository-identity/commit/path identifies one kind and blob, each
+source-entry/raw-selector pair identifies one target, and each
+canonical-repository-identity/commit/action-manifest directory identifies at most one action
+entry; a competing `action.yml` and `action.yaml` pair is status-only. Also accept
+same-repository, same-running-commit reusable-workflow calls through exact
+`./.github/workflows/...` or `$/.github/workflows/...`, and `$/` action calls
+that select the exact same-commit manifest directory. Keep
+workflow/reusable-workflow `./` or `../` local actions and all untyped bare
+action-manifest-to-script relative refs status-only. Require every closure
+entry to be root-reachable, the exact root job identity to have no inbound edge,
+and each non-root reusable-workflow job identity to have exactly one total
+inbound edge that semantically matches its external-full-SHA or
+same-running-commit-local job ref; the external edge reference must equal its
+canonical raw job identity ref exactly.
+Candidate-controlled workflow/dependency bytes or an unbound run cannot pass. The former
 does not prove the PR base. The latter additionally requires the exact synthetic
 subject and current base/merge bindings above. Ordinary readiness still
 validates base and merge base locally. A generic successful check or
@@ -200,7 +262,8 @@ themselves protect the later mutation.
 The only direct-merge alternative is a complete parent proof of monotonic range
 contraction. Require all of these from the complete applicable protection and
 ruleset snapshot: the frozen `merge_expected_base_ref` equals the selected
-repository plus `baseRefName`; the final unique merge base and
+repository plus `baseRefName`, where repository equality means canonical
+case-insensitive identity and `baseRefName` remains exact; the final unique merge base and
 `merge_expected_base` both equal reviewed `base_sha`; the mutation carries
 exact reviewed head; strict up-to-date is enforced in that merge transaction;
 every update to that same frozen target ref from `merge_expected_base` must be
@@ -258,42 +321,122 @@ Never reconcile an explicit review finding that is applicable and unresolved,
 a test failure, lint failure, policy failure, or other substantive negative
 result. Those require resolution, a fix, or an explicit policy decision.
 
-Before an Actions mutation, freeze one exact recovery tuple containing the
-repository, PR, head, dynamically identified Action or workflow, operation,
-and exact inputs. This consumer treats repetitions of that same tuple as
-idempotent; no repository-specific idempotency or reentrancy predeclaration is
-required. The current task must still authorize the external mutation. When
-that authorization is absent, keep the recovery owner in status-only mode,
-poll the scoped evidence on the schedule below, and report the missing
-authorization instead of triggering the workflow.
+Before an Actions mutation intended to enter authoritative automatic recovery,
+obtain one closed parent-owned
+`recovery_operation_preflight` from a source independently anchored outside the
+candidate range and validate it against
+`github-codex-recovery-operation-two-phase-v1` in
+`github-codex-terminal-carriers-v1.json`. This is a machine-readable reference
+and test-only validator contract; the production GitHub consumer belongs to the
+separate Actions/status implementation. The contract binds the exact
+repository, PR, frozen head, dynamically identified workflow/run/ref,
+operation intent, exact inputs, trusted producer-implementation receipt
+identity, complete dependency-edge resolution receipt, and candidate-range
+exclusion receipt, and explicitly classifies that operation as
+idempotent or reentrant independently of mutation authorization. Accepted
+source relationships are the exact target-branch baseline, an installed
+trusted release, or another parent-pinned source proved outside the candidate
+range. Candidate-head workflow or contract bytes cannot grant repeat authority.
 
-This exact-tuple idempotence applies only to the Actions mutations in this
-section. It never applies to GitHub comment creation; the one-shot
-comment-mutation budget above remains consumed after any possibly delivered
-create-comment call.
+Only after that proof, freeze the exact authoritative recovery operation and join it
+type-preservingly to the contract. Equality identifies a requested repeat; it
+does not make an operation idempotent or reentrant. The current task must still
+authorize the external mutation. When the trusted contract, exact join, or
+authorization is absent, keep the recovery owner in status-only mode, poll the
+scoped evidence on the schedule below, and report the missing gate instead of
+triggering an automatic recovery operation. A separately caller-confirmed
+manual dispatch remains status-only under step 3 below and does not inherit
+this repeat authority. This repeat authority never applies to GitHub comment
+creation; the one-shot comment-mutation budget above remains consumed after any
+possibly delivered create-comment call.
 
-After the tuple and authorization are established, choose the smallest
+After the contract and authorization are established, choose the smallest
 operation that can recover the machine-decidable retryable state:
 
-1. Retry failed jobs when the associated run exists and only jobs failed.
-2. Rerun the full associated run for a run-level infrastructure failure or a
-   broken aggregate that cannot be repaired by failed-job rerun.
-3. Dispatch a new run only for missing, stale, or aggregation-only state, and
-   only after dynamic discovery proves the exact workflow and required inputs.
+1. Retry failed jobs only on an exact existing run whose
+   platform-authenticated head, ref, workflow SHA, implementation closure, and
+   run/check identities equal the frozen contract. GitHub reruns retain that
+   run's original `GITHUB_SHA` and `GITHUB_REF`; do not substitute a live branch
+   ref.
+   Bind an independently supplied authenticated pre-mutation run receipt for
+   attempt `n`, POST exactly `/rerun-failed-jobs` with API `2026-03-10`, no
+   request body, and HTTP 201, then GET exactly `/attempts/{n+1}` with HTTP 200.
+2. Rerun the full exact existing run under the same binding for a run-level
+   infrastructure failure or broken aggregate. Stop mutation attempts at the
+   provider or contract cap; GitHub's total rerun limit is 50. Hourly monitoring
+   remains unlimited after mutation eligibility is exhausted.
+   This is the distinct `existing-run-rerun-full` operation and uses `/rerun`;
+   it cannot reuse a failed-jobs preflight or authorization. Both modes require
+   exact `n+1`, the attempt-`n` `previous_attempt_url`, and authenticated
+   acquisition ordering across preflight, POST, and post observation.
+   Follow the exact-attempt GET with an authenticated current-run GET and
+   require the same identity plus current `run_attempt == n+1`. One closed
+   transaction joins all four receipts, GitHub response dates, acquisition
+   times, and platform `run_started_at`/`updated_at`; a historical attempt
+   re-read or possible intervening rerun remains status-only.
+   Before either mode mutates, mechanically prove the complete dependency graph
+   attempt-stable under the ordinary merge-status dependency semantics. An
+   external reusable-workflow selector from a workflow or reusable-workflow
+   source exactly names the target canonical repository/workflow-path, which
+   is a direct `.github/workflows/*.yml` or `.github/workflows/*.yaml` child
+   rather than a nested path, and ends in its lowercase full commit SHA. Each
+   canonical-repository-identity/commit/path identifies one kind and blob, each
+   source-entry/raw-selector pair identifies one target, and each
+   canonical-repository-identity/commit/action-manifest directory identifies at most one action
+   entry; a competing `action.yml` and `action.yaml` pair is status-only. An
+   external action selector from a
+   workflow, reusable-workflow, or action source exactly names the target
+   canonical repository plus its action-manifest directory—or repository root
+   for a root manifest—and ends in its lowercase full commit SHA. A workflow or
+   reusable workflow may instead bind a same-repository, same-running-commit
+   reusable workflow by exact `./.github/workflows/...` or
+   `$/.github/workflows/...`. A `$/` action selector from a workflow, reusable
+   workflow, or action binds the source repository and running commit to the
+   exact target action-manifest directory. Workflow/reusable-workflow `./` or
+   `../` local actions and all untyped bare action-manifest-to-script relative
+   refs are status-only because version 1 cannot close their runtime resolution
+   bases. Every closure entry is reachable from the root. The root job identity
+   equals the root workflow identity exactly and has no inbound edge. Every
+   non-root job identity is a reusable-workflow entry with exactly one total
+   inbound edge that semantically matches its job ref from a workflow or
+   reusable-workflow source. The external arm requires a full-SHA raw selector
+   and identity ref equal to the resolved commit. A same-repository local `./`
+   or `$/` arm may retain its platform-authenticated branch-like raw job
+   identity ref only while its target and resolved commit equal the source
+   running commit and its unique local edge exactly matches repository and
+   workflow path. The external edge reference must equal the canonical raw job
+   identity ref exactly. A tag, expression, mismatched repository/commit/path,
+   disconnected entry, or unknown reference is status-only. GitHub documents
+   that full reruns
+   re-resolve a non-SHA reusable-workflow ref while failed-job reruns retain its
+   first-attempt commit; version 1 applies the same conservative rule to both
+   because it has no equivalent closed proof for every external action
+   dependency.
+3. Do not use a new `workflow_dispatch` as authoritative automatic recovery.
+   Its `ref` selects a branch or tag, and the POST documents no atomic
+   expected-SHA or `If-Match` comparison with the live PR head; a later
+   in-workflow gate
+   cannot close the dispatch race. The caller may explicitly confirm one manual
+   dispatch, but the operation and its receipts remain status-only and cannot
+   supply pass authority or satisfy the recovery contract. Any later current-
+   head status is consumed only through an independent ordinary producer/status
+   contract.
 
-Illustrative commands for an already authorized exact-tuple recovery are:
+Illustrative commands for an already authorized, trusted-contract-bound exact
+existing-run operation are:
 
 ```bash
 gh run rerun <run-id> --failed --repo <owner/repo>
 gh run rerun <run-id> --repo <owner/repo>
-gh workflow run <workflow-id> --repo <owner/repo> --ref <current-head-branch>
 ```
 
-Repository-specific inputs come from the discovered workflow contract. Never
-invent input names. Single-flight still applies: wait until the current attempt
-is terminal or proved lost before repeating the same tuple. A different
-repository/PR/head scope, Action, workflow, operation, or input set is not a
-retry of that tuple; stop and obtain ordinary confirmation before mutating it.
+The generic `gh workflow run --ref <current-head-branch>` pattern is forbidden
+for automatic recovery. Do not synthesize repository-specific dispatch inputs.
+Single-flight still applies: wait until the current attempt is terminal or
+proved lost before repeating the same contract-bound operation. A different
+repository/PR/head scope, workflow, run, ref, operation, input set,
+implementation receipt, or post-dispatch identity is not a retry of that
+operation; stop and obtain ordinary confirmation before mutating it.
 
 ## Retry Schedule And Cost Control
 
@@ -312,9 +455,12 @@ Use exponential backoff in minutes:
 1, 2, 4, 8, 16, 32, 60, 60, 60, ...
 ```
 
-There is no retry-count ceiling while the same reason remains
+There is no time ceiling on status-only monitoring while the same reason remains
 machine-decidably retryable. At 60 minutes, report the continuing delay to the
-user and then retry hourly without a terminal time ceiling. Reset the schedule
+user and then monitor hourly without a terminal time ceiling. An Actions
+mutation occurs at a scheduled wake only while its exact contract remains
+eligible and below the platform/provider or stricter contract cap; mutation
+attempts stop at that cap while hourly observation continues. Reset the schedule
 only after meaningful progress, such as a new run, new provider artifact,
 changed check conclusion, or new head. Crossing an hour is a reporting and
 cadence transition, not a reason to stop or declare the lane inconclusive;
@@ -322,12 +468,14 @@ losing the retryable classification is.
 
 For private repositories, default to a rolling budget of four full-run
 equivalents per 24 hours unless repository policy defines another budget.
-Count a full rerun or new dispatch as one equivalent; count failed-job reruns
+Count a full rerun or explicitly confirmed manual dispatch as one equivalent;
+count failed-job reruns
 proportionally when reliable job-cost data exists, otherwise conservatively as
 one. When the budget is exhausted, perform status-only hourly checks until the
 window recovers. Do not spend private Action minutes on repeated runs during a
 known service degradation. This budget throttles Action-consuming mutations;
-it never terminates status-only monitoring or imposes a retry-count ceiling.
+it never terminates status-only monitoring. It does not override a platform or
+contract mutation-attempt cap.
 
 Public repositories do not use the private-minute budget and may retry more
 frequently within the same backoff, single-flight, repository-contract, and
@@ -338,12 +486,12 @@ Keep recovery visibly pending:
 ```yaml
 recovery:
   status: pending
-  phase: observe | rerun-failed | rerun-full | dispatch | status-only
+  phase: observe | rerun-failed | rerun-full | manual-dispatch-status-only | status-only
   attempt: 1
   next_retry_at: RFC3339
   reason_class: retryable-pending | retryable-infrastructure
   last_reason: stable-machine-readable-reason
-  mutation_gate: authorized-exact-repeat | status-only
+  mutation_gate: authorized-contract-bound-repeat | status-only
   rolling_full_run_equivalents: 0
 ```
 
@@ -351,14 +499,13 @@ Do not convert a retryable recovery into `pass` or `inconclusive` merely because
 the active wait crossed an hour.
 
 Persistent monitoring does not expand authorization. A wake may always reread
-scoped evidence; it may repeat an Actions mutation only when the frozen
-recovery tuple is type-preservingly unchanged and the current mutation remains
-authorized. A new scope, Action, workflow, operation, input set, branch or PR
-mutation, destination, or other materially different action requires ordinary
-confirmation.
-
-The schedule may repeat read-only probes and an authorized exact Actions tuple.
-It never repeats a create-comment POST.
+scoped evidence; it may repeat an Actions mutation only while the versioned
+recovery contract still binds the frozen head, exact operation, trusted
+implementation, existing-run identity and attempt lineage, and
+repeat-safety declaration, the current mutation remains authorized, and the
+provider/contract attempt cap has not been reached. Any drift requires ordinary
+confirmation or status-only monitoring. The schedule never repeats a
+create-comment POST.
 
 ## Active Thread And Automation
 

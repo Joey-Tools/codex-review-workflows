@@ -753,6 +753,24 @@ The trusted launcher supplies runtime controls; do not paste authentication, pre
 
 ## GitHub Trigger
 
+Before comparing any GitHub repository-scoped field, validate ASCII
+`owner/name` and use its case-insensitive canonical repository identity for
+same-repository checks, closure/reachability keys, selector repository
+segments, candidate exclusion, action-directory uniqueness, and semantically
+repository-scoped URL/ref joins. Preserve each original repository spelling in
+the exact raw or digest-bound record. Do not case-fold workflow/action paths,
+SHAs, refs, or URL suffix/query/fragment fields, follow repository/action
+renames, or infer an immutable repository ID. Before defensive copy or
+canonical digest, reject parent/report JSON outside the closed 256-level,
+100,000-node, 1-MiB-per-string-or-key, and 16-MiB-aggregate-string/key UTF-8
+profile; perform the code-point-count precheck before bounded string encoding.
+Reject a GitHub web/API URL unless its raw ASCII form has no C0/space/DEL, uses
+the exact lowercase `https://github.com/` or `https://api.github.com/` field
+prefix, and parses/recomposes byte-for-byte; only `owner/name` may compare
+case-insensitively. Reject a claimed safe canonical repository path unless it
+is a nonempty relative POSIX path with at least one component; reject `.`, NUL,
+backslash, absolute paths, dot components, and noncanonical forms.
+
 The provider trigger is the exact issue comment:
 
 ```text
@@ -772,12 +790,76 @@ warning within the same logical review lane; it never authorizes another POST
 or counts as an additional lane. Provider evidence and
 workflow reconciliation follow
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
-For an authorized Actions recovery, freeze repository/PR/head, the dynamically
-identified Action or workflow, operation, and exact inputs. Repetition of that
-same tuple is idempotent and needs no repository predeclaration, but remains
-single-flight. A changed scope, Action, workflow, operation, or input set is a
-new mutation and requires ordinary confirmation. Never reconcile a substantive
-finding, test failure, or policy failure as infrastructure.
+For an authorized Actions recovery, first validate the closed parent-owned
+`github-codex-recovery-operation-two-phase-v1` reference schema. Its preflight binds the
+exact repository/PR/frozen head, candidate-range-external source, candidate
+exclusion receipt, operation intent/inputs, trusted producer-implementation
+receipt, and complete dependency-edge resolution receipt. Existing-run reruns
+must retain and match their original `GITHUB_SHA`/`GITHUB_REF`. The trusted
+root workflow repository must have canonical identity equal to the operation and contract repository identity; a
+cross-repository job identity must be a reusable workflow. A new
+`workflow_dispatch` is outside the accepted recovery union because the API
+accepts a branch/tag ref and documents no atomic expected-SHA or `If-Match`
+precondition on the POST. An explicitly caller-confirmed manual dispatch remains
+status-only and supplies no recovery or pass authority.
+That resolution receipt exactly covers every canonical closure entry with
+parser/source digests, complete references, and bijective full-entry edges; its
+digest belongs to the stable snapshot. The separate completion receipt joins
+the preflight digest to a separate authenticated parent-owned platform
+observation for exact query endpoint, delivery/returned ID, closed run
+object/digest, and run/head/workflow/ref/job identities. Completion fields
+cannot self-attest. Tuple equality never creates repeat safety, and mutation authorization
+remains separate. Stop mutations at provider/contract caps while hourly
+monitoring remains unlimited. Existing-run full and failed-jobs reruns are
+distinct operations: bind an independent authenticated attempt-`n`
+pre-observation, API `2026-03-10` HTTP 201 POST to exact `/rerun` or
+`/rerun-failed-jobs` with no body, and authenticated HTTP 200 GET of exact
+`/attempts/{n+1}` proving exact `n+1`, attempt-`n` `previous_attempt_url`, and
+acquisition ordering. Cross-mode or stale/current-run-only evidence is
+status-only.
+Follow the exact-attempt GET with an authenticated current-run GET proving the
+same identity and current `run_attempt == n+1`. Join pre-observation, 201 POST,
+both post observations, response/acquisition ordering, and platform
+`run_started_at`/`updated_at` in one closed transaction receipt; historical
+attempt replay or a possible intervening rerun is status-only.
+Before either automatic rerun, apply the ordinary merge-status dependency
+semantics to the complete graph. An external reusable-workflow selector from a
+workflow or reusable-workflow source exactly names the target canonical
+repository/workflow-path, which must be a direct `.github/workflows/*.yml` or
+`.github/workflows/*.yaml` child rather than a nested path, and ends in its
+lowercase full commit SHA. Each canonical-repository-identity/commit/path
+identifies one kind and blob, each source-entry/raw-selector pair identifies
+one target, and each
+canonical-repository-identity/commit/action-manifest directory identifies at most one action
+entry; a competing `action.yml` and `action.yaml` pair is status-only. An
+external action selector from a workflow, reusable-workflow, or action source exactly
+names the target canonical repository plus its action-manifest directory—or
+repository root for a root manifest—and ends in its lowercase full commit SHA.
+A workflow or reusable workflow may instead bind a same-repository,
+same-running-commit reusable workflow by exact `./.github/workflows/...` or
+`$/.github/workflows/...`; a `$/` action selector from a workflow, reusable
+workflow, or action may bind the source repository and running commit to the
+exact target action-manifest directory. Workflow/reusable-workflow `./` or
+`../` local actions and all untyped bare action-manifest-to-script relative refs
+are status-only because version 1 cannot close their runtime resolution bases.
+Require every closure entry to be reachable from the authenticated root. The
+root job identity must equal the root workflow identity exactly and have no
+inbound edge. Every non-root job identity must be a reusable-workflow entry with
+exactly one total inbound edge that semantically matches its job ref from a
+workflow or reusable-workflow source. The external arm requires a full-SHA raw
+selector and identity ref equal to the resolved commit, with the external edge
+reference exactly equal to the canonical raw job identity ref. A same-repository
+local `./` or `$/` arm may retain its platform-authenticated branch-like raw job
+identity ref only while target and resolved commit equal the source running
+commit and the unique local edge exactly matches repository and workflow path.
+Tags, expressions, mismatched repository/commit/path, disconnected entries, and
+unknown forms are status-only. Apply this conservative rule to both full and
+failed-jobs reruns; version 1 does not bind every external action dependency
+needed for a narrower exception.
+status-only monitoring may continue without a time ceiling. Never reconcile a
+substantive finding, test failure, policy failure, or comment creation as
+infrastructure. Any later status from a manual dispatch is consumed only
+through an independent ordinary producer/status contract.
 
 ## Parent Classification
 

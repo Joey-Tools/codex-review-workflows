@@ -4,14 +4,14 @@ import ast
 import contextlib
 import functools
 import hashlib
-import io
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pathlib
-import py_compile
 import pwd
+import py_compile
 import re
 import shutil
 import signal
@@ -26,20 +26,19 @@ import venv
 from collections.abc import Callable
 from unittest import mock
 
-
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime import review_workspace as review_workspace_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
+    TRUSTED_PATH,
     BoundedCapture,
     ForwardedSignal,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
-    TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
     LEGACY_PREFIX_RECEIPT_SCHEMA_VERSION,
@@ -54,18 +53,22 @@ from review_runtime.named_lane import (  # noqa: E402
     LegacyPrefixReceiptInconclusive,
     NamedLaneGuardError,
     _read_symlink_blobs,
-    _validate_materializer_git_version,
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
+    _validate_materializer_git_version,
     build_sanitized_git_argv_prefix,
-    main as _named_lane_main,
     materialize_worktree,
-    run_claude as _run_claude,
     sanitized_git_argv_prefix_receipt,
+    validate_published_sanitized_git_argv_prefix_receipt,
     validate_sanitized_git_argv_prefix,
     validate_sanitized_git_argv_prefix_receipt,
-    validate_published_sanitized_git_argv_prefix_receipt,
     validate_worktree,
+)
+from review_runtime.named_lane import (  # noqa: E402
+    main as _named_lane_main,
+)
+from review_runtime.named_lane import (  # noqa: E402
+    run_claude as _run_claude,
 )
 
 
@@ -442,6 +445,42 @@ raise SystemExit(returncode)
         receipt_path.write_bytes(issued.stdout)
         receipt_path.chmod(0o600)
         return receipt_path, receipt
+
+    def add_darwin_acl_entry(
+        self,
+        path: pathlib.Path,
+        entry: str,
+        *,
+        inherited: bool = False,
+    ) -> None:
+        completed = subprocess.run(
+            ["/bin/chmod", "+ai" if inherited else "+a", entry, str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            self.skipTest("filesystem does not support Darwin extended ACLs")
+        listing = subprocess.run(
+            ["/bin/ls", "-lde", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if listing.returncode != 0 or len(listing.stdout.splitlines()) < 2:
+            self.clear_darwin_acl(path)
+            self.skipTest("filesystem did not retain a Darwin extended ACL")
+
+    def clear_darwin_acl(self, path: pathlib.Path) -> None:
+        subprocess.run(
+            ["/bin/chmod", "-N", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
 
     def run_published_prefix_receipt_validation(
         self,
@@ -1140,6 +1179,503 @@ raise SystemExit(returncode)
                     json.loads(completed.stderr)["status"],
                     "blocked-safety",
                 )
+
+    def test_owner_private_acl_classifier_accepts_only_owner_allows(self) -> None:
+        owner = b"o" * 16
+        other = b"x" * 16
+        allow = named_lane_runtime._DARWIN_ACL_EXTENDED_ALLOW
+        deny = named_lane_runtime._DARWIN_ACL_EXTENDED_DENY
+
+        accepted = (
+            (),
+            ((deny, other),),
+            ((allow, owner),),
+            ((deny, other), (allow, owner)),
+        )
+        rejected = (
+            ((allow, other),),
+            ((allow, owner), (allow, other)),
+            ((allow, b"short"),),
+            ((deny, b"short"),),
+            ((99, owner),),
+        )
+        for entries in accepted:
+            with self.subTest(result="accepted", entries=entries):
+                self.assertTrue(
+                    named_lane_runtime._darwin_acl_entries_preserve_owner_private_access(
+                        entries,
+                        owner_qualifier=owner,
+                    )
+                )
+        self.assertTrue(
+            named_lane_runtime._darwin_acl_entries_preserve_owner_private_access(
+                (),
+                owner_qualifier=b"short",
+            )
+        )
+        for entries in rejected:
+            with self.subTest(result="rejected", entries=entries):
+                self.assertFalse(
+                    named_lane_runtime._darwin_acl_entries_preserve_owner_private_access(
+                        entries,
+                        owner_qualifier=owner,
+                    )
+                )
+
+    def test_owner_private_acl_inspection_is_descriptor_bound_and_closed(
+        self,
+    ) -> None:
+        receipt_path = self.root / "owner-private-acl-inspection.json"
+        receipt_path.write_text("{}", encoding="utf-8")
+        receipt_descriptor = os.open(receipt_path, os.O_RDONLY)
+        owner_uid = os.fstat(receipt_descriptor).st_uid
+        owner_qualifier = b"o" * 16
+        try:
+            with (
+                mock.patch.object(named_lane_runtime.sys, "platform", "darwin"),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_legacy_extended_acl_entries",
+                    return_value=(
+                        (
+                            named_lane_runtime._DARWIN_ACL_EXTENDED_ALLOW,
+                            owner_qualifier,
+                        ),
+                    ),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_darwin_uid_acl_qualifier",
+                    return_value=owner_qualifier,
+                ) as resolve_owner,
+            ):
+                named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                    receipt_descriptor,
+                    label="file",
+                )
+            resolve_owner.assert_called_once_with(
+                owner_uid,
+                label="sanitized Git argv prefix receipt file owner",
+            )
+
+            for failed_dependency, replacement in (
+                (
+                    "_legacy_extended_acl_entries",
+                    mock.Mock(side_effect=NamedLaneGuardError("ACL inventory failed")),
+                ),
+                (
+                    "_darwin_uid_acl_qualifier",
+                    mock.Mock(side_effect=NamedLaneGuardError("owner lookup failed")),
+                ),
+            ):
+                with (
+                    self.subTest(failed_dependency=failed_dependency),
+                    mock.patch.object(named_lane_runtime.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_legacy_extended_acl_entries",
+                        return_value=(
+                            (
+                                named_lane_runtime._DARWIN_ACL_EXTENDED_ALLOW,
+                                owner_qualifier,
+                            ),
+                        ),
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        failed_dependency,
+                        replacement,
+                    ),
+                    self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "extended ACL cannot be inspected",
+                    ),
+                ):
+                    named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                        receipt_descriptor,
+                        label="file",
+                    )
+        finally:
+            os.close(receipt_descriptor)
+
+    def test_owner_private_acl_check_resolves_owner_only_for_allow(self) -> None:
+        deny = named_lane_runtime._DARWIN_ACL_EXTENDED_DENY
+        allow = named_lane_runtime._DARWIN_ACL_EXTENDED_ALLOW
+        qualifier = b"q" * 16
+
+        for entries in ((), ((deny, qualifier),)):
+            with (
+                self.subTest(entries=entries),
+                mock.patch.object(named_lane_runtime.sys, "platform", "darwin"),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_legacy_extended_acl_entries",
+                    return_value=entries,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_darwin_uid_acl_qualifier",
+                ) as resolve_owner,
+            ):
+                named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                    -1,
+                    label="file",
+                )
+            resolve_owner.assert_not_called()
+
+        for entries in (((deny, b"short"),), ((99, qualifier),)):
+            with (
+                self.subTest(entries=entries),
+                mock.patch.object(named_lane_runtime.sys, "platform", "darwin"),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_legacy_extended_acl_entries",
+                    return_value=entries,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_darwin_uid_acl_qualifier",
+                ) as resolve_owner,
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "non-owner extended ACL grant",
+                ),
+            ):
+                named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                    -1,
+                    label="file",
+                )
+            resolve_owner.assert_not_called()
+
+        receipt_path = self.root / "owner-allow-acl-resolution.json"
+        receipt_path.write_text("{}", encoding="utf-8")
+        receipt_descriptor = os.open(receipt_path, os.O_RDONLY)
+        owner_uid = os.fstat(receipt_descriptor).st_uid
+        try:
+            with (
+                mock.patch.object(named_lane_runtime.sys, "platform", "darwin"),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_legacy_extended_acl_entries",
+                    return_value=((allow, qualifier),),
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_darwin_uid_acl_qualifier",
+                    return_value=qualifier,
+                ) as resolve_owner,
+            ):
+                named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                    receipt_descriptor,
+                    label="file",
+                )
+            resolve_owner.assert_called_once_with(
+                owner_uid,
+                label="sanitized Git argv prefix receipt file owner",
+            )
+        finally:
+            os.close(receipt_descriptor)
+
+    def test_owner_private_acl_check_is_not_applicable_off_darwin(self) -> None:
+        with (
+            mock.patch.object(named_lane_runtime.sys, "platform", "linux"),
+            mock.patch.object(
+                named_lane_runtime,
+                "_legacy_extended_acl_entries",
+            ) as inspect_acl,
+            mock.patch.object(
+                named_lane_runtime,
+                "_darwin_uid_acl_qualifier",
+            ) as resolve_owner,
+        ):
+            named_lane_runtime._require_prefix_receipt_owner_private_acl(
+                -1,
+                label="file",
+            )
+
+        inspect_acl.assert_not_called()
+        resolve_owner.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_guard_live_consumer_accepts_redundant_owner_acl_grants(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "owner-acl-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="owner-acl-prefix-receipt",
+        )
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        policy_paths = (
+            (receipt_path.parent, "write,delete,delete_child", False),
+            (receipt_path, "read,write", True),
+        )
+        try:
+            for policy_path, permissions, inherited in policy_paths:
+                self.add_darwin_acl_entry(
+                    policy_path,
+                    f"user:{username} allow {permissions}",
+                    inherited=inherited,
+                )
+            validated = validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+        finally:
+            for policy_path, _permissions, _inherited in policy_paths:
+                self.clear_darwin_acl(policy_path)
+
+        self.assertEqual(validated, receipt)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_guard_live_consumer_rejects_initial_non_owner_acl_grants(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "initial-acl-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="initial-acl-prefix-receipt",
+        )
+
+        for principal, inherited in (
+            ("user:nobody", False),
+            ("group:wheel", False),
+            ("group:everyone", False),
+            ("group:everyone", True),
+        ):
+            for label, policy_path, permissions in (
+                ("parent", receipt_path.parent, "write,delete,delete_child"),
+                ("file", receipt_path, "read,write"),
+            ):
+                with self.subTest(
+                    principal=principal,
+                    inherited=inherited,
+                    label=label,
+                ):
+                    self.add_darwin_acl_entry(
+                        policy_path,
+                        f"{principal} allow {permissions}",
+                        inherited=inherited,
+                    )
+                    try:
+                        completed = self.run_published_prefix_receipt_validation(
+                            receipt_path=receipt_path,
+                            prepared=prepared,
+                            base=base,
+                            head=head,
+                            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                        )
+                    finally:
+                        self.clear_darwin_acl(policy_path)
+
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(completed.stdout, "")
+                    failure = json.loads(completed.stderr)
+                    self.assertEqual(failure["status"], "blocked-safety")
+                    self.assertIn(
+                        f"receipt {label} has a non-owner extended ACL grant",
+                        failure["reason"],
+                    )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_live_consumer_accepts_redundant_owner_acl_grant_drift(self) -> None:
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+        prepared, base, head = self.prepared_review_workspace(
+            "owner-acl-drift-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="owner-acl-drift-prefix-receipt",
+        )
+        username = pwd.getpwuid(os.geteuid()).pw_name
+
+        for label, policy_path, permissions in (
+            ("parent", receipt_path.parent, "write,delete,delete_child"),
+            ("file", receipt_path, "read,write"),
+        ):
+            with self.subTest(label=label):
+
+                def add_owner_grant_after_validation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    validated = real_validator(*args, **kwargs)
+                    self.add_darwin_acl_entry(
+                        policy_path,
+                        f"user:{username} allow {permissions}",
+                    )
+                    return validated
+
+                try:
+                    with mock.patch.object(
+                        named_lane_runtime,
+                        "validate_sanitized_git_argv_prefix_receipt",
+                        side_effect=add_owner_grant_after_validation,
+                    ):
+                        validated = (
+                            validate_published_sanitized_git_argv_prefix_receipt(
+                                receipt_file=receipt_path,
+                                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                                worktree=prepared.root,
+                                base=base,
+                                head=head,
+                                git_executable=named_lane_runtime.resolve_git(),
+                            )
+                        )
+                finally:
+                    self.clear_darwin_acl(policy_path)
+
+                self.assertEqual(validated, receipt)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_live_consumer_rejects_receipt_acl_grant_drift(self) -> None:
+        real_validator = named_lane_runtime.validate_sanitized_git_argv_prefix_receipt
+        prepared, base, head = self.prepared_review_workspace(
+            "acl-drift-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="acl-drift-prefix-receipt",
+        )
+        for label, policy_path, permissions in (
+            ("parent", receipt_path.parent, "write,delete,delete_child"),
+            ("file", receipt_path, "read,write"),
+        ):
+            with self.subTest(label=label):
+
+                def add_grant_after_validation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    validated = real_validator(*args, **kwargs)
+                    self.add_darwin_acl_entry(
+                        policy_path,
+                        f"group:everyone allow {permissions}",
+                    )
+                    return validated
+
+                try:
+                    with (
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "validate_sanitized_git_argv_prefix_receipt",
+                            side_effect=add_grant_after_validation,
+                        ),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            rf"receipt {label} has a non-owner extended ACL grant",
+                        ),
+                    ):
+                        validate_published_sanitized_git_argv_prefix_receipt(
+                            receipt_file=receipt_path,
+                            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                            worktree=prepared.root,
+                            base=base,
+                            head=head,
+                            git_executable=named_lane_runtime.resolve_git(),
+                        )
+                finally:
+                    self.clear_darwin_acl(policy_path)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_live_consumer_final_revalidation_rejects_receipt_acl_grant_drift(
+        self,
+    ) -> None:
+        real_publication_validator = (
+            named_lane_runtime._revalidate_prefix_receipt_publication_identities
+        )
+        prepared, base, head = self.prepared_review_workspace(
+            "final-acl-drift-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="final-acl-drift-prefix-receipt",
+        )
+        for label, policy_path, permissions in (
+            ("parent", receipt_path.parent, "write,delete,delete_child"),
+            ("file", receipt_path, "read,write"),
+        ):
+            with self.subTest(label=label):
+
+                def add_grant_after_publication_validation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    real_publication_validator(*args, **kwargs)
+                    self.add_darwin_acl_entry(
+                        policy_path,
+                        f"group:everyone allow {permissions}",
+                    )
+
+                try:
+                    with (
+                        mock.patch.object(
+                            named_lane_runtime,
+                            "_revalidate_prefix_receipt_publication_identities",
+                            side_effect=add_grant_after_publication_validation,
+                        ),
+                        self.assertRaisesRegex(
+                            NamedLaneGuardError,
+                            rf"receipt {label} has a non-owner extended ACL grant",
+                        ),
+                    ):
+                        validate_published_sanitized_git_argv_prefix_receipt(
+                            receipt_file=receipt_path,
+                            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                            worktree=prepared.root,
+                            base=base,
+                            head=head,
+                            git_executable=named_lane_runtime.resolve_git(),
+                        )
+                finally:
+                    self.clear_darwin_acl(policy_path)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACL test")
+    def test_live_consumer_accepts_deny_only_receipt_acls(self) -> None:
+        prepared, base, head = self.prepared_review_workspace(
+            "deny-only-acl-live-consumer-review-workspace"
+        )
+        receipt_path, receipt = self.publish_prefix_receipt(
+            prepared=prepared,
+            base=base,
+            head=head,
+            name="deny-only-acl-prefix-receipt",
+        )
+        username = pwd.getpwuid(os.geteuid()).pw_name
+        policy_paths = (receipt_path.parent, receipt_path)
+        try:
+            for policy_path in policy_paths:
+                self.add_darwin_acl_entry(
+                    policy_path,
+                    f"user:{username} deny write",
+                )
+            validated = validate_published_sanitized_git_argv_prefix_receipt(
+                receipt_file=receipt_path,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                worktree=prepared.root,
+                base=base,
+                head=head,
+                git_executable=named_lane_runtime.resolve_git(),
+            )
+        finally:
+            for policy_path in policy_paths:
+                self.clear_darwin_acl(policy_path)
+
+        self.assertEqual(validated, receipt)
 
     def test_guard_live_consumer_rejects_malformed_or_oversized_receipt_bytes(
         self,

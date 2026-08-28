@@ -4,6 +4,31 @@
   "role": "consumer-terminal-carrier-grammar",
   "producer_contract": "out-of-scope",
   "fixture_patch_semantics": "RFC7396",
+  "canonical_json_profile": {
+    "profile": "rfc8785-fixed-ascii-keys-safe-integers-v1",
+    "object_keys": "closed schema keys are ASCII strings, so byte/code-point ordering equals RFC 8785 UTF-16 ordering",
+    "strings": "every string must encode as UTF-8 from Unicode scalar values; lone surrogate code points are rejected before digesting or classifying. Each string value and each object key is capped at 1048576 UTF-8 bytes, and the aggregate UTF-8 byte count of all string values plus all object keys is capped at 16777216. A string whose code-point count already exceeds 1048576 is rejected before bounded UTF-8 encoding, followed by the exact encoded-byte check",
+    "numbers": "all JSON numbers are exact non-Boolean integers in -9007199254740991..9007199254740991; each business field further requires positive or non-negative as declared",
+    "containers": "only exact list and dict containers are accepted; they must be acyclic, contain at most 100000 JSON value nodes, and have at most 256 levels of container nesting. Container, node, per-string/key UTF-8, aggregate string/key UTF-8, and malformed constructor-input resource-profile violations are malformed or status-only rather than exceptions",
+    "out_of_domain": "reject before digesting or classifying; a future GitHub identifier outside this range requires a new grammar version that represents it as a decimal string",
+    "other_json_numbers": "floating-point, NaN, and infinity are outside this profile"
+  },
+  "repository_identity_profile": {
+    "shape": "ASCII owner/name with exactly two nonempty components, each 1..100 characters from A-Z a-z 0-9 . _ -, excluding the exact components . and ..",
+    "semantic_identity": "compare the owner and repository components case-insensitively for same-repository tests, closure and reachability keys, selector repository segments, candidate exclusion, action-directory uniqueness, and repository-scoped URL/ref joins",
+    "exact_fields": "preserve original repository spellings in raw and digest-bound records; workflow/action paths, commit SHAs, refs, URL suffixes after owner/name, query strings, fragments, and all remaining fields are exact and type-preserving",
+    "rename_boundary": "case-insensitive comparison does not follow owner, repository, action, or reusable-workflow renames and does not claim or infer an immutable repository ID"
+  },
+  "github_url_profile": {
+    "raw_form": "ASCII only, no C0, space, or DEL characters, and the exact lowercase https://github.com/ or https://api.github.com/ prefix required by the field",
+    "round_trip": "the URL must parse and recompose byte-for-byte; uppercase scheme or host, stripped whitespace, and an empty query or fragment delimiter that disappears on recomposition are malformed",
+    "repository_join": "only the owner/name segment compares by canonical case-insensitive repository identity; path, ref, SHA, query, fragment, delimiter presence, and every other suffix byte remain exact"
+  },
+  "safe_repository_path_profile": {
+    "shape": "nonempty canonical relative POSIX path with at least one component",
+    "forbidden": "NUL, backslash, absolute form, empty or dot components, noncanonical spelling, and the exact path .",
+    "meaning": "lexical repository path safety only; later receipts still bind the expected blob and kind"
+  },
   "normalization": {
     "input": "unicode-scalar-values",
     "line_breaks_to_lf": [
@@ -468,7 +493,9 @@
         "server_time_field",
         "scope",
         "contract",
-        "provider_clean_assertion"
+        "provider_clean_assertion",
+        "producer_implementation_receipt_sha256",
+        "producer_dependency_resolution_receipt_sha256"
       ],
       "merge_status_scope": [
         "repository",
@@ -494,6 +521,143 @@
         "check_run_id",
         "check_run_url",
         "provider_clean_assertion"
+      ],
+      "merge_status_contract_trust_anchor": [
+        "owner",
+        "status",
+        "profile",
+        "source",
+        "candidate_scope",
+        "trusted_contract"
+      ],
+      "merge_status_trust_anchor_source": [
+        "kind",
+        "identity",
+        "sha256"
+      ],
+      "merge_status_trust_anchor_candidate_scope": [
+        "repository",
+        "base_sha",
+        "head_sha",
+        "relation"
+      ],
+      "merge_status_trusted_contract": [
+        "contract_descriptor",
+        "app_id",
+        "app_slug",
+        "workflow_id",
+        "check_name",
+        "provider_clean_assertion"
+      ],
+      "merge_status_candidate_range_exclusion_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "base_sha",
+        "head_sha",
+        "source",
+        "candidate_commits",
+        "candidate_commit_count",
+        "candidate_commits_sha256"
+      ],
+      "merge_status_producer_implementation_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "provider_kind",
+        "attestation_source",
+        "repository",
+        "feature_head_sha",
+        "run_ref",
+        "run_id",
+        "run_attempt",
+        "check_suite_id",
+        "check_run_id",
+        "workflow_id",
+        "workflow_repository",
+        "workflow_path",
+        "workflow_sha",
+        "workflow_ref",
+        "workflow_ref_identity",
+        "job_workflow_ref",
+        "job_workflow_ref_identity",
+        "external_implementation_id",
+        "implementation_closure_complete",
+        "implementation_closure",
+        "implementation_closure_count",
+        "implementation_closure_sha256",
+        "receipt_sha256"
+      ],
+      "merge_status_implementation_entry": [
+        "repository",
+        "commit",
+        "path",
+        "blob_sha256",
+        "kind"
+      ],
+      "merge_status_workflow_ref_identity": [
+        "repository",
+        "path",
+        "ref",
+        "resolved_commit",
+        "entry",
+        "entry_sha256"
+      ],
+      "merge_status_dependency_resolver_anchor": [
+        "owner",
+        "status",
+        "profile",
+        "kind",
+        "repository",
+        "commit",
+        "path",
+        "sha256",
+        "candidate_range_exclusion_sha256",
+        "receipt_sha256"
+      ],
+      "merge_status_installed_release_provenance": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "commit",
+        "manifest_identity",
+        "manifest_sha256",
+        "installed_identity",
+        "installed_sha256",
+        "receipt_sha256"
+      ],
+      "merge_status_dependency_resolution_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "implementation_receipt_sha256",
+        "resolver_anchor_receipt_sha256",
+        "records",
+        "record_count",
+        "records_sha256",
+        "edges",
+        "edge_count",
+        "edges_sha256",
+        "receipt_sha256"
+      ],
+      "merge_status_dependency_resolution_record": [
+        "source_entry",
+        "parser_profile",
+        "source_sha256",
+        "discovered_references",
+        "discovered_reference_count",
+        "record_sha256"
+      ],
+      "merge_status_dependency_reference": [
+        "reference",
+        "target_entry"
+      ],
+      "merge_status_dependency_edge": [
+        "source_entry",
+        "reference",
+        "target_entry"
       ],
       "reaction_clean_epoch": [
         "owner",
@@ -632,6 +796,46 @@
         "merge_status_scope": "initial_merge_status_scope and final_merge_status_scope are null for non-merge-status bases; for merge-status they are type-preserving equal closed merge_status_scope values that equal the separately frozen parent scope and bind the exact feature head, base ref/tip, unique merge base, subject kind, and check-subject SHA",
         "snapshot_stability": "initial_snapshot_sha256 and final_snapshot_sha256 are equal lowercase SHA-256 digests of RFC 8785 canonical JSON for the complete raw selected-PR snapshot, including exact scope/head, merge-status scope when selected, raw issue/review/inline/thread, nested thread-comment, and reaction pages, page envelopes and typed counts, all derived terminal candidates and ordering, the selected latest terminal or producer result, the independently selected pass-basis projection, unresolved applicable findings, and both subject-discriminated check/status page sets; they are not digests of report summaries"
       },
+      "merge_status_contract_trust_anchor": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-merge-status-contract-trust-anchor-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from a contract source outside the candidate range before candidate report, association, merge_status_parent_contract, or complete_pr_snapshot validation; read-only to the consumer and never derived from candidate-head files or any coupled candidate/report input",
+        "source": "closed source identity with kind target-branch-baseline, installed-trusted-release, or parent-fixed-external; source_repository is valid ASCII owner/name with case-insensitive semantic identity, while identity retains the exact original UTF-8 source_repository@source_commit:source_path descriptor spelling and sha256 equals the independently verified source bytes digest",
+        "candidate_scope": "closed candidate repository plus exact merge-base-to-feature-head range with relation outside-candidate-range; repository joins the independent merge_status_scope repository by canonical case-insensitive ASCII owner/name identity, while base_sha and head_sha exactly equal merge_base_sha and feature_head_sha",
+        "trusted_contract": "closed stable producer identity containing the exact contract descriptor, App ID/slug, workflow ID, check name, and provider-clean assertion; every field is type-preservingly equal to merge_status_parent_contract and report association while run, attempt, suite, and check-run identities remain dynamic current-evidence bindings",
+        "source_exclusion": "a separate closed parent-owned merge_status_candidate_range_exclusion_receipt binds the exact raw descriptor source, repository, base_sha, head_sha, and complete byte-sorted base..head commit set; the consumer verifies its digest and mechanically rejects a source_commit present anywhere in that set when source and candidate repositories share the canonical case-insensitive ASCII owner/name identity; target-branch-baseline additionally requires that canonical repository identity plus exact current base_tip_sha, while parent-fixed-external additionally requires a distinct canonical repository identity"
+      },
+      "merge_status_candidate_range_exclusion_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-merge-status-candidate-range-exclusion-v1",
+        "trust_boundary": "frozen and persisted independently by the parent from a complete local git rev-list of base_sha..head_sha with lazy fetching disabled before report or contract validation; read-only to the reference consumer and never derived from candidate-head files, report fields, or a coupled candidate input",
+        "scope_binding": "repository joins the independent merge_status_scope repository by canonical case-insensitive ASCII owner/name identity; base_sha and head_sha type-preservingly equal merge_base_sha and feature_head_sha; source is the exact unchanged closed merge_status_contract descriptor from the separately trusted anchor",
+        "candidate_commits": "the exact complete non-empty byte-sorted unique lowercase 40-hex commit IDs returned for base_sha..head_sha; head_sha occurs exactly once and base_sha is absent",
+        "candidate_commits_sha256": "lowercase SHA-256 over exact commit-id + LF rows in the recorded byte-sorted order; candidate_commit_count is the exact typed list length",
+        "exclusion": "when source.source_repository and repository have the same canonical case-insensitive ASCII owner/name identity, source.source_commit must not occur in candidate_commits; this mechanically rejects case aliases of the head and every non-head candidate commit while allowing a separately trusted base-side or earlier installed release"
+      },
+      "merge_status_producer_implementation_receipt": {
+        "owner": "parent-orchestrator",
+        "status": "complete",
+        "profile": "github-codex-merge-status-producer-implementation-v1",
+        "trust_boundary": "frozen from platform-authenticated run and job metadata plus an independently enumerated immutable implementation closure before report validation; read-only to this reference consumer and never derived from candidate report or candidate-head bytes",
+        "run_binding": "repository joins the independent selected run/check repository by canonical case-insensitive ASCII owner/name identity; workflow_id, run_id, run_attempt, check_suite_id, and check_run_id remain type-preservingly exact; github-actions additionally binds exact platform-authenticated workflow_sha, workflow_ref, and job_workflow_ref",
+        "github_actions": "provider_kind github-actions requires attestation_source github-actions-api, valid ASCII owner/name workflow repository identity plus exact non-null path/full SHA/ref/job ref, null external_implementation_id, and closed parsed identities for workflow_ref and job_workflow_ref. Each original raw platform identity and repository spelling remains exact and digest-bound; semantic repository segments join case-insensitively while path/ref suffixes remain exact. Each parsed identity binds resolved_commit plus the exact full canonical closure entry and its digest. The root workflow canonical repository identity equals the receipt and report repository identity, its identity entry is kind workflow and joins workflow_repository/path/workflow_sha using canonical repository identity plus exact path/SHA, its ref equals run_ref exactly, and it has no inbound dependency edge. Every non-root job identity entry is kind reusable-workflow and has exactly one total inbound edge that semantically matches its job ref. An external job arm case-folds only the selector repository segment and requires the unique edge reference suffix to equal the canonical raw job identity ref suffix exactly and end in the target full commit SHA equal to resolved_commit. A same-repository local ./ or $/ reusable-workflow arm may retain its platform-authenticated branch-like raw identity ref only while the exact target entry and resolved_commit equal the source running commit and the unique local edge matches canonical repository identity plus exact workflow path",
+        "external_app": "the accepted external-App implementation-binding profile set is empty in version 1. A nonempty external_implementation_id plus a self-digested closure cannot authenticate ID-to-root-to-closure provenance, so provider_kind external-app is always unavailable for merge-status and terminal-clean fallback remains available",
+        "implementation_closure": "complete non-empty byte-key-sorted unique closed raw entries for the workflow blob and every transitive local or reusable workflow/action/script dependency capable of deciding clean; each entry binds a valid ASCII owner/name repository spelling, immutable commit, a path accepted by safe_repository_path_profile, blob SHA-256, and kind workflow, reusable-workflow, action, or script. Canonical case-insensitive repository identity plus exact commit/path identifies exactly one kind and blob. Workflow and reusable-workflow paths are direct .github/workflows children with a .yml or .yaml suffix. Action paths end in action.yml or action.yaml, and canonical repository identity plus exact commit/action-manifest directory identifies at most one action entry. Original entry spellings remain unchanged in canonical-JSON digests",
+        "candidate_exclusion": "join every closure entry whose canonical case-insensitive repository identity equals the candidate repository identity to the separately complete candidate-range exclusion receipt and reject any entry whose commit occurs in base..head; a repository case alias cannot hide candidate-controlled workflow or dependency bytes",
+        "digests": "implementation_closure_sha256 is RFC 8785 canonical JSON SHA-256 of the exact closure list; receipt_sha256 is RFC 8785 canonical JSON SHA-256 of every receipt field except receipt_sha256"
+      },
+      "merge_status_dependency_resolution_receipt": {
+        "trust_boundary": "a separate closed parent-owned resolver-source anchor pins resolver bytes outside the candidate range; target-branch-baseline requires exact candidate repository and current base tip, parent-fixed-external requires a different repository, and installed-trusted-release additionally requires a separate closed parent-owned installed release manifest/provenance receipt. The resolution receipt is frozen independently before report and complete-snapshot validation and joins that anchor plus the exact producer implementation receipt digest",
+        "record_coverage": "records byte-key-sort and exactly cover every canonical implementation closure entry by original repository spelling, immutable commit, a path accepted by safe_repository_path_profile, kind, and blob SHA-256; blob digest alone is never entry identity, and canonical case-insensitive repository identity plus exact commit/path identifies exactly one kind and blob. Each raw record remains type-preserving and digest-bound, binds the exact parser profile and source digest, and records the complete discovered reference list, including an explicit empty list only when parsing found none",
+        "edge_bijection": "each discovered reference carries its exact raw canonical target entry and produces exactly one full source-entry/reference/target-entry edge; within each source-entry record, canonical selector identity consists of the case-insensitive repository segment plus the exact remaining raw selector suffix and identifies exactly one target. The sorted exact raw edge list must equal that projection with no missing, extra, duplicate, case-alias, or coupled-forged edge. Reachability keys use canonical repository identity plus exact commit/path/kind/blob. The root job identity joins the root workflow using canonical repository identity plus exact remaining fields and has no inbound edge. Every non-root job identity entry is kind reusable-workflow, has exactly one total inbound edge, and has that unique edge semantically match its job ref from a workflow or reusable-workflow source under canonical repository identity plus exact path/ref semantics",
+        "relative_runtime_binding": "workflow and reusable-workflow targets are direct .github/workflows children with a .yml or .yaml suffix, not nested paths. An external reusable-workflow selector from a workflow or reusable-workflow source names the target by a case-insensitive valid ASCII owner/name repository segment followed by exact workflow-path@full-commit bytes. An external action selector from a workflow, reusable-workflow, or action source names the target by that canonical repository segment followed by the exact action-manifest-directory@full-commit bytes, or exact @full-commit suffix for a root manifest. An action target path ends in action.yml or action.yaml, and at most one action target exists for each canonical repository identity/exact commit/action-manifest directory; competing action.yml and action.yaml entries are status-only. A workflow or reusable-workflow source may instead bind a same-repository same-running-commit reusable workflow by exact ./.github/workflows/... or $/.github/workflows/.... A $/ action selector from a workflow, reusable-workflow, or action source binds that source canonical repository identity and exact running commit and selects the exact target action-manifest directory. Workflow/reusable-workflow ./ or ../ local-action selectors have no closed runner-workspace binding in version 1. An untyped bare action-manifest-to-script relative ref has no declared resolution base. Those and every unrecognized relative form are status-only. Repository case folding never changes path/ref bytes, follows a rename, or rewrites the digest-bound raw selector",
+        "digests": "every record excludes only record_sha256 from its canonical digest; records_sha256 and edges_sha256 bind the exact lists; receipt_sha256 excludes only itself",
+        "snapshot_binding": "merge_status_basis_selection and therefore the complete stable snapshot basis include producer_dependency_resolution_receipt_sha256 independently from producer_implementation_receipt_sha256"
+      },
       "reaction_clean_epoch": {
         "owner": "parent-orchestrator",
         "status": "complete",
@@ -672,7 +876,7 @@
         "owner": "parent-orchestrator",
         "status": "complete",
         "trust_boundary": "frozen and persisted independently by the parent from the exact current selected-PR range before carrier observation or report validation; read-only to the consumer and never derived from raw_carrier, complete_observation, report, or evidence fields",
-        "scope": "repository and pull_request equal the selected report and complete-observation scope; base_sha is the locally proved unique PR merge base, head_sha is the exact current head, base_is_unique_merge_base and base_is_ancestor_of_head are exact true, and history_mode is exact full-dag",
+        "scope": "repository joins the selected report and complete-observation repository by canonical case-insensitive ASCII owner/name identity while every raw spelling remains unchanged; pull_request equals those scopes type-preservingly; base_sha is the locally proved unique PR merge base, head_sha is the exact current head, base_is_unique_merge_base and base_is_ancestor_of_head are exact true, and history_mode is exact full-dag",
         "ancestor_set": "ancestor_shas is the complete lowercase full-SHA set from base_sha..head_sha excluding both endpoints, ordered by ascending ASCII SHA with no duplicates; ancestor_count is a typed non-negative integer equal to its length and ancestor_shas_sha256 is recomputed over each ordered ASCII SHA followed by LF",
         "carrier_join": "every complete-observation candidate and selected raw_carrier has a type-preserving exact scope equal to the receipt projection, including base_sha, head_sha, ancestor_shas, and a closed parent-orchestrator complete ancestor_shas_projection with the receipt count and digest; only head_sha or membership in this independent receipt can make a finding applicable",
         "invalidation": "a repository, PR, head, unique merge base, or full-DAG ancestor-set change requires a new receipt and observation; same-head base movement, a coupled raw ancestry rewrite, first-parent projection, or ancestry-path omission cannot repair an old receipt"
@@ -818,7 +1022,7 @@
       "resolved-inline-awaiting-clean": {
         "status": "pending",
         "completion": "forbidden-until-later-accepted-current-head-terminal-clean",
-        "recovery": "same-head idempotent repository-Action reconcile under github-pr-probes retry policy",
+        "recovery": "same-head repository-Action reconcile only through a candidate-range-external closed trusted recovery contract that binds the exact operation and inputs and explicitly declares that operation idempotent or reentrant under the github-pr-probes retry policy; tuple equality alone never supplies repeat safety",
         "last_reason": "resolved-inline-awaiting-current-head-clean",
         "evidence_kind": "terminal-artifact",
         "branch": "inline-parent-v1",
@@ -841,8 +1045,8 @@
         "parent_scope_binding": "report repository, pull request, and head plus the current base/merge/check-subject scope equal independently supplied parent inputs",
         "stable_identity": "positive check-run ID and exact repository /runs/<ID> URL",
         "app_binding": "raw exact app ID and slug equal the independently parent-verified association contract",
-        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and exact provider-clean assertion equal the report association",
-        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds equal initial/final current feature-head/base/merge/check-subject scope, complete typed page state, stable canonical snapshot digests, exact stable contract-verified producer-clean selection, exact App/workflow/run/check/producer-contract basis, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
+        "parent_contract_input": "separate closed parent-owned merge_status_parent_contract whose exact raw contract-descriptor UTF-8 bytes, trusted App, workflow/run/attempt, check suite/name/run identity, and provider-clean assertion equal the report association, plus a separately frozen merge_status_contract_trust_anchor, merge_status_candidate_range_exclusion_receipt, merge_status_producer_implementation_receipt, resolver source anchor, and dependency resolution receipt from outside the candidate range; the digest-bound receipts bind the exact source, actual platform-authenticated run implementation, exact per-entry parser coverage and resolved dependency edges, and complete base..head commit set so any source, workflow, resolver, or dependency sharing the candidate's canonical case-insensitive repository identity at a candidate commit is rejected, and none can be supplied by candidate-head files",
+        "parent_complete_snapshot_input": "separate closed parent-owned complete_pr_snapshot binds equal initial/final current feature-head/base/merge/check-subject scope, complete typed page state, stable canonical snapshot digests, exact stable contract-verified producer-clean selection, exact App/workflow/run/check/producer-contract basis plus independent producer implementation and dependency-resolution receipt digests, and zero unresolved applicable findings; report association fields cannot supply or repair this input",
         "provider_clean_assertion": "exact github-codex-provider-clean semantics with scope latest-feature-head for a feature-head subject or current-merge-scope for a github-synthetic-merge subject, and exact true unresolved_findings_required_zero",
         "association": "complete parent-owned binding of this exact check subject and App/workflow/run/check to independently verified producer-contract bytes whose success conclusion itself means GitHub Codex provider clean for the declared scope; a generic successful check or service-start marker is invalid"
       },
@@ -860,6 +1064,286 @@
         "finding_artifact_commit": "required-full-sha",
         "finding_head_binding": "explicit-commit"
       }
+    }
+  },
+  "recovery_operation_contract_schema": {
+    "schema": "github-codex-recovery-operation-two-phase-v1",
+    "role": "machine-readable-reference-and-test-only",
+    "production_consumer": "out-of-scope",
+    "closed_fields": {
+      "preflight_contract": [
+        "owner",
+        "status",
+        "profile",
+        "source_descriptor",
+        "source_trust_anchor",
+        "candidate_range_exclusion_receipt",
+        "repository",
+        "pull_request",
+        "head_sha",
+        "operation_intent",
+        "repeat_safety",
+        "implementation_receipt_identity",
+        "dependency_edge_resolution_receipt",
+        "pre_mutation_run_observation",
+        "preflight_sha256"
+      ],
+      "completion_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "preflight_sha256",
+        "pre_mutation_observation_sha256",
+        "dispatch_delivery_receipt_sha256",
+        "platform_observation_receipt_sha256",
+        "post_current_observation_receipt_sha256",
+        "acquisition_transaction_receipt_sha256",
+        "returned_run_id",
+        "observed_repository",
+        "observed_run_attempt",
+        "observed_head_sha",
+        "observed_workflow_id",
+        "observed_workflow_sha",
+        "observed_workflow_ref",
+        "observed_run_ref",
+        "observed_job_workflow_ref",
+        "completion_sha256"
+      ],
+      "platform_dispatch_run_observation_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "query_repository",
+        "query_endpoint",
+        "api_version",
+        "http_method",
+        "response_status",
+        "response_date",
+        "preflight_sha256",
+        "operation_identity_sha256",
+        "dispatch_delivery_receipt_sha256",
+        "request_delivery_status",
+        "returned_run_id",
+        "run_object",
+        "run_object_sha256",
+        "platform_identity",
+        "receipt_sha256"
+      ],
+      "dispatch_delivery_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "api_version",
+        "http_method",
+        "request_endpoint",
+        "request_body",
+        "request_body_encoding",
+        "request_body_sha256",
+        "request_server_time",
+        "delivery_status",
+        "response_status",
+        "response",
+        "response_sha256",
+        "returned_run_id",
+        "unique_run_id",
+        "receipt_sha256"
+      ],
+      "platform_run_object": [
+        "id",
+        "repository",
+        "run_attempt",
+        "observed_at",
+        "run_started_at",
+        "updated_at",
+        "previous_attempt_url",
+        "head_sha",
+        "workflow_id",
+        "workflow_sha",
+        "workflow_ref",
+        "run_ref",
+        "job_workflow_ref"
+      ],
+      "platform_identity": [
+        "source",
+        "authenticated"
+      ],
+      "recovery_acquisition_transaction_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "run_id",
+        "pre_observation_sha256",
+        "delivery_receipt_sha256",
+        "exact_attempt_observation_sha256",
+        "current_run_observation_sha256",
+        "pre_response_date",
+        "pre_acquired_at",
+        "post_server_time",
+        "exact_response_date",
+        "exact_acquired_at",
+        "current_response_date",
+        "current_acquired_at",
+        "no_intervening_rerun",
+        "receipt_sha256"
+      ],
+      "pre_mutation_run_observation": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "query_endpoint",
+        "api_version",
+        "http_method",
+        "response_status",
+        "response_date",
+        "run_id",
+        "run_attempt",
+        "observed_at",
+        "head_sha",
+        "workflow_id",
+        "workflow_sha",
+        "workflow_ref",
+        "run_ref",
+        "job_workflow_ref",
+        "platform_identity",
+        "receipt_sha256"
+      ],
+      "source_descriptor": [
+        "source_repository",
+        "source_commit",
+        "source_path",
+        "source_sha256"
+      ],
+      "source_trust_anchor": [
+        "owner",
+        "status",
+        "profile",
+        "kind",
+        "identity",
+        "sha256",
+        "repository",
+        "base_sha",
+        "head_sha"
+      ],
+      "candidate_range_exclusion_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "repository",
+        "base_sha",
+        "head_sha",
+        "source",
+        "candidate_commits",
+        "candidate_commit_count",
+        "candidate_commits_sha256"
+      ],
+      "existing_run_rerun_operation_intent": [
+        "repository",
+        "kind",
+        "workflow_id",
+        "run_id",
+        "pre_run_attempt",
+        "expected_run_attempt",
+        "ref",
+        "inputs"
+      ],
+      "input": [
+        "name",
+        "value"
+      ],
+      "repeat_safety": [
+        "declaration",
+        "operation_identity_sha256",
+        "authorization_independent"
+      ],
+      "implementation_receipt_identity": [
+        "profile",
+        "receipt_sha256",
+        "provider_kind",
+        "repository",
+        "workflow_sha",
+        "workflow_id",
+        "run_id",
+        "run_ref",
+        "head_sha"
+      ],
+      "implementation_entry": [
+        "repository",
+        "commit",
+        "path",
+        "blob_sha256",
+        "kind"
+      ],
+      "workflow_ref_identity": [
+        "repository",
+        "path",
+        "ref",
+        "resolved_commit",
+        "entry",
+        "entry_sha256"
+      ],
+      "dependency_edge_resolution_receipt": [
+        "owner",
+        "status",
+        "profile",
+        "implementation_receipt_sha256",
+        "repository",
+        "head_sha",
+        "resolver_anchor",
+        "records",
+        "record_count",
+        "records_sha256",
+        "edges",
+        "edge_count",
+        "edges_sha256",
+        "receipt_sha256"
+      ],
+      "recovery_resolver_anchor": [
+        "owner",
+        "status",
+        "profile",
+        "kind",
+        "repository",
+        "commit",
+        "path",
+        "sha256",
+        "candidate_range_exclusion_sha256",
+        "installed_release_manifest_sha256",
+        "receipt_sha256"
+      ],
+      "recovery_resolution_record": [
+        "source_entry",
+        "parser_profile",
+        "source_sha256",
+        "discovered_references",
+        "discovered_reference_count",
+        "record_sha256"
+      ],
+      "recovery_dependency_reference": [
+        "reference",
+        "target_entry"
+      ],
+      "dependency_edge": [
+        "source_entry",
+        "reference",
+        "target_entry"
+      ]
+    },
+    "rules": {
+      "owner_status_profile": "preflight is exact owner parent-orchestrator, status complete, and profile github-codex-recovery-operation-preflight-v1; completion is a separate exact profile github-codex-recovery-operation-completion-v1",
+      "source": "descriptor and trust anchor are exact, closed, digest-bound, parent-owned raw records and join repository/base/head semantically; the complete candidate-range exclusion receipt compares valid ASCII owner/name repositories by case-insensitive canonical identity and rejects a same-identity source_commit anywhere in base..head, including a non-head candidate commit",
+      "scope": "repository is valid ASCII owner/name with case-insensitive semantic identity, pull_request is a positive typed integer, and head_sha is a full lowercase SHA. Producer receipt, implementation identity, operation intent, preflight, delivery, observation query and run object, completion, and every derived endpoint or URL bind the same canonical repository identity while preserving original repository spelling and all non-repository suffix/query/fragment and delimiter bytes type-preservingly under github_url_profile; a coupled cross-repository rehash, parser-normalized URL, or rename alias is invalid",
+      "operation_kinds": "the closed version-1 union has exactly two accepted arms: existing-run-rerun-full and existing-run-rerun-failed-jobs. New workflow_dispatch, manual-workflow-dispatch, comment creation, debug/job reruns, ambiguous legacy reruns, and every other operation kind are outside the authoritative recovery contract and are status-only",
+      "existing_run_rerun": "preflight binds a separate authenticated pre-mutation run observation and exact repository, workflow_id, run_id, run_ref, frozen head, workflow SHA/ref, job workflow identity, and run_attempt to the full independently validated trusted producer receipt. Full rerun uses POST /repos/{repository}/actions/runs/{run_id}/rerun; failed-jobs rerun uses POST /repos/{repository}/actions/runs/{run_id}/rerun-failed-jobs; each requires API 2026-03-10 and HTTP 201. The post-mutation GET targets /repos/{repository}/actions/runs/{run_id}/attempts/{pre_attempt+1}, occurs no earlier than the POST server time, and proves exact run_attempt pre_attempt+1 plus the canonical previous_attempt_url; a current-run snapshot, unchanged attempt, skipped attempt, stale observation, ambiguous mode, or cross-mode endpoint is status-only",
+      "attempt_stable_dependencies": "automatic existing-run rerun uses the same closed dependency semantics as ordinary merge-status. Workflow and reusable-workflow targets are direct .github/workflows children with a .yml or .yaml suffix, not nested paths. Canonical case-insensitive repository identity plus exact commit/path identifies one kind and blob; each source-entry/raw-selector identity, with only its repository segment case-folded and its remaining bytes exact, identifies one target; and canonical repository identity plus exact commit/action-manifest directory identifies at most one action entry, so repository-case aliases and competing action.yml/action.yaml entries are status-only. The canonical repository/workflow-path@full-commit grammar means an external reusable-workflow selector from a workflow or reusable-workflow source compares the repository segment by canonical identity and the workflow-path@full-commit suffix exactly. An external action selector from a workflow, reusable-workflow, or action source likewise compares canonical repository identity followed by exact action-manifest-directory@full-commit bytes, or exact @full-commit for a root manifest. A workflow or reusable-workflow source may instead bind a same-repository same-running-commit reusable workflow by exact ./.github/workflows/... or $/.github/workflows/.... A $/ action selector from a workflow, reusable-workflow, or action source binds the source canonical repository identity and exact running commit and selects the exact target action-manifest directory. Workflow/reusable-workflow ./ or ../ local-action selectors and every untyped bare action-manifest-to-script relative ref are status-only because version 1 cannot close their runtime resolution bases. Reachability keys use canonical repository identity plus exact remaining entry fields. The root job identity joins the root workflow by canonical repository identity plus exact path/commit/kind/blob and has no inbound edge. Every non-root job identity is a reusable-workflow entry with exactly one total inbound edge semantically matching its job ref under the same narrow repository normalization. The external job arm requires the unique edge reference repository segment to share canonical identity and every suffix byte to equal the raw job identity ref exactly and end in the full SHA equal to resolved_commit; a same-repository local ./ or $/ job arm may retain a platform-authenticated branch-like raw identity ref only while target entry and resolved_commit equal the source running commit and the unique local edge matches canonical repository identity plus exact workflow path. Tags, expressions, mismatched repository/commit/path, disconnected entries, rename-dependent names, or unrecognized forms are status-only. Original records remain unchanged in their canonical-JSON digests. This conservative rule applies to both full and failed-jobs reruns: GitHub documents first-attempt reusable-workflow commit reuse for failed-job reruns, but version 1 has no equivalent closed evidence for every external action dependency",
+      "inputs": "each accepted existing-run rerun arm has an exact empty intent list and no transmitted POST body",
+      "repeat_safety": "declaration is idempotent or reentrant, operation_identity_sha256 binds the RFC 8785 canonical operation record, and authorization_independent is exact true; this proves repeat safety only and never supplies mutation authorization",
+      "implementation": "implementation receipt identity type-preservingly equals the independently validated github-codex-merge-status-producer-implementation-v1 raw receipt while semantic repository fields use canonical case-insensitive ASCII owner/name identity. Its trusted root workflow repository identity equals the recovery operation and contract repository identity; an external reusable workflow may appear only as a non-root job-workflow identity, never as the root workflow identity. The separately supplied parent-owned dependency-resolution receipt uses a separately supplied exact resolver provenance anchor. Target-baseline resolver source shares candidate canonical repository identity at exact base_tip, parent-fixed external source has a different canonical repository identity, and installed release source has independently fixed manifest provenance; every same-repository-identity resolver commit in base..head is rejected. Valid repository shape and safe_repository_path_profile are mandatory. Every exact raw repository/commit/path/kind/blob closure entry has one sorted unique complete reference record and reference-to-edge bijection, while canonical repository identity plus exact commit/path identifies one kind/blob and canonical repository identity plus exact commit/action-manifest directory identifies at most one action. Each source-entry/raw-selector identity case-folds only its repository segment and identifies one target. Every workflow target is a direct .github/workflows .yml or .yaml child; every entry is root-reachable under canonical repository identity plus exact remaining fields; the root job identity has no inbound edge; and each non-root reusable-workflow job identity has exactly one total inbound edge semantically matching the job ref under the external-full-SHA or same-running-commit-local arm. Raw repository spellings remain unchanged in every record and digest; path, SHA/ref, URL suffix/query/fragment and delimiter bytes, and other fields remain exact under github_url_profile. Missing, duplicate, stale, disconnected, candidate-controlled, unresolved, unbound, parser-normalized, rename-dependent, or drifted evidence is status-only",
+      "two_phase": "preflight_sha256 canonically binds the complete preflight excluding itself; completion_sha256 canonically binds the complete completion excluding itself. Completion cannot retroactively authorize mutation and is accepted only after an accepted preflight",
+      "platform_observation": "completion consumes separate closed parent-owned authenticated exact-attempt and post-mutation current-run observations plus a closed acquisition-transaction receipt joining pre-observation, delivery, both post GET digests, and response/acquisition ordering. The observations share the complete frozen repository/run/attempt/head/workflow/ref/job identity, independently valid run_started_at/updated_at endpoint intervals, and a common run_started_at no earlier than the POST boundary. Accepted existing-run rerun requires exact n+1 in both post observations and current run_attempt n+1; a re-stamped historical attempt cannot pass, and any possible intervening concurrent rerun or final-window drift is status-only. Every completion field joins external receipts; no returned or observed completion field or transaction may self-attest",
+      "monitoring": "status-only monitoring keeps the 1,2,4,8,16,32,60 minute then hourly cadence without a time ceiling; mutation attempts stop at the platform/provider cap or stricter contract limit"
     }
   },
   "report_bases": {

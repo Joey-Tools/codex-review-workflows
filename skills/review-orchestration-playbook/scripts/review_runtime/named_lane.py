@@ -12,8 +12,8 @@ import pathlib
 import re
 import secrets
 import select
-import signal
 import shutil
+import signal
 import stat
 import sys
 import tempfile
@@ -21,7 +21,13 @@ import time
 from dataclasses import dataclass
 from typing import BinaryIO, Callable, Iterable, Mapping, NoReturn, Sequence
 
+from .claude_version_policy import (
+    CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+)
 from .common import (
+    TRUSTED_PATH,
     ForwardedSignal,
     ForwardedSignalMaskOwner,
     ReviewError,
@@ -29,7 +35,6 @@ from .common import (
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
-    TRUSTED_PATH,
     _executable_candidate_identity,
     _is_process_control_flow_error,
     block_forwarded_signals,
@@ -41,17 +46,12 @@ from .common import (
     run_bounded_capture,
     strict_json_loads,
 )
-from .claude_version_policy import (
-    CLAUDE_GUARD_MANAGED_SESSION_MINIMUM_VERSION,
-    ClaudeVersionPolicyError,
-    parse_compatible_release_version,
-)
 from .review_workspace import (
+    WORKSPACE_SCHEMA_VERSION,
     PreparedWorkspace,
     RangeIncomplete,
     ReviewWorkspaceError,
     SourceAuthorityBindingError,
-    WORKSPACE_SCHEMA_VERSION,
     _attach_workspace_teardown_failures,
     _attempt_workspace_descriptor_closes,
     _finish_forwarded_signal_mask,
@@ -978,6 +978,63 @@ def _require_prefix_receipt_file_policy(metadata: os.stat_result) -> None:
         )
 
 
+def _require_prefix_receipt_owner_private_acl(
+    descriptor: int,
+    *,
+    label: str,
+) -> None:
+    """Reject non-owner Darwin ACL grants through a bound descriptor.
+
+    UID, mode, and link count do not completely describe access policy on
+    macOS.  The protected property is owner-private access: a deny entry may
+    further restrict access, and an allow entry for the exact object owner is
+    redundant, but an allow entry for any other or unrecognized principal
+    grants access outside that property.  Linux and other POSIX platforms
+    retain their existing mode-based semantics because their Darwin ACL
+    inventory is empty.
+    """
+
+    if sys.platform != "darwin":
+        return
+    try:
+        entries = _legacy_extended_acl_entries(
+            descriptor,
+            label=f"sanitized Git argv prefix receipt {label}",
+        )
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} extended ACL cannot be inspected"
+        ) from error
+    allow_qualifiers = _darwin_acl_allow_qualifiers(entries)
+    if allow_qualifiers is None:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} has a non-owner extended ACL grant"
+        )
+    if not allow_qualifiers:
+        return
+    try:
+        owner_uid = os.fstat(descriptor).st_uid
+        owner_qualifier = _darwin_uid_acl_qualifier(
+            owner_uid,
+            label=f"sanitized Git argv prefix receipt {label} owner",
+        )
+        if len(owner_qualifier) != _DARWIN_ACL_QUALIFIER_BYTES:
+            raise NamedLaneGuardError(
+                f"sanitized Git argv prefix receipt {label} owner qualifier is malformed"
+            )
+    except (NamedLaneGuardError, OSError) as error:
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} extended ACL cannot be inspected"
+        ) from error
+    if not _darwin_acl_entries_preserve_owner_private_access(
+        entries,
+        owner_qualifier=owner_qualifier,
+    ):
+        raise NamedLaneGuardError(
+            f"sanitized Git argv prefix receipt {label} has a non-owner extended ACL grant"
+        )
+
+
 def _revalidate_open_prefix_receipt(
     *,
     receipt_path: pathlib.Path,
@@ -1022,6 +1079,10 @@ def _revalidate_open_prefix_receipt(
         raise NamedLaneGuardError(
             "sanitized Git argv prefix receipt parent path changed"
         )
+    _require_prefix_receipt_owner_private_acl(
+        parent_descriptor,
+        label="parent",
+    )
     for metadata in (receipt_descriptor_metadata, receipt_path_metadata):
         try:
             _require_prefix_receipt_file_policy(metadata)
@@ -1036,6 +1097,10 @@ def _revalidate_open_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt identity or access policy changed"
             )
+    _require_prefix_receipt_owner_private_acl(
+        receipt_descriptor,
+        label="file",
+    )
     final_signals = _prefix_receipt_content_signals(receipt_descriptor_metadata)
     if (
         final_signals != initial_signals
@@ -1117,6 +1182,10 @@ def validate_published_sanitized_git_argv_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt parent changed before opening"
             )
+        _require_prefix_receipt_owner_private_acl(
+            parent_descriptor,
+            label="parent",
+        )
         lexical = os.stat(
             receipt_file.name,
             dir_fd=parent_descriptor,
@@ -1141,6 +1210,10 @@ def validate_published_sanitized_git_argv_prefix_receipt(
             raise NamedLaneGuardError(
                 "sanitized Git argv prefix receipt changed before reading"
             )
+        _require_prefix_receipt_owner_private_acl(
+            receipt_descriptor,
+            label="file",
+        )
         payload = _read_prefix_receipt_descriptor(receipt_descriptor)
         if len(payload) != opened.st_size:
             raise NamedLaneGuardError(
@@ -1908,12 +1981,17 @@ def _current_user_id() -> int:
     return int(get_effective_user_id())
 
 
-def _legacy_extended_acl_tag_types(
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_EXTENDED_DENY = 2
+_DARWIN_ACL_QUALIFIER_BYTES = 16
+
+
+def _legacy_extended_acl_entries(
     descriptor: int,
     *,
     label: str,
-) -> tuple[int, ...]:
-    """Return every Darwin extended-ACL entry tag from a bound descriptor."""
+) -> tuple[tuple[int, bytes], ...]:
+    """Return each Darwin ACL entry's access tag and principal UUID."""
 
     if sys.platform != "darwin":
         return ()
@@ -1937,6 +2015,9 @@ def _legacy_extended_acl_tag_types(
             ctypes.POINTER(ctypes.c_int),
         ]
         acl_get_tag_type.restype = ctypes.c_int
+        acl_get_qualifier = libc.acl_get_qualifier
+        acl_get_qualifier.argtypes = [ctypes.c_void_p]
+        acl_get_qualifier.restype = ctypes.c_void_p
         acl_free = libc.acl_free
         acl_free.argtypes = [ctypes.c_void_p]
         acl_free.restype = ctypes.c_int
@@ -1954,7 +2035,7 @@ def _legacy_extended_acl_tag_types(
         raise NamedLaneGuardError(
             f"legacy prefix {label} extended ACL cannot be inspected"
         )
-    tag_types: list[int] = []
+    entries: list[tuple[int, bytes]] = []
     try:
         entry_id = 0
         while True:
@@ -1974,11 +2055,114 @@ def _legacy_extended_acl_tag_types(
                 raise NamedLaneGuardError(
                     f"legacy prefix {label} extended ACL cannot be inspected"
                 )
-            tag_types.append(int(tag_type.value))
+            ctypes.set_errno(0)
+            qualifier = acl_get_qualifier(entry)
+            if not qualifier:
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} extended ACL cannot be inspected"
+                )
+            try:
+                qualifier_bytes = ctypes.string_at(
+                    qualifier,
+                    _DARWIN_ACL_QUALIFIER_BYTES,
+                )
+            finally:
+                acl_free(qualifier)
+            if len(qualifier_bytes) != _DARWIN_ACL_QUALIFIER_BYTES:
+                raise NamedLaneGuardError(
+                    f"legacy prefix {label} extended ACL cannot be inspected"
+                )
+            entries.append((int(tag_type.value), qualifier_bytes))
             entry_id = -1
     finally:
         acl_free(acl)
-    return tuple(tag_types)
+    return tuple(entries)
+
+
+def _legacy_extended_acl_tag_types(
+    descriptor: int,
+    *,
+    label: str,
+) -> tuple[int, ...]:
+    """Return every Darwin extended-ACL access tag from a bound descriptor."""
+
+    return tuple(
+        tag_type
+        for tag_type, _qualifier in _legacy_extended_acl_entries(
+            descriptor,
+            label=label,
+        )
+    )
+
+
+def _darwin_uid_acl_qualifier(uid: int, *, label: str) -> bytes:
+    """Resolve one local UID to the UUID qualifier used by Darwin ACLs."""
+
+    if sys.platform != "darwin":
+        return b""
+    if uid < 0 or uid > 0xFFFFFFFF:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} extended ACL owner cannot be resolved"
+        )
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        mbr_uid_to_uuid = libc.mbr_uid_to_uuid
+        qualifier_type = ctypes.c_ubyte * _DARWIN_ACL_QUALIFIER_BYTES
+        mbr_uid_to_uuid.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_ubyte)]
+        mbr_uid_to_uuid.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} extended ACL owner cannot be resolved"
+        ) from error
+    qualifier = qualifier_type()
+    if mbr_uid_to_uuid(uid, qualifier) != 0:
+        raise NamedLaneGuardError(
+            f"legacy prefix {label} extended ACL owner cannot be resolved"
+        )
+    return bytes(qualifier)
+
+
+def _darwin_acl_entries_preserve_owner_private_access(
+    entries: Iterable[tuple[int, bytes]],
+    *,
+    owner_qualifier: bytes,
+) -> bool:
+    """Classify whether ACL entries preserve access by only the exact owner."""
+
+    allow_qualifiers = _darwin_acl_allow_qualifiers(entries)
+    if allow_qualifiers is None or not allow_qualifiers:
+        return allow_qualifiers == ()
+    if type(owner_qualifier) is not bytes:
+        return False
+    if len(owner_qualifier) != _DARWIN_ACL_QUALIFIER_BYTES:
+        return False
+    return all(qualifier == owner_qualifier for qualifier in allow_qualifiers)
+
+
+def _darwin_acl_allow_qualifiers(
+    entries: Iterable[tuple[int, bytes]],
+) -> tuple[bytes, ...] | None:
+    """Return valid allow principals, or ``None`` for an unsafe ACL shape."""
+
+    allow_qualifiers: list[bytes] = []
+    for entry in entries:
+        if type(entry) is not tuple or len(entry) != 2:
+            return None
+        tag_type, qualifier = entry
+        if (
+            type(tag_type) is not int
+            or type(qualifier) is not bytes
+            or len(qualifier) != _DARWIN_ACL_QUALIFIER_BYTES
+        ):
+            return None
+        if tag_type == _DARWIN_ACL_EXTENDED_DENY:
+            continue
+        if tag_type != _DARWIN_ACL_EXTENDED_ALLOW:
+            return None
+        allow_qualifiers.append(qualifier)
+    return tuple(allow_qualifiers)
 
 
 def _require_no_legacy_extended_acl(descriptor: int, *, label: str) -> None:
