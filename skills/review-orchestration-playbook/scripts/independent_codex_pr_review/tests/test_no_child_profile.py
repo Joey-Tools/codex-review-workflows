@@ -57,6 +57,14 @@ GITHUB_HOSTED_RUNTIME_PINS = {
             "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16"
         ),
     ),
+    "github-macos-26-arm64-26.6.2-25G83": profile.RuntimePin(
+        macos_product_version="26.6.2",
+        macos_build_version="25G83",
+        darwin_release="25.6.0",
+        sandbox_exec_sha256=(
+            "abc5bb136d6b5cce8fa85d789f78e3326c51ca60cae637b2064adfb67a1dcd9a"
+        ),
+    ),
 }
 
 
@@ -890,6 +898,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
             {
                 "github-macos-26-arm64-26.4-25E246",
                 "github-macos-26-arm64-26.5.2-25F84",
+                "github-macos-26-arm64-26.6.2-25G83",
             },
         )
         self.assertEqual(pin.macos_product_version, "26.4")
@@ -929,6 +938,13 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 "25F84",
                 "25.5.0",
                 (3, 13, 1),
+            ),
+            (
+                "github-macos-26-arm64-26.6.2-25G83",
+                "26.6.2",
+                "25G83",
+                "25.6.0",
+                (3, 13, 0),
             ),
             (None, "26.6", "25G100", "25.6.0", (3, 13, 0)),
             (None, "26.5.2", "25F84", "25.5.0", (3, 14, 0)),
