@@ -31,12 +31,13 @@ superseded_by:
 
 ## Next Steps
 
-- 重新运行 broker reproducibility，确认新的 `codesign` digest 后其余 toolchain pin 仍保持一致。
+- 保留 macOS 26.5.2/25F84 在镜像滚动期间的 broker 兼容 gate，再重新运行 broker reproducibility。
 - 在 canonical source 完成本地测试和 PR CI 验证，再刷新 private overlay 的 review-workflows source pin。
 
 ## Evidence
 
 - GitHub Actions run `34290326303`，`independent-supervisor` job `102275203799`。
 - GitHub Actions run `34317951947`，`broker-reproducibility` job `102358061142`：OS gate、clang、ld、lipo、vtool、codesign_allocate 通过；`codesign` actual 为 `844d30a12929b59c9f2215e2a308c3e1db572831a478f35906e452a54025603e`。
+- GitHub Codex finding `3965233232`：指出 selector 需要继续接受 `26.5.2 / 25F84`；该 finding 与当前脚本一致，不能直接 resolve，需先补兼容 case。
 - `skills/review-orchestration-playbook/scripts/independent_codex_pr_review/tests/test_no_child_profile.py`
 - `skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh`
