@@ -50,6 +50,10 @@ JWT_LEGACY = "eyJ" + "A" * 12 + "." + "B" * 12 + "." + "C" * 12
 HIGH_ENTROPY = b"Aa9!" + b"Bb8@" + b"Cc7#" + b"Dd6$" + b"Ee5%"
 
 
+def source_permission_marker() -> bytes:
+    return b"id-" + b"token: write"
+
+
 def reduction_secret(rule: str, marker: bytes = b"A") -> bytes:
     if len(marker) != 1 or not marker.isalpha():
         raise ValueError("marker must be one ASCII letter")
@@ -5920,6 +5924,1126 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(
             scan.blocking_candidates,
             {candidate: {"github-token"}},
+        )
+
+    def test_complete_source_string_permission_marker_is_not_opaque(self) -> None:
+        marker = source_permission_marker()
+        payload = (
+            b"        for forbidden in (\n"
+            b'            "contents: write",\n'
+            b'            "'
+            + marker
+            + b'",\n'
+            b'            "statuses: write",\n'
+            b"        ):\n"
+            b"            self.assertNotIn(forbidden, workflow)\n"
+            b"\n"
+            b'if __name__ == "__main__":\n'
+            b"    unittest.main()\n"
+        )
+        direct = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.blocking_candidates, {})
+        self.assertEqual(streamed, direct)
+
+        candidate = reduction_secret("generic-secret-assignment", b"Z")
+        secret_payload = b'            "password: ' + candidate + b'",\n'
+        secret_scan = workspace._scan_secret_value(
+            secret_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(
+            secret_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertIsNone(secret_scan.unextractable_rule)
+        self.assertEqual(secret_scan.blocking_candidates, {})
+
+    def test_permission_marker_keeps_later_provider_candidate(self) -> None:
+        marker = source_permission_marker()
+        provider = b"ghp_" + b"A" * 36
+        accepted = accepted_legacy_value(
+            provider.decode("ascii"),
+            rule="github-token",
+        )
+        payload = (
+            b"for forbidden in (\n    \""
+            + marker
+            + b'",\n    "'
+            + provider
+            + b'",\n):\n    pass\n'
+        )
+
+        direct = workspace._scan_secret_value(
+            payload,
+            accepted_values=(accepted,),
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=(accepted,),
+        )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.accepted_counts, {accepted: 1})
+        self.assertEqual(streamed, direct)
+
+    def test_source_permission_marker_record_classifier_is_closed(self) -> None:
+        marker = source_permission_marker()
+        self.assertEqual(marker, b"id-" + b"token:" + b" " + b"write")
+        credential = reduction_secret("generic-secret-assignment", b"Y")
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        cases = (
+            ("double-quoted", b'"' + marker + b'"\n', True, "exact"),
+            ("single-quoted-comma", b"'" + marker + b"',\n", True, "exact"),
+            (
+                "hash-comment-after-comma",
+                b'    "' + marker + b'",  # required\n',
+                True,
+                "exact",
+            ),
+            (
+                "slash-comment-after-comma",
+                b'    "' + marker + b'",  // required\n',
+                True,
+                "exact",
+            ),
+            (
+                "hash-comment-after-closed-block",
+                b'    "' + marker + b'",  # /* note */ required\n',
+                True,
+                "exact",
+            ),
+            (
+                "hash-comment-at-proven-eof",
+                b'"' + marker + b'", # required',
+                True,
+                "exact",
+            ),
+            (
+                "hash-comment-incomplete",
+                b'"' + marker + b'", # required',
+                False,
+                "incomplete",
+            ),
+            ("eof", b'"' + marker + b'"', True, "exact"),
+            ("diff-line", b'+    "' + marker + b'",\n', True, "exact"),
+            (
+                "quoted-prose",
+                b'"requires ' + marker + b' permission"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "plain-prose-with-quoted-marker",
+                b'Use "' + marker + b'" permission.\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "markdown-list-prose-with-quoted-marker",
+                b'- Use "' + marker + b'" permission.\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "markdown-four-space-indented-code",
+                b'    Use "' + marker + b'" permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-tab-indented-code",
+                b'\tUse "' + marker + b'" permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "html-prose-with-quoted-marker",
+                b'<p>Use "' + marker + b'" permission.</p>\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "html-comment-with-quoted-marker",
+                b'<!-- Use "' + marker + b'" permission. -->\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "long-quoted-prose",
+                b'"' + b"x" * 129 + b" " + marker + b' permission"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "inner-single-quoted-prose",
+                b"\"requires '" + marker + b"' permission\"\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "escaped-double-quoted-prose",
+                b'"requires \\"' + marker + b'\\" permission"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "assigned-inner-quoted-prose",
+                b"message = \"requires '"
+                + marker
+                + b"' permission\"\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "unquoted-prose",
+                b"documentation requires " + marker + b" permission\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "hash-comment-prose",
+                b"# documentation requires " + marker + b" permission\n",
+                True,
+                "not-applicable",
+            ),
+            (
+                "hash-comment-quoted-prose",
+                b'# documentation requires "' + marker + b'" permission\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "hash-define-literal",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-spaced-define-literal",
+                b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-doc-attribute-literal",
+                b'#[doc = "' + marker + b'"]\n',
+                True,
+                "near-miss",
+            ),
+            ("bytes-prefix", b'b"' + marker + b'",\n', True, "near-miss"),
+            (
+                "assignment-bytes-prefix",
+                b'permission = b"' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "assignment-plain-literal",
+                b'permission = "' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            ("uppercase-prefix", b'B"' + marker + b'",\n', True, "near-miss"),
+            ("raw-prefix", b'r"' + marker + b'",\n', True, "near-miss"),
+            (
+                "rust-raw-hash-prefix",
+                b'r#"' + marker + b'"#,\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-nine-hash-prefix",
+                b"r" + b"#" * 9 + b'"' + marker + b'"' + b"#" * 9 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-c-nine-hash-prefix",
+                b"cr" + b"#" * 9 + b'"' + marker + b'"' + b"#" * 9 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-maximum-hash-prefix",
+                b"br"
+                + b"#" * 255
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 255
+                + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-over-maximum-incomplete-prefix",
+                b"r" + b"#" * 256 + b'"' + marker,
+                False,
+                "near-miss",
+            ),
+            ("cpp-raw-prefix", b'R"(' + marker + b')"\n', True, "near-miss"),
+            (
+                "cpp-u8-raw-prefix",
+                b'u8R"tag(' + marker + b')tag"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-maximum-delimiter",
+                b'u8R"'
+                + b"d" * 16
+                + b"("
+                + marker
+                + b")"
+                + b"d" * 16
+                + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-incomplete-overlong-delimiter",
+                b'u8R"' + b"d" * 17 + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-over-window-delimiter",
+                b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "cpp-u8-raw-over-window-incomplete-opener",
+                b'u8R"' + b"d" * 129 + marker + b"\n",
+                True,
+                "near-miss",
+            ),
+            ("cpp-u-raw-prefix", b'uR"(' + marker + b')"\n', True, "near-miss"),
+            ("cpp-U-raw-prefix", b'UR"(' + marker + b')"\n', True, "near-miss"),
+            ("cpp-L-raw-prefix", b'LR"(' + marker + b')"\n', True, "near-miss"),
+            ("format-prefix", b'f"' + marker + b'",\n', True, "near-miss"),
+            ("semicolon", b'"' + marker + b'";\n', True, "near-miss"),
+            (
+                "concatenation",
+                b'"' + marker + b'" + "suffix"\n',
+                True,
+                "near-miss",
+            ),
+            ("escape", b'"' + escaped_marker + b'"\n', True, "near-miss"),
+            ("triple", b'"""' + marker + b'"""\n', True, "near-miss"),
+            ("embedded-newline", b'"' + marker + b'\n"\n', True, "near-miss"),
+            ("unclosed", b'"' + marker + b'\n', True, "near-miss"),
+            (
+                "long-record",
+                b'"' + marker + b'"' + b" " * 129 + b"\n",
+                True,
+                "near-miss",
+            ),
+            (
+                "credential-value",
+                b'"id-' + b"token: " + credential + b'"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "credential-suffix",
+                b'"' + marker + credential + b'"\n',
+                True,
+                "not-applicable",
+            ),
+            (
+                "long-leading-context",
+                b" " * 129 + b'"' + marker + b'"\n',
+                True,
+                "near-miss",
+            ),
+            ("c-u8-prefix", b'u8"' + marker + b'"\n', True, "near-miss"),
+            ("c-wide-prefix", b'L"' + marker + b'"\n', True, "near-miss"),
+            (
+                "c-adjacent-literal",
+                b'"' + marker + b'"\n"' + credential + b'"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "c-assignment-adjacent-literal",
+                b'const char *p = "'
+                + marker
+                + b'" "'
+                + credential
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "c-block-comment-before-adjacent-literal",
+                b'/* " */ const char *p = "'
+                + marker
+                + b'" "'
+                + credential
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-raw-before-literal",
+                b'r"prefix\\"; let p = "'
+                + marker
+                + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-label-before-literal",
+                b'\'label: let p = "' + marker + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "rust-lifetime-before-literal",
+                b'let _: &\'a str = "' + marker + b'"; let _: &\'b str = "";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "javascript-regex-quote-before-literal",
+                b'const r = /"/; const p = "' + marker + b'";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "prose-shaped-function-call",
+                b'Use("' + marker + b'");\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "prose-shaped-adjacent-literal",
+                b'Use "' + marker + b'" "permission".\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "html-attribute",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-inline-code",
+                b'Use `"' + marker + b'"` permission.\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "markdown-fenced-code",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "comment-without-comma",
+                b'"' + marker + b'" # required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "same-line-list-comment",
+                b'values = ("' + marker + b'", # required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "block-comment-after-comma",
+                b'"' + marker + b'", /* required */\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "comment-lookalike-after-comma",
+                b'"' + marker + b'", / required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-directive-after-comma",
+                b'"' + marker + b'", #[cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-spaced-outer-attribute-after-comma",
+                b'"' + marker + b'", # [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-spaced-inner-attribute-after-comma",
+                b'"' + marker + b'", # ! [allow(dead_code)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-comment-separated-outer-attribute",
+                b'"' + marker + b'", # /* gap */ [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-comment-separated-inner-attribute",
+                b'"' + marker + b'", # ! /* gap */ [allow(dead_code)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-nested-comment-before-attribute",
+                b'"' + marker + b'", # /* outer /* nested */ [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-unclosed-comment-before-attribute",
+                b'"' + marker + b'", # /* gap [cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-nonascii-comment",
+                b'"' + marker + b'", # required \xe2\x80\xa8[cfg(test)]\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "hash-comment-without-separator",
+                b'"' + marker + b'", #required\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "slash-comment-unicode-line-separator",
+                b'"'
+                + marker
+                + b'", // required\xe2\x80\xa8"suffix"\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "python-next-line-operator",
+                b'"' + marker + b'"\n+ "' + credential + b'"\n',
+                True,
+                "near-miss",
+            ),
+            ("partial", b'"' + marker + b'"', False, "incomplete"),
+            (
+                "multiline-triple",
+                b'value = """\n' + marker + b'\n"""\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-raw-triple",
+                b'value = r"""\n' + marker + b'\n"""\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-cpp-raw",
+                b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-rust-raw",
+                b'let p = r#"\n' + marker + b'\n"#;\n',
+                True,
+                "near-miss",
+            ),
+            (
+                "multiline-template",
+                b'const p = `\n' + marker + b'\n`;\n',
+                True,
+                "near-miss",
+            ),
+        )
+
+        for label, payload, suffix_context_complete, expected in cases:
+            with self.subTest(case=label):
+                assignment = workspace.SECRET_ASSIGNMENT_PREFIX.search(payload)
+                self.assertIsNotNone(assignment)
+                assert assignment is not None
+                assignment_line_start = (
+                    max(
+                        payload.rfind(b"\n", 0, assignment.start()),
+                        payload.rfind(b"\r", 0, assignment.start()),
+                    )
+                    + 1
+                )
+                status, record_end = (
+                    workspace._source_permission_marker_record_status(
+                        payload,
+                        assignment_start=assignment.start(),
+                        assignment_end=assignment.end(),
+                        assignment_line_start=assignment_line_start,
+                        proof_end=len(payload),
+                        diff_surface=label == "diff-line",
+                        prefix_context_complete=True,
+                        suffix_context_complete=suffix_context_complete,
+                    )
+                )
+
+                self.assertEqual(status, expected)
+                self.assertGreaterEqual(record_end, assignment.end())
+                self.assertLessEqual(record_end, len(payload))
+
+        assignment_bound_payload = (
+            b'"' + marker + b'", # password = "' + credential + b'"\n'
+        )
+        assignment_matches = tuple(
+            workspace.SECRET_ASSIGNMENT_PREFIX.finditer(assignment_bound_payload)
+        )
+        self.assertEqual(len(assignment_matches), 2)
+        later_assignment = assignment_matches[1]
+        later_status, _later_end = (
+            workspace._source_permission_marker_record_status(
+                assignment_bound_payload,
+                assignment_start=later_assignment.start(),
+                assignment_end=later_assignment.end(),
+                assignment_line_start=0,
+                proof_end=len(assignment_bound_payload),
+                diff_surface=False,
+                prefix_context_complete=True,
+                suffix_context_complete=True,
+            )
+        )
+        self.assertEqual(later_status, "not-applicable")
+
+    def test_permission_marker_inside_quoted_prose_is_ordinary(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"V")
+        ordinary = b'    "requires ' + marker + b' permission",\n'
+        plain_prose = b'Use "' + marker + b'" permission.\n'
+        markdown_list_prose = b'- Use "' + marker + b'" permission.\n'
+        html_prose = b'<p>Use "' + marker + b'" permission.</p>\n'
+        html_comment = b'<!-- Use "' + marker + b'" permission. -->\n'
+        inner_quoted = b"    \"requires '" + marker + b"' permission\",\n"
+        escaped_quoted = (
+            b'    "requires \\"' + marker + b'\\" permission",\n'
+        )
+        assigned_inner_quoted = (
+            b"message = \"requires '" + marker + b"' permission\"\n"
+        )
+        exact = b'"' + marker + b'"\n'
+        near_miss = b'b"' + marker + b'"\n'
+        credential_payload = b'password = "' + credential + b'"\n'
+        comment_assignment = (
+            b'"' + marker + b'", # password = "' + credential + b'"\n'
+        )
+
+        for label, payload, should_block in (
+            ("ordinary-prose", ordinary, False),
+            ("plain-prose", plain_prose, False),
+            ("markdown-list-prose", markdown_list_prose, False),
+            (
+                "hash-comment-prose",
+                b'# documentation requires "' + marker + b'" permission\n',
+                False,
+            ),
+            ("html-prose", html_prose, False),
+            ("html-comment", html_comment, False),
+            ("inner-quoted-prose", inner_quoted, False),
+            ("escaped-quoted-prose", escaped_quoted, False),
+            ("assigned-inner-quoted-prose", assigned_inner_quoted, False),
+            ("exact-marker", exact, False),
+            ("marker-near-miss", near_miss, True),
+            ("long-credential", credential_payload, True),
+            ("comment-assignment", comment_assignment, True),
+            ("prose-shaped-call", b'Use("' + marker + b'");\n', True),
+            (
+                "prose-shaped-adjacent-literal",
+                b'Use "' + marker + b'" "permission".\n',
+                True,
+            ),
+            (
+                "html-attribute",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+                True,
+            ),
+            (
+                "markdown-inline-code",
+                b'Use `"' + marker + b'"` permission.\n',
+                True,
+            ),
+            (
+                "markdown-fenced-code",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
+                True,
+            ),
+            (
+                "markdown-four-space-indented-code",
+                b'    Use "' + marker + b'" permission.\n',
+                True,
+            ),
+            (
+                "markdown-tab-indented-code",
+                b'\tUse "' + marker + b'" permission.\n',
+                True,
+            ),
+            (
+                "hash-define-literal",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+                True,
+            ),
+            (
+                "rust-doc-attribute-literal",
+                b'#[doc = "' + marker + b'"]\n',
+                True,
+            ),
+        ):
+            with self.subTest(case=label):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(streamed, direct)
+                if should_block:
+                    self.assertTrue(
+                        direct.blocking_rule == "generic-secret-assignment"
+                        or direct.unextractable_rule
+                        == "generic-secret-assignment"
+                        or direct.blocking_candidates
+                        == {credential: {"generic-secret-assignment"}},
+                        direct,
+                    )
+                else:
+                    self.assertIsNone(direct.blocking_rule)
+                    self.assertIsNone(direct.unextractable_rule)
+                    self.assertEqual(direct.blocking_candidates, {})
+
+    def test_source_string_permission_marker_exception_is_exact(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"X")
+        credential_fragments = (credential[:11], credential[11:22], credential[22:])
+        self.assertEqual(b"".join(credential_fragments), credential)
+        self.assertTrue(all(len(fragment) < 16 for fragment in credential_fragments))
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        accepted = (
+            b'"' + marker + b'"\n',
+            b'"' + marker + b'"',
+            b"'" + marker + b"',\n",
+            b'values = (\n    "' + marker + b'",  # required for OIDC\n)\n',
+            b'values = (\n    "' + marker + b'",  # ! ordinary note\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'",  # /* note */ required for OIDC\n)\n',
+            b'values = {\n    "' + marker + b'",  // required for OIDC\n}\n',
+            b'(\n    "contents: write",\n    "'
+            + marker
+            + b'",\n    "statuses: write",\n)\n',
+        )
+        rejected = (
+            b'(\n    b"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'permission = b"' + marker + b'"\n',
+            b'permission = "' + marker + b'"\n',
+            b'(\n    B"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    r"' + marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    r#"' + marker + b'"#,\n    "statuses: write",\n)\n',
+            b'(\n    r'
+            + b"#" * 9
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 9
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    cr'
+            + b"#" * 9
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 9
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    br'
+            + b"#" * 255
+            + b'"'
+            + marker
+            + b'"'
+            + b"#" * 255
+            + b',\n    "statuses: write",\n)\n',
+            b'(\n    r' + b"#" * 256 + b'"' + marker,
+            b'(\n    "' + marker + b'";\n    "statuses: write",\n)\n',
+            b'const char *p = "'
+            + marker
+            + b'" "'
+            + credential
+            + b'";\n',
+            b'/* " */ const char *p = "'
+            + marker
+            + b'" "'
+            + credential
+            + b'";\n',
+            b'r"prefix\\"; let p = "' + marker + b'";\n',
+            b'\'label: let p = "' + marker + b'";\n',
+            b'let _: &\'a str = "'
+            + marker
+            + b'"; let _: &\'b str = "";\n',
+            b'const r = /"/; const p = "' + marker + b'";\n',
+            b'values = ("' + marker + b'", # required\n)\n',
+            b'values = ("' + marker + b'" # required\n)\n',
+            b'values = ("' + marker + b'", /* required */\n)\n',
+            b'values = ("' + marker + b'", / required\n)\n',
+            b'values = (\n    "' + marker + b'", #[cfg(test)]\n)\n',
+            b'values = (\n    "' + marker + b'", # [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # ! [allow(dead_code)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* gap */ [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # ! /* gap */ [allow(dead_code)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* outer /* nested */ [cfg(test)]\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", # /* gap [cfg(test)]\n)\n',
+            b'values = (\n    "' + marker + b'", #required\n)\n',
+            b'values = (\n    "'
+            + marker
+            + b'", // required\xe2\x80\xa8"suffix"\n)\n',
+            b'(\n    "'
+            + marker
+            + b'" + "suffix",\n    "statuses: write",\n)\n',
+            b'(\n    "'
+            + marker
+            + credential
+            + b'",\n    "statuses: write",\n)\n',
+            b'(\n    "id-'
+            + b"token: "
+            + credential
+            + b'",\n    "statuses: write",\n)\n',
+            b'(\n    "' + escaped_marker + b'",\n    "statuses: write",\n)\n',
+            b'(\n    """' + marker + b'""",\n    "statuses: write",\n)\n',
+            b'(\n    "' + marker + b'\n",\n    "statuses: write",\n)\n',
+            b'(\n    "' + marker + b',\n    "statuses: write",\n)\n',
+            b'(\n    "'
+            + marker
+            + b'"\n    "'
+            + credential
+            + b'",\n)\n',
+            b'(\n    "'
+            + marker
+            + b'"\n    + "'
+            + credential
+            + b'",\n)\n',
+            b" " * 129
+            + b'"'
+            + marker
+            + b'"\n"'
+            + credential_fragments[0]
+            + b'"\n"'
+            + credential_fragments[1]
+            + b'"\n"'
+            + credential_fragments[2]
+            + b'"\n',
+            b'u8"'
+            + marker
+            + b'"\nu8"'
+            + credential_fragments[0]
+            + b'"\nu8"'
+            + credential_fragments[1]
+            + b'"\nu8"'
+            + credential_fragments[2]
+            + b'"\n',
+            b'L"'
+            + marker
+            + b'"\nL"'
+            + credential_fragments[0]
+            + b'"\nL"'
+            + credential_fragments[1]
+            + b'"\nL"'
+            + credential_fragments[2]
+            + b'"\n',
+            b'(\n    "'
+            + marker
+            + b'"'
+            + b" " * 129
+            + b',\n    "statuses: write",\n)\n',
+            b'R"(' + marker + b')"\n',
+            b'u8R"tag(' + marker + b')tag"\n',
+            b'u8R"'
+            + b"d" * 16
+            + b"("
+            + marker
+            + b")"
+            + b"d" * 16
+            + b'"\n',
+            b'u8R"' + b"d" * 17 + marker + b"\n",
+            b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+            b'u8R"' + b"d" * 129 + marker + b"\n",
+            b'uR"(' + marker + b')"\n',
+            b'UR"(' + marker + b')"\n',
+            b'LR"(' + marker + b')"\n',
+            b'R"('
+            + marker
+            + b')" "'
+            + credential_fragments[0]
+            + b'" "'
+            + credential_fragments[1]
+            + b'" "'
+            + credential_fragments[2]
+            + b'";\n',
+            b'value = """\n' + marker + b'\n"""\n',
+            b'value = r"""\n' + marker + b'\n"""\n',
+            b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+            b'let p = r#"\n' + marker + b'\n"#;\n',
+            b'const p = `\n' + marker + b'\n`;\n',
+            b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+            b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+            b'#[doc = "' + marker + b'"]\n',
+            b'    Use "' + marker + b'" permission.\n',
+            b'\tUse "' + marker + b'" permission.\n',
+        )
+
+        for payload in accepted:
+            with self.subTest(kind="accepted", payload=payload):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertIsNone(direct.blocking_rule)
+                self.assertIsNone(direct.unextractable_rule)
+                self.assertEqual(direct.blocking_candidates, {})
+                self.assertEqual(streamed, direct)
+
+        for payload in rejected:
+            with self.subTest(kind="rejected", payload=payload):
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule
+                    == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
+
+    def test_dense_permission_marker_prose_scans_markdown_fences_once(self) -> None:
+        marker = source_permission_marker()
+        payload = (b'Use "' + marker + b'" permission.\n') * 256
+        original_pattern = workspace._SOURCE_PERMISSION_MARKDOWN_FENCE
+
+        class CountingPattern:
+            def __init__(self) -> None:
+                self.finditer_calls = 0
+
+            def finditer(self, *args: object, **kwargs: object):
+                self.finditer_calls += 1
+                return original_pattern.finditer(*args, **kwargs)
+
+        counting_pattern = CountingPattern()
+        with mock.patch.object(
+            workspace,
+            "_SOURCE_PERMISSION_MARKDOWN_FENCE",
+            counting_pattern,
+        ):
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertIsNone(direct.unextractable_rule)
+        self.assertEqual(direct.blocking_candidates, {})
+        self.assertEqual(counting_pattern.finditer_calls, 1)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32)
+    def test_cpp_raw_permission_marker_opener_split_fails_closed(self) -> None:
+        marker = source_permission_marker()
+        opener = b'u8R"' + b"d" * 16 + b"("
+        record = opener + marker + b")" + b"d" * 16 + b'"\n'
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        padding_size = first_read_size - len(opener)
+        padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+        payload = padding + record
+        self.assertEqual(len(padding + opener), first_read_size)
+
+        direct = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertTrue(
+            direct.blocking_rule == "generic-secret-assignment"
+            or direct.unextractable_rule == "generic-secret-assignment",
+            direct,
+        )
+        self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 512)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 320)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256)
+    def test_cpp_raw_overlong_opener_split_fails_closed(self) -> None:
+        marker = source_permission_marker()
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        for label, opener in (
+            ("overlong-delimiter", b'u8R"' + b"d" * 17 + b"("),
+            ("over-window-delimiter", b'u8R"' + b"d" * 129 + b"("),
+            ("over-window-incomplete", b'u8R"' + b"d" * 129),
+        ):
+            with self.subTest(case=label):
+                padding_size = first_read_size - len(opener)
+                padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+                payload = padding + opener + marker + b"\n"
+                self.assertEqual(len(padding + opener), first_read_size)
+
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 512)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 320)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256)
+    def test_rust_raw_permission_marker_maximum_opener_split_fails_closed(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        for label, opener, suffix in (
+            (
+                "maximum",
+                b"br" + b"#" * 255 + b'"',
+                b'"' + b"#" * 255 + b"\n",
+            ),
+            (
+                "over-maximum-incomplete",
+                b"br" + b"#" * 256 + b'"',
+                b"",
+            ),
+        ):
+            with self.subTest(case=label):
+                record = opener + marker + suffix
+                padding_size = first_read_size - len(opener)
+                padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+                payload = padding + record
+                self.assertEqual(len(padding + opener), first_read_size)
+
+                direct = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertTrue(
+                    direct.blocking_rule == "generic-secret-assignment"
+                    or direct.unextractable_rule == "generic-secret-assignment",
+                    direct,
+                )
+                self.assertEqual(streamed, direct)
+
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 16)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32)
+    def test_permission_marker_continuation_survives_stream_boundary(self) -> None:
+        marker = source_permission_marker()
+        credential = reduction_secret("generic-secret-assignment", b"W")
+        marker_record = b'"' + marker + b'"\n'
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        padding_size = first_read_size - len(marker_record)
+        padding = b"#" + b"x" * (padding_size - 2) + b"\n"
+        payload = padding + marker_record + b'"' + credential + b'"\n'
+        self.assertEqual(len(padding + marker_record), first_read_size)
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertTrue(
+            scan.blocking_rule == "generic-secret-assignment"
+            or scan.unextractable_rule == "generic-secret-assignment",
+            scan,
         )
 
     def test_safe_short_provider_candidate_is_counted_once(self) -> None:
