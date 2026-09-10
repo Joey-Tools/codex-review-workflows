@@ -4,6 +4,7 @@ import ast
 import inspect
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,11 @@ CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
 CI_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/review-orchestration-playbook"): "canonical",
     pathlib.Path("personal_codex/skills/review-orchestration-playbook"): "private",
+}
+
+CI_AGGREGATE_LABEL_BY_PROFILE = {
+    "canonical": "Require every platform test to pass",
+    "private": "Require every CI leaf to pass",
 }
 
 
@@ -96,6 +102,21 @@ def _has_python_shebang(path: pathlib.Path) -> bool:
     return first_line.startswith(b"#!") and b"python" in first_line.lower()
 
 
+def _workflow_job_blocks(workflow: str) -> dict[str, str]:
+    jobs = workflow.split("\njobs:\n", 1)[1]
+    matches = list(re.finditer(r"(?m)^  ([A-Za-z0-9_-]+):\n", jobs))
+    return {
+        match.group(1): jobs[
+            match.start() : next_match.start() if next_match is not None else None
+        ]
+        for match, next_match in zip(matches, matches[1:] + [None])
+    }
+
+
+def _workflow_matrix_modules(job: str) -> list[str]:
+    return re.findall(r"(?m)^          - (test_[a-z0-9_]+\.py)$", job)
+
+
 class RepositoryContractTest(unittest.TestCase):
     def test_ci_matches_the_reviewed_distribution_profile(self) -> None:
         actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
@@ -110,7 +131,220 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Require source-only Python tree", workflow)
         self.assertIn("python3 -B -c 'import pathlib, sys;", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("Require every platform test to pass", workflow)
+        aggregate_label = CI_AGGREGATE_LABEL_BY_PROFILE[CI_PROFILE]
+        other_labels = set(CI_AGGREGATE_LABEL_BY_PROFILE.values()) - {
+            aggregate_label
+        }
+        self.assertEqual(workflow.count(f"- name: {aggregate_label}"), 1)
+        for other_label in other_labels:
+            self.assertNotIn(f"- name: {other_label}", workflow)
+
+    def test_private_ci_fixture_preserves_leaf_job_contracts(self) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_blocks(workflow)
+        expected_leaf_jobs = {
+            "python-39-compatibility",
+            "independent_supervisor_tests",
+            "readonly_install_supervisor_tests",
+            "review_syntax_tests",
+            "review_tests",
+            "review_macos_shard_tests",
+            "project_journal_tests",
+            "private_overlay_sync_tests",
+            "linux_isolation_tests",
+            "private_overlay_tests",
+            "private_overlay_contract_tests",
+        }
+        self.assertEqual(set(jobs), expected_leaf_jobs | {"test"})
+
+        aggregate = jobs["test"]
+        self.assertIn("    if: ${{ always() }}", aggregate)
+        aggregate_needs = set(
+            re.findall(r"(?m)^      - ([A-Za-z0-9_-]+)$", aggregate)
+        )
+        self.assertEqual(aggregate_needs, expected_leaf_jobs)
+        expected_results = {
+            "PYTHON_39_RESULT": "python-39-compatibility",
+            "INDEPENDENT_SUPERVISOR_RESULT": "independent_supervisor_tests",
+            "READONLY_INSTALL_SUPERVISOR_RESULT": "readonly_install_supervisor_tests",
+            "REVIEW_SYNTAX_RESULT": "review_syntax_tests",
+            "REVIEW_RESULT": "review_tests",
+            "REVIEW_MACOS_SHARD_RESULT": "review_macos_shard_tests",
+            "PROJECT_JOURNAL_RESULT": "project_journal_tests",
+            "PRIVATE_OVERLAY_SYNC_RESULT": "private_overlay_sync_tests",
+            "LINUX_ISOLATION_RESULT": "linux_isolation_tests",
+            "PRIVATE_OVERLAY_RESULT": "private_overlay_tests",
+            "PRIVATE_OVERLAY_CONTRACT_RESULT": "private_overlay_contract_tests",
+        }
+        actual_results = dict(
+            re.findall(
+                r"(?m)^          ([A-Z0-9_]+): \$\{\{ needs\.([A-Za-z0-9_-]+)\.result \}\}$",
+                aggregate,
+            )
+        )
+        self.assertEqual(actual_results, expected_results)
+        tested_results = set(
+            re.findall(r'(?m)^          test "\$([A-Z0-9_]+)" = "success"$', aggregate)
+        )
+        self.assertEqual(tested_results, set(expected_results))
+
+    def test_ci_fixture_aggregate_labels_are_profile_specific(self) -> None:
+        for profile, expected_label in CI_AGGREGATE_LABEL_BY_PROFILE.items():
+            with self.subTest(profile=profile):
+                workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
+                    encoding="utf-8"
+                )
+                aggregate = _workflow_job_blocks(workflow)["test"]
+                aggregate_step_labels = re.findall(
+                    r"(?m)^      - name: (.+)$", aggregate
+                )
+                self.assertEqual(aggregate_step_labels, [expected_label])
+
+    def test_private_ci_fixture_shards_macos_and_scopes_apt_to_integration(
+        self,
+    ) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_blocks(workflow)
+        macos_shards = jobs["review_macos_shard_tests"]
+        self.assertIn("    runs-on: macos-latest", macos_shards)
+        self.assertIn("python3 -B scripts/run_unittest_shard.py", macos_shards)
+        self.assertIn('--shard-index "${{ matrix.shard }}"', macos_shards)
+        self.assertIn('--shard-count "${{ matrix.shard_count }}"', macos_shards)
+        self.assertEqual(
+            re.findall(
+                r"(?m)^          - module: (test_[a-z_]+\.py)\n"
+                r"            shard: ([0-9]+)\n"
+                r"            shard_count: ([0-9]+)$",
+                macos_shards,
+            ),
+            [
+                ("test_named_lane.py", "0", "4"),
+                ("test_named_lane.py", "1", "4"),
+                ("test_named_lane.py", "2", "4"),
+                ("test_named_lane.py", "3", "4"),
+                ("test_providers.py", "0", "2"),
+                ("test_providers.py", "1", "2"),
+                ("test_review_workspace.py", "0", "2"),
+                ("test_review_workspace.py", "1", "2"),
+            ],
+        )
+
+        jobs_with_apt = {
+            job_name for job_name, block in jobs.items() if "apt-get" in block
+        }
+        self.assertEqual(jobs_with_apt, {"linux_isolation_tests"})
+        integration = jobs["linux_isolation_tests"]
+        self.assertIn("sudo apt-get update", integration)
+        self.assertIn(
+            "sudo apt-get install --yes bubblewrap gcc ripgrep socat", integration
+        )
+
+    def test_private_ci_fixture_runs_the_complete_overlay_module_matrix(self) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        private_overlay = _workflow_job_blocks(workflow)["private_overlay_tests"]
+        modules = _workflow_matrix_modules(private_overlay)
+        expected_modules = [
+            "test_codex_personal_sync.py",
+            "test_generated_sync_source_lock.py",
+            "test_jira_issue_probe.py",
+            "test_package_builder_safety.py",
+            "test_pending_agent_claim_compatibility.py",
+            "test_pending_staging_cleanup.py",
+            "test_personal_sync_reconciliation_safety.py",
+            "test_pr_attribution.py",
+            "test_private_macos_sync_controller.py",
+            "test_private_overlay_package.py",
+            "test_private_overlay_source_lock.py",
+            "test_private_overlay_sync.py",
+            "test_private_synthetic_catalog.py",
+            "test_quarantine_empty_batch_reclaim.py",
+            "test_regular_agent_materialization.py",
+            "test_regular_overlay_uninstall_status_regressions.py",
+            "test_release_manifest_baseline.py",
+            "test_release_retention.py",
+            "test_remote_codex_probe.py",
+            "test_scheduler_doctor.py",
+            "test_skill_validator_wrapper.py",
+            "test_sync_manifest_changes.py",
+            "test_unittest_shard.py",
+        ]
+        self.assertEqual(modules, expected_modules)
+        self.assertEqual(modules, sorted(modules))
+        self.assertIn(
+            'run: python3 -m unittest "tests/${{ matrix.module }}"',
+            private_overlay,
+        )
+
+    def test_private_ci_fixture_covers_all_review_test_files(self) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        review_tests = _workflow_job_blocks(workflow)["review_tests"]
+        review_modules = _workflow_matrix_modules(review_tests)
+        review_test_files = sorted(
+            path.name for path in (SKILL_ROOT / "tests").glob("test_*.py")
+        )
+        self.assertEqual(review_modules, review_test_files)
+        self.assertIn(
+            'run: python3 -m unittest "personal_codex/skills/'
+            'review-orchestration-playbook/tests/${{ matrix.module }}"',
+            review_tests,
+        )
+
+    @unittest.skipUnless(CI_PROFILE == "private", "private layout only")
+    def test_private_ci_matrix_covers_the_private_layout_test_files(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        jobs = _workflow_job_blocks(workflow)
+
+        overlay_modules = _workflow_matrix_modules(jobs["private_overlay_tests"])
+        overlay_test_files = sorted(
+            path.name for path in (REPO_ROOT / "tests").glob("test_*.py")
+        )
+        self.assertEqual(overlay_modules, overlay_test_files)
+
+        project_journal_modules = _workflow_matrix_modules(
+            jobs["project_journal_tests"]
+        )
+        project_journal_test_files = sorted(
+            path.name
+            for path in (
+                REPO_ROOT
+                / "personal_codex"
+                / "skills"
+                / "project-journal"
+                / "tests"
+            ).glob("test_*.py")
+        )
+        self.assertEqual(project_journal_modules, project_journal_test_files)
+        self.assertIn(
+            'run: python3 -m unittest "personal_codex/skills/'
+            'project-journal/tests/${{ matrix.module }}"',
+            jobs["project_journal_tests"],
+        )
+
+        review_modules = _workflow_matrix_modules(jobs["review_tests"])
+        review_test_files = sorted(
+            path.name for path in (SKILL_ROOT / "tests").glob("test_*.py")
+        )
+        self.assertEqual(review_modules, review_test_files)
+
+        macos_excluded_modules = re.findall(
+            r"(?m)^          - os: macos-latest\n"
+            r"            module: (test_[a-z0-9_]+\.py)$",
+            jobs["review_tests"],
+        )
+        macos_shard_modules = sorted(
+            {
+                module
+                for module, _shard, _shard_count in re.findall(
+                    r"(?m)^          - module: (test_[a-z0-9_]+\.py)\n"
+                    r"            shard: ([0-9]+)\n"
+                    r"            shard_count: ([0-9]+)$",
+                    jobs["review_macos_shard_tests"],
+                )
+            }
+        )
+        self.assertEqual(macos_excluded_modules, macos_shard_modules)
 
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
