@@ -400,7 +400,11 @@ def _reap_process_group_leader(
     return process.wait(timeout=remaining)
 
 
-def _abort_unanchored_fresh_session(process: subprocess.Popen[bytes]) -> None:
+def _abort_unanchored_fresh_session(
+    process: subprocess.Popen[bytes],
+    *,
+    close_streams: bool = True,
+) -> None:
     deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
     try:
         # WNOWAIT proves this numeric PID is still our unreaped child before an
@@ -429,9 +433,74 @@ def _abort_unanchored_fresh_session(process: subprocess.Popen[bytes]) -> None:
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         _reap_process_group_leader(process, deadline=deadline)
     finally:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None and not stream.closed:
+        if close_streams:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+
+
+def _collect_unanchored_terminal_output(
+    process: subprocess.Popen[bytes],
+    *,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> tuple[int, bytes, bytes]:
+    """Collect bounded output after a child exited before session binding.
+
+    The process group is fenced and the leader is reaped before any output is
+    read. The parent-child wait proof makes the numeric PID safe for the
+    unanchored cleanup; preserving the pipes lets this fast-exit path return
+    the child's real result without weakening the live identity checks.
+    """
+    _abort_unanchored_fresh_session(process, close_streams=False)
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("cannot collect terminal Git pipes")
+
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    streams = {
+        stdout_fd: (process.stdout, stdout_limit),
+        stderr_fd: (process.stderr, stderr_limit),
+    }
+    buffers: dict[int, bytearray] = {fd: bytearray() for fd in streams}
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
+    try:
+        for fd in streams:
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("terminal Git output drain timed out")
+            for key, _ in selector.select(min(remaining, 0.25)):
+                fd = key.fd
+                try:
+                    chunk = os.read(fd, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(fd)
+                    continue
+                _, limit = streams[fd]
+                if len(buffers[fd]) + len(chunk) > limit:
+                    raise OverflowError("bounded Git output exceeded its byte cap")
+                buffers[fd].extend(chunk)
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if not stream.closed:
                 stream.close()
+
+    if process.returncode is None:
+        raise ChildProcessError("terminal Git process was not reaped")
+    return (
+        process.returncode,
+        bytes(buffers[stdout_fd]),
+        bytes(buffers[stderr_fd]),
+    )
 
 
 def _bind_fresh_session(process: subprocess.Popen[bytes]) -> SpawnedProcess:
@@ -475,7 +544,19 @@ def run_bounded(
             close_fds=True,
             start_new_session=True,
         )
-        group_anchor = _bind_fresh_session(process)
+        try:
+            group_anchor = _bind_fresh_session(process)
+        except ProcessLookupError:
+            # A very short Git command can exit between Popen returning and
+            # the first identity read. Treat only an observed terminal child
+            # as a completed command; a live lookup failure remains fatal.
+            if terminal_status(process.pid) is None:
+                raise
+            return _collect_unanchored_terminal_output(
+                process,
+                stdout_limit=stdout_limit,
+                stderr_limit=stderr_limit,
+            )
         checkpoint_bound_signal_interrupt(force=True)
         if (
             process.stdout is None
