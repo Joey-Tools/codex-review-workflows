@@ -81,7 +81,7 @@ Read [local-codex-lane.md](references/local-codex-lane.md) and [review-prompt-te
 
 A fresh zero-inherited-context `reviewer` subagent and a fresh non-resumed Codex CLI review process are peer adapters for the same one logical lane. Neither is the default winner. Select the adapter that can most directly realize the intended effective reviewer profile with the least orchestration and context overhead.
 
-The intended installed profile is `gpt-5.6-sol` with Codex mode `ultra`. Ultra may internally delegate; that remains one logical lane. Record the requested and effective adapter, model, and mode. Do not describe `ultra` as an OpenAI API `reasoning.effort` enum value.
+The intended installed `reviewer` subagent profile is `gpt-5.6-terra` with Codex mode `ultra`. Ultra may internally delegate; that remains one logical lane. The Codex CLI/app-server runtime uses `gpt-5.6-terra` first, `gpt-5.6-luna` as its explicit fallback, and `max` reasoning effort. Record the requested and effective adapter, model, and mode. Do not describe `ultra` as an OpenAI API `reasoning.effort` enum value.
 
 ### Claude Code
 

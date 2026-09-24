@@ -79,7 +79,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "slash_commands": [],
             "skills": [],
             "plugins": [],
-            "model": "claude-opus-4-8",
+            "model": "claude-opus-5",
             "claude_code_version": self.claude_code_version,
             "apiKeySource": "none",
             "session_id": "init-session",
@@ -97,7 +97,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "content": [{"type": "text", "text": "working"}],
                 "context_management": None,
                 "id": "msg-synthetic",
-                "model": "claude-opus-4-8",
+                "model": "claude-opus-5",
                 "role": "assistant",
                 "stop_details": None,
                 "stop_reason": None,
@@ -116,7 +116,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "subtype": "success",
             "is_error": False,
             "result": "\nNo findings.\n",
-            "modelUsage": {"claude-opus-4-8": {"inputTokens": 1}},
+            "modelUsage": {"claude-opus-5": {"inputTokens": 1}},
             "duration_ms": 10,
             "duration_api_ms": 5,
             "num_turns": 1,
@@ -415,7 +415,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         events: list[object] | None = None,
         *,
         raw: bytes | None = None,
-        requested_model: str = "claude-opus-4-8",
+        requested_model: str = "claude-opus-5",
         claude_code_version: str | None = None,
         authentication_source: str = "local-login",
         launch_profile: str = "named-direct",
@@ -2817,7 +2817,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 self._raw(self._full_events()),
                 host_workspace_cwd=self.cwd,
                 expected_runtime_cwd=str(self.cwd),
-                requested_model="claude-opus-4-8",
+                requested_model="claude-opus-5",
                 runtime_binding=validator.ClaudeRuntimeBinding(
                     **{
                         **self._valid_runtime_binding_fields(),
@@ -2878,7 +2878,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
     def test_accepts_reviewed_model_alias_and_auxiliary_usage(self) -> None:
         events = self._full_events()
         events[-1]["modelUsage"] = {
-            "claude-opus-4.8": {},
+            "claude-opus-5.0": {},
             "claude-haiku-4-5-20251001": {},
         }
 
@@ -2961,7 +2961,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             io.StringIO("not binary"),
             host_workspace_cwd=self.cwd,
             expected_runtime_cwd=str(self.cwd),
-            requested_model="claude-opus-4-8",
+            requested_model="claude-opus-5",
             runtime_binding=validator.ClaudeRuntimeBinding(
                 **self._valid_runtime_binding_fields()
             ),
@@ -3155,7 +3155,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "slash_commands": None,
             "skills": "",
             "plugins": {},
-            "model": ["claude-opus-4-8"],
+            "model": ["claude-opus-5"],
             "claude_code_version": 212,
             "apiKeySource": None,
             "session_id": " ",
@@ -3461,12 +3461,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         other_model[-1]["modelUsage"] = {"claude-opus-4-7": {}}
         mixed_models = self._full_events()
         mixed_models[-1]["modelUsage"] = {
-            "claude-opus-4-8": {},
+            "claude-opus-5": {},
             "claude-opus-4-7": {},
         }
         unknown_model = self._full_events()
         unknown_model[-1]["modelUsage"] = {
-            "claude-opus-4-8": {},
+            "claude-opus-5": {},
             "claude-future": {},
         }
         unknown_field = self._full_events()
@@ -3557,7 +3557,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         )
         numeric_status = failure_with(
             result="Not logged in - please run /login",
-            modelUsage={"claude-opus-4-8": {}},
+            modelUsage={"claude-opus-5": {}},
             api_error_status=401,
         )
         self.assertEqual(
@@ -3808,7 +3808,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "--cwd",
                         str(self.cwd),
                         "--model",
-                        "claude-opus-4-8",
+                        "claude-opus-5",
                         "--preflight-result",
                         str(self.preflight_path),
                         "--authentication-source",
@@ -3845,7 +3845,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -3885,7 +3885,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "--cwd",
             str(self.cwd),
             "--model",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "--preflight-result",
             str(preflight_path),
             "--authentication-source",
@@ -3940,7 +3940,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "--cwd",
                         str(self.cwd),
                         "--model",
-                        "claude-opus-4-8",
+                        "claude-opus-5",
                         "--preflight-result",
                         str(self.preflight_path),
                         "--authentication-source",
@@ -3979,7 +3979,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4036,7 +4036,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "--cwd",
                         str(self.cwd),
                         "--model",
-                        "claude-opus-4-8",
+                        "claude-opus-5",
                         "--preflight-result",
                         str(self.preflight_path),
                         "--authentication-source",
@@ -4068,7 +4068,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "long-help": ["--help"],
             "missing-cwd": [
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4080,7 +4080,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -4090,7 +4090,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4100,7 +4100,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4124,7 +4124,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4136,7 +4136,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4184,7 +4184,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",
@@ -4228,7 +4228,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "--cwd",
                 str(self.cwd),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.preflight_path),
                 "--authentication-source",

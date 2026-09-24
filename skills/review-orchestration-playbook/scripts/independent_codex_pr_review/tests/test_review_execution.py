@@ -20,6 +20,7 @@ import review_supervisor.codex_executable as codex_executable
 import review_supervisor.no_child_profile as no_child_profile
 
 from review_supervisor.appserver_protocol import (
+    ModelFallbackAuthorization,
     AppServerSessionResult,
 )
 from review_supervisor.auth_carrier import AuthCarrierRefreshRequired
@@ -232,10 +233,10 @@ def _process(final_text: str = "STATUS: clean") -> AppServerProcessResult:
             "ephemeral": True,
             "external_auth": "accepted",
             "instruction_sources": [],
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.6-terra",
             "model_attempt": "primary",
             "model_provider": "openai",
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "max",
             "remote_control": "disabled-notification-observed",
             "runtime_workspace_roots": [],
             "sandbox": {"networkAccess": False, "type": "readOnly"},
@@ -949,8 +950,8 @@ class ReviewExecutionTests(unittest.TestCase):
                     retention_root=root / "retention",
                     checkout_root=root / "checkout",
                     prompt=b"review",
-                    requested_model="gpt-5.6-sol",
-                    requested_reasoning_effort="xhigh",
+                    requested_model="gpt-5.6-terra",
+                    requested_reasoning_effort="max",
                     lifecycle=lifecycle,
                     auth_path=auth_path,
                 )
@@ -999,8 +1000,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         retention_root=root / "retention",
                         checkout_root=root / "checkout",
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model="gpt-5.6-terra",
+                        requested_reasoning_effort="max",
                         lifecycle=_Lifecycle(),
                         auth_path=auth_path,
                     )
@@ -1011,6 +1012,72 @@ class ReviewExecutionTests(unittest.TestCase):
                 sum(resource is lease for resource in failure.retained_resources),
                 1,
             )
+
+    def test_inherited_auth_refresh_evidence_survives_a_model_fallback_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            auth_home = root / "home" / ".codex"
+            auth_home.mkdir(parents=True, mode=0o700)
+            auth_path = auth_home / "auth.json"
+            lease = _Lease(root / "run")
+            state = ProcessCustodyState(
+                leader_reaped=True,
+                process_group_empty=True,
+                pipes_closed=True,
+                exit_code=0,
+            )
+            inherited = {
+                "status": "completed",
+                "managed_auth_verified": True,
+                "codex_home_verified": True,
+                "requires_openai_auth": False,
+                "process_closure": {
+                    "pid": 424242,
+                    "process_group_id": 424242,
+                    "session_id": 424242,
+                    "profile_sha256": "a" * 64,
+                    "exit_code": 0,
+                    "leader_reaped": True,
+                    "process_group_empty": True,
+                    "stdio_closed": True,
+                },
+            }
+            with (
+                patch.object(execution, "_allocate_runtime_lease", return_value=lease),
+                patch.object(execution, "load_external_auth", return_value=object()),
+                patch.object(execution, "revalidate_external_auth_source"),
+                patch.object(
+                    execution,
+                    "_run_review",
+                    return_value=(
+                        _process(),
+                        state,
+                        {"launch": True, "serialization": True},
+                    ),
+                ),
+            ):
+                result = execution.run_authenticated_review(
+                    codex_executable=root / "codex",
+                    aggregate_schema_path=root / "schema.json",
+                    runtime_root=root / "runtime",
+                    repo=root / "repo",
+                    helper_root=root / "helper",
+                    retention_root=root / "retention",
+                    checkout_root=root / "checkout",
+                    prompt=b"review",
+                    requested_model="gpt-5.6-luna",
+                    requested_reasoning_effort="max",
+                    fallback_authorization=ModelFallbackAuthorization(
+                        denial_category="model_entitlement",
+                        denial_record_sha256="b" * 64,
+                    ),
+                    inherited_auth_refresh=inherited,
+                    lifecycle=_Lifecycle(),
+                    auth_path=auth_path,
+                )
+
+            self.assertEqual(result.auth_refresh, inherited)
+            self.assertTrue(lease.cleaned)
 
     def test_refreshed_auth_uses_the_filesystem_verifier_before_review(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -1081,8 +1148,8 @@ class ReviewExecutionTests(unittest.TestCase):
                     retention_root=root / "retention",
                     checkout_root=root / "checkout",
                     prompt=b"review",
-                    requested_model="gpt-5.6-sol",
-                    requested_reasoning_effort="xhigh",
+                    requested_model="gpt-5.6-terra",
+                    requested_reasoning_effort="max",
                     lifecycle=lifecycle,
                     auth_path=auth_path,
                 )
@@ -2084,8 +2151,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=Mock(),
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model="gpt-5.6-terra",
+                        requested_reasoning_effort="max",
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )
@@ -2201,8 +2268,8 @@ class ReviewExecutionTests(unittest.TestCase):
                                 auth=Mock(),
                                 lease=lease,
                                 prompt=b"review",
-                                requested_model="gpt-5.6-sol",
-                                requested_reasoning_effort="xhigh",
+                                requested_model="gpt-5.6-terra",
+                                requested_reasoning_effort="max",
                                 lifecycle=lifecycle,
                                 liveness_checkpoint=lambda: None,
                             )
@@ -2289,8 +2356,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=Mock(),
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model="gpt-5.6-terra",
+                        requested_reasoning_effort="max",
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )
@@ -2391,8 +2458,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=auth,
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model="gpt-5.6-terra",
+                        requested_reasoning_effort="max",
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )

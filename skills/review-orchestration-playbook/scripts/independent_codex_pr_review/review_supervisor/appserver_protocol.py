@@ -365,6 +365,7 @@ class AppServerRemoteError(AppServerProtocolError):
         self.remote_code = remote_code
         self.remote_message = remote_message
         self.remote_data = remote_data
+        self.auth_refresh_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

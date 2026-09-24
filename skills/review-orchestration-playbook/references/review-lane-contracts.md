@@ -566,7 +566,10 @@ deviation.
 Read [local-codex-lane.md](local-codex-lane.md).
 
 - A zero-inherited-context `reviewer` subagent and a fresh non-resumed Codex CLI review are peer adapters.
-- The intended installed profile is `gpt-5.6-sol` with Codex mode `ultra`.
+- The intended installed `reviewer` subagent profile is `gpt-5.6-terra` with
+  Codex mode `ultra`.
+- The Codex CLI/app-server runtime uses `gpt-5.6-terra` first,
+  `gpt-5.6-luna` as its explicit fallback, and `max` reasoning effort.
 - Record requested and effective adapter, model, and mode.
 - Record `self_policy_migration`, plus the instruction-surface status and
   receipt for the selected adapter.
