@@ -951,6 +951,62 @@ class FinalAuthorizationTests(unittest.TestCase):
                 state["handoff_token"],
             )
 
+            primary_leader = {
+                "pid": 4566,
+                "pgid": 4566,
+                "start_identity": "fixture-primary-reviewer",
+            }
+            primary_binding = {
+                "session_id": primary_leader["pid"],
+                "profile_sha256": "6" * 64,
+            }
+            final_leader = state["leader"]
+            final_binding = state["runtime_process_binding"]
+            state["model_fallback_authorization"] = {
+                "denial_category": "model_entitlement",
+                "denial_record_sha256": "a" * 64,
+                "denied_model": "gpt-5.6-terra",
+                "selected_model": "gpt-5.6-luna",
+            }
+            state["requested_model"] = "gpt-5.6-luna"
+            state["observed_runtime"]["model"].update(
+                {
+                    "model": "gpt-5.6-luna",
+                    "model_attempt": "explicit_fallback",
+                    "model_fallback_authorization": state[
+                        "model_fallback_authorization"
+                    ],
+                }
+            )
+            state["observed_runtime"]["requested_model"] = "gpt-5.6-luna"
+            state["process_history"] = [
+                {
+                    "stage": "reviewer",
+                    "leader": primary_leader,
+                    "runtime_binding": primary_binding,
+                    "exit_code": 1,
+                    "closure": "proven-by-owner",
+                },
+                {
+                    "stage": "auth-refresh",
+                    "leader": refresh_leader,
+                    "runtime_binding": refresh_binding,
+                    "exit_code": 0,
+                    "closure": "proven-by-owner",
+                },
+                {
+                    "stage": "reviewer",
+                    "leader": final_leader,
+                    "runtime_binding": final_binding,
+                    "exit_code": 0,
+                    "closure": "proven-by-owner",
+                },
+            ]
+            self.assertEqual(
+                _validate_terminal_lifecycle(attempt, state),
+                state["handoff_token"],
+            )
+
 
 class RecoverySettlementTests(unittest.TestCase):
     def test_boot_change_rejects_unbound_or_nonprivate_closure_receipt(

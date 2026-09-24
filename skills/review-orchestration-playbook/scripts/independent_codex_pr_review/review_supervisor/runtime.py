@@ -1948,11 +1948,14 @@ def _validate_terminal_lifecycle(
         raise ValueError("terminal handoff token is malformed")
     _validate_observed_runtime(state)
     refresh_runtime = state["observed_runtime"]["auth_refresh"]
-    if history[0].get("stage") != "auth-refresh":
+    refresh_history = next(
+        (entry for entry in history if entry.get("stage") == "auth-refresh"),
+        None,
+    )
+    if refresh_history is None:
         if refresh_runtime.get("status") != "not-required":
             raise ValueError("terminal auth-refresh history is missing")
     else:
-        refresh_history = history[0]
         refresh_leader = refresh_history["leader"]
         refresh_binding = refresh_history["runtime_binding"]
         refresh_closure = refresh_runtime.get("process_closure")
