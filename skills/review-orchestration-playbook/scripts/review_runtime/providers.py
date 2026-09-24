@@ -20329,7 +20329,12 @@ def _claude_supported_failure_category(
 
 
 def _normalize_model(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
+    normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
+    # Claude Code reports the same Opus 5 family as either `claude-opus-5`
+    # or its dotted wire alias `claude-opus-5.0`.
+    return {
+        "claudeopus50": "claudeopus5",
+    }.get(normalized, normalized)
 
 
 def _model_matches(requested: str, effective: str) -> bool:

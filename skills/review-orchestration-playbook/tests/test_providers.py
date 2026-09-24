@@ -30516,8 +30516,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_model_match_is_normalized_but_not_prefix_based(self) -> None:
         self.assertTrue(providers._model_matches("claude-opus-4-8", "claude-opus-4.8"))
+        self.assertTrue(providers._model_matches("claude-opus-5", "claude-opus-5.0"))
+        self.assertTrue(providers._model_matches("claude-opus-5.0", "claude-opus-5"))
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-mini"))
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-codex"))
+        self.assertFalse(providers._model_matches("claude-opus-5", "claude-opus-5.1"))
 
     def test_entitlement_is_fallback_eligible(self) -> None:
         self.assertEqual(
