@@ -20330,7 +20330,7 @@ def _claude_supported_failure_category(
 
 def _normalize_model(value: str) -> str:
     if value.lower() in {"claude-opus-5", "claude-opus-5.0"}:
-        return "claudeopus5"
+        return "claude-opus-5"
     normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
     return normalized
 
