@@ -99,7 +99,7 @@ CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION = pathlib.Path("/dev/null")
 CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS = frozenset(
     ((CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION, pathlib.Path("/dev")),)
 )
-CLAUDE_DIRECT_MODELS = ("claude-opus-4-8",)
+CLAUDE_DIRECT_MODELS = ("claude-opus-5",)
 CLAUDE_DIRECT_REQUIRED_OPTIONS = (
     "--print",
     "--input-format",

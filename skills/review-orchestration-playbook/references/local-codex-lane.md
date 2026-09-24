@@ -412,8 +412,8 @@ The normalized direct-argv shape is:
   -c shell_environment_policy.exclude=["CODEX_HOME"]
   -c shell_environment_policy.ignore_default_excludes=false
   -s read-only
-  -m gpt-5.6-sol
-  -c model_reasoning_effort="ultra"
+  -m gpt-5.6-terra
+  -c model_reasoning_effort="max"
   -C <absolute-parent-owned-neutral-launch-directory>
   --skip-git-repo-check
   --json
@@ -558,10 +558,11 @@ failure.
 
 ## Reviewer Profile
 
-The intended installed profile is:
+The intended Codex CLI/app-server runtime profile is:
 
-- model: `gpt-5.6-sol`;
-- Codex profile/mode: `ultra`;
+- primary model: `gpt-5.6-terra`;
+- explicit fallback model: `gpt-5.6-luna`;
+- reasoning effort: `max`;
 - context: fresh;
 - access: read-only;
 - output: findings only.
@@ -587,18 +588,21 @@ latency, tokens, and unnecessary external reads.
 A runtime rejection, silent downgrade, or effective-profile mismatch is a
 local capability and conformance problem, not evidence that a newer model
 exists. Diagnose it from local runtime capability/receipt evidence and try the
-peer adapter at the exact same configured model and `ultra` mode. It never
-triggers latest-model discovery.
+peer adapter at the exact same configured reviewer-subagent model and
+`ultra` mode. It never triggers latest-model discovery.
 
 ## Fallback Order
 
 When the first adapter cannot realize the intended profile:
 
-1. Try the peer adapter with the exact same model and `ultra` mode.
-2. If neither adapter can realize that exact profile, keep the lane blocked or
+1. For the `reviewer` subagent, try the peer adapter with the exact same
+   `gpt-5.6-terra` model and `ultra` mode.
+2. For the Codex CLI/app-server runtime, try `gpt-5.6-luna` with `max`
+   reasoning only when the primary Terra launch is explicitly rejected by the
+   runtime's fallback contract.
+3. If neither configured profile can run, keep the lane blocked or
    inconclusive according to the local evidence; do not silently lower the
    mode or change the model family.
-3. A lower mode or different model family requires explicit user confirmation.
 
 A transient adapter or service failure is retryable. A CLI adapter that cannot
 prove a file-backed credential source or construct and validate its temporary

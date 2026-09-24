@@ -1036,8 +1036,8 @@ class RuntimeHelperTests(unittest.TestCase):
             "actual_invocation_enabled": False,
             "cli_version_expected": APP_SERVER_CLI_VERSION,
             "no_child_kernel_profile_verified": False,
-            "requested_model": "gpt-5.6-sol",
-            "requested_reasoning_effort": "xhigh",
+            "requested_model": "gpt-5.6-terra",
+            "requested_reasoning_effort": "max",
             "supervisor_executable_authenticated": False,
             "transport": "app-server-stdio",
         }
@@ -1608,8 +1608,8 @@ class RuntimeHelperTests(unittest.TestCase):
                     "worktree": str(root),
                     "worktree_identity": identity.to_json(),
                 },
-                "requested_model": "gpt-5.6-sol",
-                "requested_reasoning_effort": "xhigh",
+                "requested_model": "gpt-5.6-terra",
+                "requested_reasoning_effort": "max",
                 "worktree_path": str(root),
             }
             execution_calls: list[dict[str, object]] = []
@@ -1711,7 +1711,7 @@ class RuntimeHelperTests(unittest.TestCase):
             observed["evidence_bundle_sha256"],
             sha256_bytes(canonical_json(evidence_bundle)),
         )
-        self.assertEqual(observed["requested_model"], "gpt-5.6-sol")
+        self.assertEqual(observed["requested_model"], "gpt-5.6-terra")
         self.assertEqual(observed["transport"], "app-server-stdio")
         self.assertTrue(observed["actual_invocation_enabled"])
         self.assertEqual(

@@ -420,8 +420,8 @@ def _write_attempt(
         "admission_status": "completed",
         "failure_stage": None,
         "review_range": f"{'1' * 40}..{'2' * 40}",
-        "requested_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "xhigh",
+        "requested_model": "gpt-5.6-terra",
+        "requested_reasoning_effort": "max",
         "observed_runtime": {},
         "final_seal": None,
         "final_fifo_path": str(attempt / "final.fifo"),
@@ -452,10 +452,10 @@ def _terminal_observed_runtime() -> dict[str, object]:
             "session_source": "exec",
         },
         "model": {
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.6-terra",
             "model_attempt": "primary",
             "model_provider": "openai",
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "max",
         },
         "containment": {
             "leader_reaped": True,
@@ -476,8 +476,8 @@ def _terminal_observed_runtime() -> dict[str, object]:
         "evidence_bundle_sha256": "a" * 64,
         "model_input_length": 128,
         "model_input_sha256": "b" * 64,
-        "requested_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "xhigh",
+        "requested_model": "gpt-5.6-terra",
+        "requested_reasoning_effort": "max",
         "transport": "app-server-stdio",
     }
 

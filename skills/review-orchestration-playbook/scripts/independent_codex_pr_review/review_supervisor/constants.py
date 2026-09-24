@@ -80,9 +80,9 @@ REGISTRATION_DESCENDANT_COUNT_CAP = 16
 REGISTRATION_PATH_BYTES_CAP = 4096
 TARGETED_MANIFEST_RECORD_BYTES = 192
 
-MODEL = "gpt-5.6-sol"
-EXPLICIT_FALLBACK_MODEL = "gpt-5.5"
-REASONING_EFFORT = "xhigh"
+MODEL = "gpt-5.6-terra"
+EXPLICIT_FALLBACK_MODEL = "gpt-5.6-luna"
+REASONING_EFFORT = "max"
 PRIMARY_DIFF_RELATIVE_PATH = ".codex-review/review.diff"
 HELPER_PREFLIGHT_STATUS = "sensitive-content and escaping-symlink checks passed"
 HELPER_STATE_MARKER = ".isolated-review-state"

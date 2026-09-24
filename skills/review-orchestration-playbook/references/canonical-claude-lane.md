@@ -85,9 +85,9 @@ control options, `--` is followed by exactly the preflight-bound absolute Claude
 executable and no caller-owned Claude argument. This is a security-tightening
 replacement for the former full-tail call shape; do not preserve or reconstruct
 that obsolete entrypoint. The only accepted model control is
-`--model claude-opus-4-8`; the direct guard rejects `claude-opus-4-7` and every
-other caller-selected model. Retained 4.7 stream schemas or legacy/helper
-failure classifiers do not authorize a named-direct launch. A final 4.8
+`--model claude-opus-5`; the direct guard rejects every other caller-selected
+model. Retained legacy stream schemas or failure classifiers do not authorize
+a named-direct launch. A final Opus 5
 entitlement or organization-policy denial therefore leaves the named-direct
 lane inconclusive until a separately closed, evidence-bound fallback bridge is
 defined. The guard constructs this exact ordered argument profile:

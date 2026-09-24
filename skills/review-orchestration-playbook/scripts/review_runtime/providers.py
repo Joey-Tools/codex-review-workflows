@@ -161,12 +161,10 @@ def __getattr__(name: str) -> Any:
 _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
 
 
-CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
-CODEX_REASONING_EFFORT = "xhigh"
-CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
-# GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
-# shorter command-reference examples can lag product availability.
-COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
+CODEX_MODELS = ("gpt-5.6-terra", "gpt-5.6-luna")
+CODEX_REASONING_EFFORT = "max"
+CLAUDE_MODELS = ("claude-opus-5",)
+COPILOT_MODELS = ("claude-opus-5",)
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
 CLAUDE_LINUX_PROMPT_GUIDANCE = b"""
