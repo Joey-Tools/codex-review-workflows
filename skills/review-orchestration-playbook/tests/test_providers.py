@@ -30521,6 +30521,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-mini"))
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-codex"))
         self.assertFalse(providers._model_matches("claude-opus-5", "claude-opus-5.1"))
+        self.assertFalse(providers._model_matches("claude-opus-5", "claude-opus-50"))
 
     def test_entitlement_is_fallback_eligible(self) -> None:
         self.assertEqual(
