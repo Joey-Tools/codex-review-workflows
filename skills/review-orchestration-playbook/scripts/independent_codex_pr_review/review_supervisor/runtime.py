@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .appserver_runtime import build_prelaunch_appserver_input
+from .appserver_protocol import (
+    AppServerRemoteError,
+    ModelFallbackAuthorization,
+)
 from .checkout import (
     RawMaterializer,
     probe_name_semantics,
@@ -22,12 +26,14 @@ from .checkout import (
 )
 from .constants import (
     CHECKOUT_SECONDS,
+    EXPLICIT_FALLBACK_MODEL,
     FINAL_MESSAGE_BYTES,
     HANDOFF_SECONDS,
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     MAX_EVIDENCE_CONTEXT_BYTES,
     MAX_EVIDENCE_CONTEXT_FILE_BYTES,
     MAX_EVIDENCE_CONTEXT_FILES,
+    MODEL,
     NAMED_LANE_ELIGIBLE,
     PRIMARY_DIFF_RELATIVE_PATH,
     PROCESS_TERM_GRACE_SECONDS,
@@ -312,6 +318,11 @@ _ORDINARY_PHASE_TRANSITIONS = (
         {"launched"},
         "review-finished",
         {"phase", "launch_status", "closure", "leader_exit", "process_history"},
+    ),
+    _transition(
+        {"review-finished"},
+        "validating",
+        {"phase", "requested_model", "model_fallback_authorization"},
     ),
     _transition(
         {"review-finished"},
@@ -658,7 +669,7 @@ class DurableProcessLifecycle:
         if not isinstance(runtime_binding, dict):
             raise ValueError("durable process closure has no runtime binding")
         history = self.state.get("process_history", [])
-        if not isinstance(history, list) or len(history) >= 2:
+        if not isinstance(history, list) or len(history) >= 3:
             raise ValueError(
                 "durable process history is malformed or exceeds its bound"
             )
@@ -711,48 +722,109 @@ class DurableProcessLifecycle:
             if any(self.state.get(key) != value for key, value in expected.items()):
                 raise ValueError("durable process initial predecessor is not pristine")
             return
-        if stage != "reviewer" or len(history) != 1:
+        if stage != "reviewer" or len(history) not in {1, 2}:
             raise ValueError("durable process stage history is out of sequence")
-        previous = history[0]
-        if (
-            not isinstance(previous, dict)
-            or set(previous)
-            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
-            or previous.get("stage") != "auth-refresh"
-            or previous.get("exit_code") != 0
-            or previous.get("closure") != "proven-by-owner"
-            or not isinstance(previous.get("leader"), dict)
-            or not isinstance(previous.get("runtime_binding"), dict)
-        ):
-            raise ValueError("durable auth-refresh history is malformed")
-        expected = {
-            "launch_status": "completed",
-            "runtime_stage": "auth-refresh",
-            "leader": previous["leader"],
-            "runtime_process_binding": previous["runtime_binding"],
-            "leader_exit": 0,
-            "closure": "proven-by-owner",
-        }
-        if any(self.state.get(key) != value for key, value in expected.items()):
-            raise ValueError("durable auth-refresh predecessor changed")
-        profile = self.state.get("no_child_process_profile")
-        if (
-            not isinstance(profile, dict)
-            or set(profile)
-            != {
-                "version",
-                "authenticated",
-                "kernel_enforced",
-                "child_process_limit",
-                "leader",
+        previous = history[-1]
+        if not isinstance(previous, dict):
+            raise ValueError("durable process history entry is malformed")
+        if previous.get("stage") == "auth-refresh" and len(history) == 1:
+            if (
+                set(previous)
+                != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+                or previous.get("stage") != "auth-refresh"
+                or previous.get("exit_code") != 0
+                or previous.get("closure") != "proven-by-owner"
+                or not isinstance(previous.get("leader"), dict)
+                or not isinstance(previous.get("runtime_binding"), dict)
+            ):
+                raise ValueError("durable auth-refresh history is malformed")
+            expected = {
+                "launch_status": "completed",
+                "runtime_stage": "auth-refresh",
+                "leader": previous["leader"],
+                "runtime_process_binding": previous["runtime_binding"],
+                "leader_exit": 0,
+                "closure": "proven-by-owner",
             }
-            or profile.get("version") != 1
-            or profile.get("authenticated") is not True
-            or profile.get("kernel_enforced") is not True
-            or profile.get("child_process_limit") != 0
-            or profile.get("leader") != previous["leader"]
-        ):
-            raise ValueError("durable auth-refresh profile is malformed")
+            if any(self.state.get(key) != value for key, value in expected.items()):
+                raise ValueError("durable auth-refresh predecessor changed")
+            profile = self.state.get("no_child_process_profile")
+            if (
+                not isinstance(profile, dict)
+                or set(profile)
+                != {
+                    "version",
+                    "authenticated",
+                    "kernel_enforced",
+                    "child_process_limit",
+                    "leader",
+                }
+                or profile.get("version") != 1
+                or profile.get("authenticated") is not True
+                or profile.get("kernel_enforced") is not True
+                or profile.get("child_process_limit") != 0
+                or profile.get("leader") != previous["leader"]
+            ):
+                raise ValueError("durable auth-refresh profile is malformed")
+            return
+        if previous.get("stage") == "reviewer":
+            if (
+                set(previous)
+                != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+                or previous.get("stage") != "reviewer"
+                or type(previous.get("exit_code")) is not int
+                or previous.get("closure") != "proven-by-owner"
+                or not isinstance(previous.get("leader"), dict)
+                or not isinstance(previous.get("runtime_binding"), dict)
+            ):
+                raise ValueError("durable reviewer history is malformed")
+            expected = {
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": previous["leader"],
+                "runtime_process_binding": previous["runtime_binding"],
+                "leader_exit": previous["exit_code"],
+                "closure": "proven-by-owner",
+            }
+            if any(self.state.get(key) != value for key, value in expected.items()):
+                raise ValueError("durable reviewer predecessor changed")
+            profile = self.state.get("no_child_process_profile")
+            if (
+                not isinstance(profile, dict)
+                or set(profile)
+                != {
+                    "version",
+                    "authenticated",
+                    "kernel_enforced",
+                    "child_process_limit",
+                    "leader",
+                }
+                or profile.get("version") != 1
+                or profile.get("authenticated") is not True
+                or profile.get("kernel_enforced") is not True
+                or profile.get("child_process_limit") != 0
+                or profile.get("leader") != previous["leader"]
+            ):
+                raise ValueError("durable reviewer profile is malformed")
+            if len(history) == 2:
+                refresh = history[0]
+                if (
+                    not isinstance(refresh, dict)
+                    or set(refresh)
+                    != {
+                        "stage",
+                        "leader",
+                        "runtime_binding",
+                        "exit_code",
+                        "closure",
+                    }
+                    or refresh.get("stage") != "auth-refresh"
+                    or refresh.get("exit_code") != 0
+                    or refresh.get("closure") != "proven-by-owner"
+                ):
+                    raise ValueError("durable auth-refresh history is malformed")
+            return
+        raise ValueError("durable process history stage is malformed")
 
 
 def _git_control(value: dict[str, Any]) -> GitControlBinding:
@@ -1419,7 +1491,13 @@ def _validate_observed_runtime(state: dict[str, Any]) -> None:
     if (
         not isinstance(model, dict)
         or set(model)
-        != {"model", "model_attempt", "model_provider", "reasoning_effort"}
+        != {
+            "model",
+            "model_attempt",
+            "model_fallback_authorization",
+            "model_provider",
+            "reasoning_effort",
+        }
         or model.get("model") != state.get("requested_model")
         or model.get("reasoning_effort") != state.get("requested_reasoning_effort")
         or model.get("model_provider") != "openai"
@@ -1427,6 +1505,31 @@ def _validate_observed_runtime(state: dict[str, Any]) -> None:
         or not model["model_attempt"]
     ):
         raise ValueError("terminal model runtime evidence is malformed")
+    fallback_authorization = model.get("model_fallback_authorization")
+    state_fallback_authorization = state.get("model_fallback_authorization")
+    if state.get("requested_model") == EXPLICIT_FALLBACK_MODEL:
+        if (
+            not isinstance(fallback_authorization, dict)
+            or fallback_authorization != state_fallback_authorization
+            or set(fallback_authorization)
+            != {
+                "denial_category",
+                "denial_record_sha256",
+                "denied_model",
+                "selected_model",
+            }
+        ):
+            raise ValueError("terminal model fallback authorization is malformed")
+        try:
+            authorization = ModelFallbackAuthorization(**fallback_authorization)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "terminal model fallback authorization is malformed"
+            ) from None
+        if authorization.selected_model != state.get("requested_model"):
+            raise ValueError("terminal model fallback authorization is mismatched")
+    elif fallback_authorization is not None or state_fallback_authorization is not None:
+        raise ValueError("unexpected terminal model fallback authorization")
     auth = observed.get("auth")
     if (
         not isinstance(auth, dict)
@@ -1551,10 +1654,12 @@ def _validate_terminal_lifecycle(
     except ChildProcessError as error:
         raise ValueError("terminal reviewer no-child profile is malformed") from error
     history = state.get("process_history")
-    if not isinstance(history, list) or len(history) not in {1, 2}:
+    if not isinstance(history, list) or len(history) not in {1, 2, 3}:
         raise ValueError("terminal process history is malformed")
     for index, entry in enumerate(history):
-        expected_stage = "reviewer" if index == len(history) - 1 else "auth-refresh"
+        expected_stage = (
+            "reviewer" if len(history) == 1 or index > 0 else "auth-refresh"
+        )
         if (
             not isinstance(entry, dict)
             or set(entry)
@@ -1635,7 +1740,7 @@ def _validate_terminal_lifecycle(
         raise ValueError("terminal handoff token is malformed")
     _validate_observed_runtime(state)
     refresh_runtime = state["observed_runtime"]["auth_refresh"]
-    if len(history) == 1:
+    if history[0].get("stage") != "auth-refresh":
         if refresh_runtime.get("status") != "not-required":
             raise ValueError("terminal auth-refresh history is missing")
     else:
@@ -3919,8 +4024,37 @@ def _run_authenticated_review_boundary(
         return run_authenticated_review(**arguments), False
     except UnprovenDirectHelperClosure:
         raise
+    except AppServerRemoteError:
+        raise
     except BaseException:
         return None, True
+
+
+def _fallback_authorization_from_denial(
+    error: AppServerRemoteError,
+) -> ModelFallbackAuthorization | None:
+    if error.request_method != "thread/start" or error.remote_code != -32001:
+        return None
+    denial = error.remote_data
+    if not isinstance(denial, dict) or set(denial) != {"category"}:
+        return None
+    category = denial.get("category")
+    if not isinstance(category, str) or category not in {
+        "account",
+        "plan",
+        "org_policy",
+        "model_entitlement",
+    }:
+        return None
+    denial_record = {
+        "category": category,
+        "code": error.remote_code,
+        "method": error.request_method,
+    }
+    return ModelFallbackAuthorization(
+        denial_category=category,
+        denial_record_sha256=sha256_bytes(canonical_json(denial_record)),
+    )
 
 
 def run_reviewer(
@@ -3988,22 +4122,65 @@ def run_reviewer(
         state=state,
         state_digest=state_digest,
     )
-    result, execution_failed = _run_authenticated_review_boundary(
-        codex_executable=pathlib.Path(state["codex_executable"]),
-        runtime_root=attempt.path / "review-runtime",
-        repo=pathlib.Path(state["repo"]),
-        helper_root=tool_root(),
-        retention_root=attempt.path.parent,
-        checkout_root=worktree,
-        prompt=prepared_input.prompt,
-        requested_model=state["requested_model"],
-        requested_reasoning_effort=state["requested_reasoning_effort"],
-        lifecycle=lifecycle,
-        liveness_checkpoint=lambda: _require_outer_liveness(outer),
-    )
+    try:
+        result, execution_failed = _run_authenticated_review_boundary(
+            codex_executable=pathlib.Path(state["codex_executable"]),
+            runtime_root=attempt.path / "review-runtime",
+            repo=pathlib.Path(state["repo"]),
+            helper_root=tool_root(),
+            retention_root=attempt.path.parent,
+            checkout_root=worktree,
+            prompt=prepared_input.prompt,
+            requested_model=state["requested_model"],
+            requested_reasoning_effort=state["requested_reasoning_effort"],
+            fallback_authorization=None,
+            lifecycle=lifecycle,
+            liveness_checkpoint=lambda: _require_outer_liveness(outer),
+        )
+    except AppServerRemoteError as denial_error:
+        authorization = _fallback_authorization_from_denial(denial_error)
+        if (
+            authorization is None
+            or state.get("requested_model") != MODEL
+            or lifecycle.state.get("phase") != "review-finished"
+        ):
+            result, execution_failed = None, True
+        else:
+            state, state_digest = commit_via_helper(
+                entrypoint=entrypoint,
+                attempt=attempt,
+                state=lifecycle.state,
+                state_digest=lifecycle.state_digest,
+                updates={
+                    "phase": "validating",
+                    "requested_model": EXPLICIT_FALLBACK_MODEL,
+                    "model_fallback_authorization": authorization.to_json(),
+                },
+                deadline=time.monotonic() + 30,
+            )
+            lifecycle.state = state
+            lifecycle.state_digest = state_digest
+            try:
+                result, execution_failed = _run_authenticated_review_boundary(
+                    codex_executable=pathlib.Path(state["codex_executable"]),
+                    runtime_root=attempt.path / "review-runtime",
+                    repo=pathlib.Path(state["repo"]),
+                    helper_root=tool_root(),
+                    retention_root=attempt.path.parent,
+                    checkout_root=worktree,
+                    prompt=prepared_input.prompt,
+                    requested_model=state["requested_model"],
+                    requested_reasoning_effort=state["requested_reasoning_effort"],
+                    fallback_authorization=authorization,
+                    lifecycle=lifecycle,
+                    liveness_checkpoint=lambda: _require_outer_liveness(outer),
+                )
+            except AppServerRemoteError:
+                result, execution_failed = None, True
     if execution_failed and not peer_is_open(outer):
         raise OuterAbandoned("outer liveness closed during reviewer execution")
     if execution_failed or result is None:
+        state = lifecycle.state
         error = inconclusive(
             "authenticated app-server review failed at a closed runtime boundary",
             stage="reviewer-runtime",
@@ -5462,6 +5639,7 @@ def _compact_terminal(
         ),
         "requested_model": state.get("requested_model"),
         "requested_reasoning_effort": state.get("requested_reasoning_effort"),
+        "model_fallback_authorization": state.get("model_fallback_authorization"),
         "observed_runtime": state.get("observed_runtime"),
         "final_seal": state.get("final_seal"),
         "retained_process_bytes": state.get("retained_process_bytes"),

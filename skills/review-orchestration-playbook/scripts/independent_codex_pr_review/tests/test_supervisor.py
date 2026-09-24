@@ -454,6 +454,7 @@ def _terminal_observed_runtime() -> dict[str, object]:
         "model": {
             "model": "gpt-5.6-terra",
             "model_attempt": "primary",
+            "model_fallback_authorization": None,
             "model_provider": "openai",
             "reasoning_effort": "max",
         },
@@ -750,7 +751,10 @@ class FinalAuthorizationTests(unittest.TestCase):
                 "length": len(content),
                 "sha256": sha256_bytes(content),
             }
-            supervisor = {"pid": 1234, "start_identity": "fixture-supervisor"}
+            supervisor = {
+                "pid": 999_999_999,
+                "start_identity": "fixture-supervisor",
+            }
             leader = {
                 "pid": 5678,
                 "pgid": 5678,

@@ -1087,7 +1087,7 @@ def _require_reviewer_closure_evidence(state: dict[str, Any]) -> None:
     leader_exit = state.get("leader_exit")
     if (
         not isinstance(process_history, list)
-        or len(process_history) not in {1, 2}
+        or len(process_history) not in {1, 2, 3}
         or not isinstance(process_history[-1], dict)
         or set(process_history[-1])
         != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
@@ -1099,7 +1099,10 @@ def _require_reviewer_closure_evidence(state: dict[str, Any]) -> None:
         or process_history[-1].get("closure") != "proven-by-owner"
     ):
         raise ValueError("reviewer closure history is malformed")
-    if len(process_history) == 2:
+    if (
+        len(process_history) >= 2
+        and process_history[0].get("stage") == "auth-refresh"
+    ):
         refresh = process_history[0]
         if (
             not isinstance(refresh, dict)
@@ -1174,7 +1177,7 @@ def _terminal_handoff_token(
     process_history = state.get("process_history")
     if (
         not isinstance(process_history, list)
-        or len(process_history) not in {1, 2}
+        or len(process_history) not in {1, 2, 3}
         or not isinstance(process_history[-1], dict)
         or set(process_history[-1])
         != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
@@ -1186,7 +1189,10 @@ def _terminal_handoff_token(
         or state.get("leader_exit") != 0
     ):
         raise ValueError("terminal reviewer closure history is malformed")
-    if len(process_history) == 2:
+    if (
+        len(process_history) >= 2
+        and process_history[0].get("stage") == "auth-refresh"
+    ):
         refresh = process_history[0]
         if (
             not isinstance(refresh, dict)

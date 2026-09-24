@@ -1694,6 +1694,7 @@ def create_reserved_attempt(
         "codex_executable": codex_executable,
         "requested_model": MODEL,
         "requested_reasoning_effort": REASONING_EFFORT,
+        "model_fallback_authorization": None,
         "exec_budget": exec_budget,
         "review_range": custody.review_range,
         "base_sha": custody.base_sha,

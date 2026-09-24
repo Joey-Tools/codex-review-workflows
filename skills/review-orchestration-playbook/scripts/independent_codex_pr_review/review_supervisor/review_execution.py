@@ -14,6 +14,7 @@ from typing import Any, Callable, Protocol, cast
 
 from .appserver_protocol import (
     APP_SERVER_NO_EXECUTION_CONFIG_ARGS,
+    ModelFallbackAuthorization,
     AppServerSessionConfig,
     AppServerSessionResult,
 )
@@ -1256,6 +1257,7 @@ def run_authenticated_review(
     prompt: bytes,
     requested_model: str,
     requested_reasoning_effort: str,
+    fallback_authorization: ModelFallbackAuthorization | None = None,
     lifecycle: ProcessLifecycle,
     aggregate_schema_path: pathlib.Path | None = None,
     auth_path: pathlib.Path | None = None,
@@ -1336,6 +1338,7 @@ def run_authenticated_review(
             prompt=prompt,
             requested_model=requested_model,
             requested_reasoning_effort=requested_reasoning_effort,
+            fallback_authorization=fallback_authorization,
             lifecycle=lifecycle,
             liveness_checkpoint=liveness_checkpoint,
         )
@@ -1507,6 +1510,7 @@ def _run_review(
     prompt: bytes,
     requested_model: str,
     requested_reasoning_effort: str,
+    fallback_authorization: ModelFallbackAuthorization | None = None,
     lifecycle: ProcessLifecycle,
     liveness_checkpoint: Callable[[], None],
 ) -> tuple[AppServerProcessResult, ProcessCustodyState, dict[str, bool]]:
@@ -1558,6 +1562,7 @@ def _run_review(
             expected_codex_home=str(codex_home),
             expected_model=requested_model,
             expected_reasoning_effort=requested_reasoning_effort,
+            fallback_authorization=fallback_authorization,
             external_auth=auth.auth,
         )
 
@@ -2282,6 +2287,9 @@ def _sanitize_process_result(
         ),
         "model": attestation.get("model"),
         "model_attempt": attestation.get("model_attempt"),
+        "model_fallback_authorization": attestation.get(
+            "model_fallback_authorization"
+        ),
         "model_provider": attestation.get("model_provider"),
         "reasoning_effort": attestation.get("reasoning_effort"),
         "remote_control": attestation.get("remote_control"),
@@ -2353,6 +2361,9 @@ def _observed_runtime(
         "model": {
             "model": protocol.get("model"),
             "model_attempt": protocol.get("model_attempt"),
+            "model_fallback_authorization": protocol.get(
+                "model_fallback_authorization"
+            ),
             "model_provider": protocol.get("model_provider"),
             "reasoning_effort": protocol.get("reasoning_effort"),
         },

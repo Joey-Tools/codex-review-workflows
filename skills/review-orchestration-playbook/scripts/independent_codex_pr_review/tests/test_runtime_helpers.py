@@ -20,6 +20,7 @@ from review_supervisor.constants import (
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
 )
+from review_supervisor.appserver_protocol import AppServerRemoteError
 from review_supervisor.evidence import ManifestEntry, manifest_sha256
 from review_supervisor.errors import SupervisorError, inconclusive
 from review_supervisor.ledger import (
@@ -51,6 +52,7 @@ from review_supervisor.runtime import (
     _read_checkout_closure_receipt,
     _run_checkout,
     _run_authenticated_review_boundary,
+    _fallback_authorization_from_denial,
     _spawn_internal,
     _validate_checkout_failed_record,
     _validate_final_authorization_updates,
@@ -138,6 +140,53 @@ class _FakeCatFileBatch:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_model_fallback_requires_an_explicit_bounded_denial(self) -> None:
+        denial = AppServerRemoteError(
+            request_method="thread/start",
+            remote_code=-32001,
+            remote_message="model is not entitled",
+            remote_data={"category": "model_entitlement"},
+        )
+        authorization = _fallback_authorization_from_denial(denial)
+        self.assertIsNotNone(authorization)
+        assert authorization is not None
+        self.assertEqual(authorization.denied_model, "gpt-5.6-terra")
+        self.assertEqual(authorization.selected_model, "gpt-5.6-luna")
+        self.assertEqual(
+            authorization.denial_record_sha256,
+            sha256_bytes(
+                canonical_json(
+                    {
+                        "category": "model_entitlement",
+                        "code": -32001,
+                        "method": "thread/start",
+                    }
+                )
+            ),
+        )
+        for malformed in (
+            AppServerRemoteError(
+                request_method="turn/start",
+                remote_code=-32001,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement"},
+            ),
+            AppServerRemoteError(
+                request_method="thread/start",
+                remote_code=-32000,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement"},
+            ),
+            AppServerRemoteError(
+                request_method="thread/start",
+                remote_code=-32001,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement", "detail": "extra"},
+            ),
+        ):
+            with self.subTest(error=malformed):
+                self.assertIsNone(_fallback_authorization_from_denial(malformed))
+
     def test_retained_git_control_paths_are_closed_to_the_temporary_root(self) -> None:
         attempt_dir = pathlib.Path("/private/review/attempt-1")
         retained = attempt_dir / "codex-git-control-synthetic"
@@ -873,6 +922,53 @@ class RuntimeHelperTests(unittest.TestCase):
 
         self.assertEqual(lifecycle.state["phase"], "spawn-intent")
         self.assertEqual(lifecycle.state["process_history"][0]["stage"], "auth-refresh")
+
+    def test_reviewer_stage_accepts_a_second_reviewer_after_primary_denial(self) -> None:
+        leader = {"pid": 123, "pgid": 123, "start_identity": "start"}
+        runtime_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": leader,
+                "runtime_process_binding": runtime_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": leader,
+                },
+                "leader_exit": 1,
+                "closure": "proven-by-owner",
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": leader,
+                        "runtime_binding": runtime_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    }
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("reviewer")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["process_history"][0]["stage"], "reviewer")
 
     def test_publish_bytes_never_leaves_a_partial_destination(self) -> None:
         with owned_temporary_directory("atomic-artifact-") as root:
