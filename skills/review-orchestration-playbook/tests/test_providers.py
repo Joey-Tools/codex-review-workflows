@@ -31084,7 +31084,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         mismatched = self.record_claude_result(
             json.dumps(
-                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                {
+                    **base,
+                    "modelUsage": {"claude-haiku-4-5-20251001": {}},
+                }
             ).encode(),
             returncode=0,
             index=108,
@@ -31176,7 +31179,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ("malformed", [], "runtime-unverified", "malformed-model-usage"),
             (
                 "wrong",
-                {providers.CLAUDE_MODELS[1]: {}},
+                {"claude-haiku-4-5-20251001": {}},
                 "model-mismatch",
                 "effective-model-mismatch",
             ),
@@ -31320,7 +31323,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_all_supported_failures_require_requested_model_binding(self) -> None:
         model = providers.CLAUDE_MODELS[0]
-        wrong_model = providers.CLAUDE_MODELS[1]
+        wrong_model = "claude-haiku-4-5-20251001"
         payloads = {
             "auth": {"result": "Not logged in - please run /login"},
             "entitlement": {
@@ -31634,7 +31637,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         wrong = self.record_claude_result(
             json.dumps(
-                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                {
+                    **base,
+                    "modelUsage": {"claude-haiku-4-5-20251001": {}},
+                }
             ).encode(),
             index=103,
         )
@@ -33892,8 +33898,12 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             [(item.runtime, item.requested_model) for item in outcome.attempts],
             [
-                ("claude", "claude-opus-5"),
-                ("copilot", "claude-opus-5"),
+                ("claude", model)
+                for model in providers.CLAUDE_MODELS
+            ]
+            + [
+                ("copilot", model)
+                for model in providers.COPILOT_MODELS
             ],
         )
         self.assertEqual(
@@ -35341,7 +35351,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 2)
         self.assertEqual(outcome.attempts, ())
-        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
+        self.assertEqual(claude_attempt.call_count, 1)
         copilot_attempt.assert_not_called()
         resolve.assert_not_called()
         self.assertIn(
@@ -38874,7 +38884,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 argv=("sandbox",),
                 returncode=1,
                 stdout=json.dumps(
-                    {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                    {
+                        **base,
+                        "modelUsage": {"claude-haiku-4-5-20251001": {}},
+                    }
                 ).encode(),
                 stderr=b"",
             ),

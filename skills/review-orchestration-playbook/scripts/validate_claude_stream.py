@@ -1282,6 +1282,10 @@ def _load_contract_with_binding() -> tuple[
             "init_model": "claude-opus-5",
             "accepted_model_usage_keys": ["claude-opus-5", "claude-opus-5.0"],
         },
+        "claude-opus-5.0": {
+            "init_model": "claude-opus-5.0",
+            "accepted_model_usage_keys": ["claude-opus-5", "claude-opus-5.0"],
+        },
         # Retain prior identities only so legacy output is classified as a
         # primary-model substitution; they are not launch candidates.
         "claude-opus-4-8": {

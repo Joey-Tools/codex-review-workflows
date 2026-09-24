@@ -163,8 +163,11 @@ _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
 
 CODEX_MODELS = ("gpt-5.6-terra", "gpt-5.6-luna")
 CODEX_REASONING_EFFORT = "max"
-CLAUDE_MODELS = ("claude-opus-5",)
-COPILOT_MODELS = ("claude-opus-5",)
+# Keep the closed retry chain within the Opus 5 family. The first ID is the
+# requested default; the dotted form is the same-family wire alias used only
+# for a separately recorded retry.
+CLAUDE_MODELS = ("claude-opus-5", "claude-opus-5.0")
+COPILOT_MODELS = ("claude-opus-5", "claude-opus-5.0")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
 CLAUDE_LINUX_PROMPT_GUIDANCE = b"""

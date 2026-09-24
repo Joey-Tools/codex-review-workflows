@@ -18,6 +18,7 @@ superseded_by:
 
 ## Current State
 - Runtime constants, reviewer configuration, stream contracts, and supervisor ledgers are aligned with the new profile policy.
+- Claude and Copilot retry slots stay within the Opus 5 family: `claude-opus-5` is primary and `claude-opus-5.0` is the closed wire alias; the stream validator accepts both current identities.
 - Targeted provider, app-server, stream, lane, contract, and execution tests pass; two supervisor/CLI cases remain unverified because the macOS sandbox denied their phase helper with `Operation not permitted`, outside model-policy coverage.
 
 ## Next Steps
