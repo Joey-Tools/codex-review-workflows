@@ -974,6 +974,119 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertEqual(lifecycle.state["phase"], "spawn-intent")
         self.assertEqual(lifecycle.state["process_history"][0]["stage"], "reviewer")
 
+    def test_fallback_auth_refresh_can_follow_primary_reviewer(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+        leader = {"pid": 123, "pgid": 123, "start_identity": "start"}
+        runtime_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": leader,
+                "runtime_process_binding": runtime_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": leader,
+                },
+                "leader_exit": 1,
+                "closure": "proven-by-owner",
+                "model_fallback_authorization": authorization,
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": leader,
+                        "runtime_binding": runtime_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    }
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("auth-refresh")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["runtime_stage"], "auth-refresh")
+
+    def test_reviewer_can_follow_fallback_auth_refresh(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+        first_leader = {"pid": 123, "pgid": 123, "start_identity": "start-1"}
+        first_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        refresh_leader = {"pid": 124, "pgid": 124, "start_identity": "start-2"}
+        refresh_binding = {"session_id": 124, "profile_sha256": "b" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "auth-refresh",
+                "leader": refresh_leader,
+                "runtime_process_binding": refresh_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": refresh_leader,
+                },
+                "leader_exit": 0,
+                "closure": "proven-by-owner",
+                "model_fallback_authorization": authorization,
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": first_leader,
+                        "runtime_binding": first_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    },
+                    {
+                        "stage": "auth-refresh",
+                        "leader": refresh_leader,
+                        "runtime_binding": refresh_binding,
+                        "exit_code": 0,
+                        "closure": "proven-by-owner",
+                    },
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("reviewer")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["runtime_stage"], "reviewer")
+
     def test_terminal_history_accepts_a_bound_model_fallback_retry(self) -> None:
         authorization = ModelFallbackAuthorization(
             denial_category="model_entitlement",
@@ -1014,6 +1127,21 @@ class RuntimeHelperTests(unittest.TestCase):
                             record("auth-refresh", 424240, 0),
                             record("reviewer", 424242, 1),
                             record("reviewer", 424243, 0),
+                        ],
+                    }
+                )
+            ),
+            3,
+        )
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("reviewer", 424242, 1),
+                            record("auth-refresh", 424243, 0),
+                            record("reviewer", 424244, 0),
                         ],
                     }
                 )

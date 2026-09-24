@@ -722,12 +722,14 @@ class DurableProcessLifecycle:
             if any(self.state.get(key) != value for key, value in expected.items()):
                 raise ValueError("durable process initial predecessor is not pristine")
             return
-        if stage != "reviewer" or len(history) not in {1, 2}:
+        if len(history) not in {1, 2}:
             raise ValueError("durable process stage history is out of sequence")
         previous = history[-1]
         if not isinstance(previous, dict):
             raise ValueError("durable process history entry is malformed")
         if previous.get("stage") == "auth-refresh" and len(history) == 1:
+            if stage != "reviewer":
+                raise ValueError("durable process stage history is out of sequence")
             if (
                 set(previous)
                 != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
@@ -766,6 +768,117 @@ class DurableProcessLifecycle:
                 or profile.get("leader") != previous["leader"]
             ):
                 raise ValueError("durable auth-refresh profile is malformed")
+            return
+        if previous.get("stage") == "auth-refresh":
+            if stage != "reviewer":
+                raise ValueError("durable process stage history is out of sequence")
+            first = history[0]
+            if (
+                not isinstance(first, dict)
+                or set(first)
+                != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+                or first.get("stage") != "reviewer"
+                or type(first.get("exit_code")) is not int
+                or first.get("exit_code") == 0
+                or first.get("closure") != "proven-by-owner"
+                or not isinstance(first.get("leader"), dict)
+                or not isinstance(first.get("runtime_binding"), dict)
+            ):
+                raise ValueError("durable reviewer history is malformed")
+            _validate_process_binding(
+                first.get("leader"),
+                first.get("runtime_binding"),
+                label="durable reviewer",
+            )
+            fallback_authorization = self.state.get("model_fallback_authorization")
+            try:
+                ModelFallbackAuthorization(**fallback_authorization)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "durable model fallback authorization is malformed"
+                ) from None
+            expected = {
+                "launch_status": "completed",
+                "runtime_stage": "auth-refresh",
+                "leader": previous["leader"],
+                "runtime_process_binding": previous["runtime_binding"],
+                "leader_exit": 0,
+                "closure": "proven-by-owner",
+            }
+            if any(self.state.get(key) != value for key, value in expected.items()):
+                raise ValueError("durable auth-refresh predecessor changed")
+            profile = self.state.get("no_child_process_profile")
+            if (
+                not isinstance(profile, dict)
+                or set(profile)
+                != {
+                    "version",
+                    "authenticated",
+                    "kernel_enforced",
+                    "child_process_limit",
+                    "leader",
+                }
+                or profile.get("version") != 1
+                or profile.get("authenticated") is not True
+                or profile.get("kernel_enforced") is not True
+                or profile.get("child_process_limit") != 0
+                or profile.get("leader") != previous["leader"]
+            ):
+                raise ValueError("durable auth-refresh profile is malformed")
+            return
+        if previous.get("stage") == "reviewer" and stage == "auth-refresh":
+            if len(history) != 1:
+                raise ValueError("durable process stage history is out of sequence")
+            if (
+                set(previous)
+                != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+                or type(previous.get("exit_code")) is not int
+                or previous.get("exit_code") == 0
+                or previous.get("closure") != "proven-by-owner"
+                or not isinstance(previous.get("leader"), dict)
+                or not isinstance(previous.get("runtime_binding"), dict)
+            ):
+                raise ValueError("durable reviewer history is malformed")
+            _validate_process_binding(
+                previous.get("leader"),
+                previous.get("runtime_binding"),
+                label="durable reviewer",
+            )
+            fallback_authorization = self.state.get("model_fallback_authorization")
+            try:
+                ModelFallbackAuthorization(**fallback_authorization)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "durable model fallback authorization is malformed"
+                ) from None
+            expected = {
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": previous["leader"],
+                "runtime_process_binding": previous["runtime_binding"],
+                "leader_exit": previous["exit_code"],
+                "closure": "proven-by-owner",
+            }
+            if any(self.state.get(key) != value for key, value in expected.items()):
+                raise ValueError("durable reviewer predecessor changed")
+            profile = self.state.get("no_child_process_profile")
+            if (
+                not isinstance(profile, dict)
+                or set(profile)
+                != {
+                    "version",
+                    "authenticated",
+                    "kernel_enforced",
+                    "child_process_limit",
+                    "leader",
+                }
+                or profile.get("version") != 1
+                or profile.get("authenticated") is not True
+                or profile.get("kernel_enforced") is not True
+                or profile.get("child_process_limit") != 0
+                or profile.get("leader") != previous["leader"]
+            ):
+                raise ValueError("durable reviewer profile is malformed")
             return
         if previous.get("stage") == "reviewer":
             if (
@@ -1473,12 +1586,24 @@ def _validate_terminal_process_history(
                 )
             ):
                 raise ValueError("terminal reviewer history is malformed")
+        elif len(history) == 2:
+            if (
+                history[0]["exit_code"] == 0
+                or history[1]["stage"] != "reviewer"
+                or (
+                    history[1]["exit_code"] != 0
+                    and not allow_incomplete_reviewer
+                )
+                or not fallback_is_authorized
+            ):
+                raise ValueError("terminal model fallback history is malformed")
         elif (
-            len(history) != 2
-            or history[0]["exit_code"] == 0
-            or history[1]["stage"] != "reviewer"
+            history[0]["exit_code"] == 0
+            or history[1]["stage"] != "auth-refresh"
+            or history[1]["exit_code"] != 0
+            or history[2]["stage"] != "reviewer"
             or (
-                history[1]["exit_code"] != 0
+                history[2]["exit_code"] != 0
                 and not allow_incomplete_reviewer
             )
             or not fallback_is_authorized
