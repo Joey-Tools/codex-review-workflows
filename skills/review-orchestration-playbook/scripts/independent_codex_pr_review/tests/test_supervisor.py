@@ -487,6 +487,7 @@ def _write_authorized_attempt(
     retention: pathlib.Path,
     *,
     suffix: str,
+    legacy_model: bool = False,
 ) -> pathlib.Path:
     attempt = _write_attempt(
         retention,
@@ -569,6 +570,8 @@ def _write_authorized_attempt(
             "observed_runtime": _terminal_observed_runtime(),
         }
     )
+    if legacy_model:
+        state["observed_runtime"]["model"].pop("model_fallback_authorization")
     _write_exact_state(attempt, state)
     state, _, digest = read_attempt_state(attempt)
     with acquire_retention_lease(retention, deadline=time.monotonic() + 5) as lease:
@@ -869,6 +872,21 @@ class FinalAuthorizationTests(unittest.TestCase):
                 result["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT
             )
             self.assertIs(result["named_lane_eligible"], False)
+            self.assertEqual(result["final_message"], "No findings.")
+
+    def test_final_result_accepts_a_legacy_primary_model_attestation(self) -> None:
+        with owned_temporary_directory("final-legacy-model-attestation-") as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            attempt = _write_authorized_attempt(
+                retention,
+                suffix="8" * 32,
+                legacy_model=True,
+            )
+            result = final_result(
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             self.assertEqual(result["final_message"], "No findings.")
 
     def test_terminal_auth_refresh_closure_must_match_process_history(self) -> None:

@@ -109,6 +109,7 @@ from .runtime import (
     _persist_attempt_git_closure_receipt,
     _read_checkout_closure_receipt,
     _settle_process,
+    _validate_terminal_process_history,
     _validate_terminal_lifecycle,
     build_unsettled_checkout_summary,
     build_final_authorization_rewrite,
@@ -1083,12 +1084,13 @@ def _require_reviewer_closure_evidence(state: dict[str, Any]) -> None:
         or SHA256_PATTERN.fullmatch(runtime_binding["profile_sha256"]) is None
     ):
         raise ValueError("reviewer runtime binding is malformed")
-    process_history = state.get("process_history")
+    process_history = _validate_terminal_process_history(
+        state,
+        allow_incomplete_reviewer=True,
+    )
     leader_exit = state.get("leader_exit")
     if (
-        not isinstance(process_history, list)
-        or len(process_history) not in {1, 2, 3}
-        or not isinstance(process_history[-1], dict)
+        not isinstance(process_history[-1], dict)
         or set(process_history[-1])
         != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
         or process_history[-1].get("stage") != "reviewer"
@@ -1099,20 +1101,6 @@ def _require_reviewer_closure_evidence(state: dict[str, Any]) -> None:
         or process_history[-1].get("closure") != "proven-by-owner"
     ):
         raise ValueError("reviewer closure history is malformed")
-    if (
-        len(process_history) >= 2
-        and process_history[0].get("stage") == "auth-refresh"
-    ):
-        refresh = process_history[0]
-        if (
-            not isinstance(refresh, dict)
-            or set(refresh)
-            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
-            or refresh.get("stage") != "auth-refresh"
-            or refresh.get("exit_code") != 0
-            or refresh.get("closure") != "proven-by-owner"
-        ):
-            raise ValueError("auth-refresh closure history is malformed")
 
 
 def _terminal_handoff_token(
@@ -1174,11 +1162,9 @@ def _terminal_handoff_token(
         or SHA256_PATTERN.fullmatch(runtime_binding["profile_sha256"]) is None
     ):
         raise ValueError("terminal reviewer runtime binding is malformed")
-    process_history = state.get("process_history")
+    process_history = _validate_terminal_process_history(state)
     if (
-        not isinstance(process_history, list)
-        or len(process_history) not in {1, 2, 3}
-        or not isinstance(process_history[-1], dict)
+        not isinstance(process_history[-1], dict)
         or set(process_history[-1])
         != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
         or process_history[-1].get("stage") != "reviewer"
@@ -1189,20 +1175,6 @@ def _terminal_handoff_token(
         or state.get("leader_exit") != 0
     ):
         raise ValueError("terminal reviewer closure history is malformed")
-    if (
-        len(process_history) >= 2
-        and process_history[0].get("stage") == "auth-refresh"
-    ):
-        refresh = process_history[0]
-        if (
-            not isinstance(refresh, dict)
-            or set(refresh)
-            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
-            or refresh.get("stage") != "auth-refresh"
-            or refresh.get("exit_code") != 0
-            or refresh.get("closure") != "proven-by-owner"
-        ):
-            raise ValueError("terminal auth-refresh closure history is malformed")
     if state.get("terminal_commit_authorized") is not True:
         raise ValueError("terminal review was not authorized")
     seal = state.get("final_seal")
@@ -1646,8 +1618,7 @@ def run(
         terminal_deadline = (
             time.monotonic()
             + CHECKOUT_SECONDS
-            + REVIEWER_LAUNCH_SECONDS
-            + REVIEWER_RUNTIME_SECONDS
+            + 2 * (REVIEWER_LAUNCH_SECONDS + REVIEWER_RUNTIME_SECONDS)
             + 10 * 60
         )
         terminal: dict[str, Any] | None = None

@@ -1403,6 +1403,80 @@ def _validate_process_binding(
         raise ValueError(f"{label} runtime binding is malformed")
 
 
+def _validate_terminal_process_history(
+    state: dict[str, Any],
+    *,
+    allow_incomplete_reviewer: bool = False,
+) -> list[dict[str, Any]]:
+    history = state.get("process_history")
+    if not isinstance(history, list) or len(history) not in {1, 2, 3}:
+        raise ValueError("terminal process history is malformed")
+    for entry in history:
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+            or entry.get("stage") not in {"auth-refresh", "reviewer"}
+            or type(entry.get("exit_code")) is not int
+            or entry.get("closure") != "proven-by-owner"
+        ):
+            raise ValueError("terminal process history entry is malformed")
+        _validate_process_binding(
+            entry.get("leader"),
+            entry.get("runtime_binding"),
+            label=entry["stage"],
+        )
+
+    fallback_authorization = state.get("model_fallback_authorization")
+    fallback_is_authorized = False
+    if fallback_authorization is not None:
+        if not isinstance(fallback_authorization, dict):
+            raise ValueError("terminal model fallback authorization is malformed")
+        try:
+            ModelFallbackAuthorization(**fallback_authorization)
+        except (TypeError, ValueError):
+            raise ValueError("terminal model fallback authorization is malformed") from None
+        fallback_is_authorized = True
+
+    first_stage = history[0]["stage"]
+    if first_stage == "auth-refresh":
+        if len(history) not in {2, 3} or history[0]["exit_code"] != 0:
+            raise ValueError("terminal auth-refresh history is malformed")
+        if history[1]["stage"] != "reviewer":
+            raise ValueError("terminal reviewer history is malformed")
+        if len(history) == 2:
+            if history[1]["exit_code"] != 0 or fallback_is_authorized:
+                raise ValueError("terminal reviewer history is malformed")
+        elif (
+            history[1]["exit_code"] == 0
+            or history[2]["stage"] != "reviewer"
+            or history[2]["exit_code"] != 0
+            or not fallback_is_authorized
+        ):
+            raise ValueError("terminal model fallback history is malformed")
+    elif first_stage == "reviewer":
+        if len(history) == 1:
+            if (
+                fallback_is_authorized
+                or (
+                    history[0]["exit_code"] != 0
+                    and not allow_incomplete_reviewer
+                )
+            ):
+                raise ValueError("terminal reviewer history is malformed")
+        elif (
+            len(history) != 2
+            or history[0]["exit_code"] == 0
+            or history[1]["stage"] != "reviewer"
+            or history[1]["exit_code"] != 0
+            or not fallback_is_authorized
+        ):
+            raise ValueError("terminal model fallback history is malformed")
+    else:
+        raise ValueError("terminal process history stage is malformed")
+    return history
+
+
 def _validate_observed_runtime(state: dict[str, Any]) -> None:
     observed = state.get("observed_runtime")
     expected_keys = {
@@ -1488,24 +1562,41 @@ def _validate_observed_runtime(state: dict[str, Any]) -> None:
     ):
         raise ValueError("terminal protocol runtime evidence is malformed")
     model = observed.get("model")
+    current_model_keys = {
+        "model",
+        "model_attempt",
+        "model_fallback_authorization",
+        "model_provider",
+        "reasoning_effort",
+    }
+    legacy_model_keys = {
+        "model",
+        "model_attempt",
+        "model_provider",
+        "reasoning_effort",
+    }
     if (
         not isinstance(model, dict)
-        or set(model)
-        != {
-            "model",
-            "model_attempt",
-            "model_fallback_authorization",
-            "model_provider",
-            "reasoning_effort",
-        }
+        or set(model) not in (current_model_keys, legacy_model_keys)
         or model.get("model") != state.get("requested_model")
         or model.get("reasoning_effort") != state.get("requested_reasoning_effort")
         or model.get("model_provider") != "openai"
         or not isinstance(model.get("model_attempt"), str)
         or not model["model_attempt"]
+        or (
+            set(model) == legacy_model_keys
+            and (
+                state.get("requested_model") != MODEL
+                or state.get("model_fallback_authorization") is not None
+            )
+        )
     ):
         raise ValueError("terminal model runtime evidence is malformed")
-    fallback_authorization = model.get("model_fallback_authorization")
+    fallback_authorization = (
+        model.get("model_fallback_authorization")
+        if set(model) == current_model_keys
+        else None
+    )
     state_fallback_authorization = state.get("model_fallback_authorization")
     if state.get("requested_model") == EXPLICIT_FALLBACK_MODEL:
         if (
@@ -1653,27 +1744,7 @@ def _validate_terminal_lifecycle(
         require_authenticated_no_child_process_profile(state)
     except ChildProcessError as error:
         raise ValueError("terminal reviewer no-child profile is malformed") from error
-    history = state.get("process_history")
-    if not isinstance(history, list) or len(history) not in {1, 2, 3}:
-        raise ValueError("terminal process history is malformed")
-    for index, entry in enumerate(history):
-        expected_stage = (
-            "reviewer" if len(history) == 1 or index > 0 else "auth-refresh"
-        )
-        if (
-            not isinstance(entry, dict)
-            or set(entry)
-            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
-            or entry.get("stage") != expected_stage
-            or entry.get("exit_code") != 0
-            or entry.get("closure") != "proven-by-owner"
-        ):
-            raise ValueError("terminal process history entry is malformed")
-        _validate_process_binding(
-            entry.get("leader"),
-            entry.get("runtime_binding"),
-            label=expected_stage,
-        )
+    history = _validate_terminal_process_history(state)
     if (
         history[-1].get("leader") != leader
         or history[-1].get("runtime_binding") != runtime_binding
@@ -4172,6 +4243,9 @@ def run_reviewer(
                     requested_model=state["requested_model"],
                     requested_reasoning_effort=state["requested_reasoning_effort"],
                     fallback_authorization=authorization,
+                    inherited_auth_refresh=getattr(
+                        denial_error, "auth_refresh_evidence", None
+                    ),
                     lifecycle=lifecycle,
                     liveness_checkpoint=lambda: _require_outer_liveness(outer),
                 )

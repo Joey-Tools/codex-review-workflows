@@ -14,6 +14,7 @@ from typing import Any, Callable, Protocol, cast
 
 from .appserver_protocol import (
     APP_SERVER_NO_EXECUTION_CONFIG_ARGS,
+    AppServerRemoteError,
     ModelFallbackAuthorization,
     AppServerSessionConfig,
     AppServerSessionResult,
@@ -1258,6 +1259,7 @@ def run_authenticated_review(
     requested_model: str,
     requested_reasoning_effort: str,
     fallback_authorization: ModelFallbackAuthorization | None = None,
+    inherited_auth_refresh: dict[str, Any] | None = None,
     lifecycle: ProcessLifecycle,
     aggregate_schema_path: pathlib.Path | None = None,
     auth_path: pathlib.Path | None = None,
@@ -1293,7 +1295,11 @@ def run_authenticated_review(
         _default_auth_path() if auth_path is None else auth_path
     )
     lease = _allocate_runtime_lease(paths["runtime_root"])
-    refresh_evidence: dict[str, Any] = {"status": "not-required"}
+    refresh_evidence: dict[str, Any] = (
+        dict(inherited_auth_refresh)
+        if inherited_auth_refresh is not None
+        else {"status": "not-required"}
+    )
     try:
         try:
             auth = load_external_auth(
@@ -1369,6 +1375,9 @@ def run_authenticated_review(
             auth_refresh=refresh_evidence,
             observed_runtime=observed_runtime,
         )
+    except AppServerRemoteError as error:
+        error.auth_refresh_evidence = dict(refresh_evidence)
+        raise
     except CodexExecutableRetentionRequired as error:
         lease.retain()
         if not any(resource is lease for resource in error.retained_resources):

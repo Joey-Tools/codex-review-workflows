@@ -20,7 +20,10 @@ from review_supervisor.constants import (
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
 )
-from review_supervisor.appserver_protocol import AppServerRemoteError
+from review_supervisor.appserver_protocol import (
+    AppServerRemoteError,
+    ModelFallbackAuthorization,
+)
 from review_supervisor.evidence import ManifestEntry, manifest_sha256
 from review_supervisor.errors import SupervisorError, inconclusive
 from review_supervisor.ledger import (
@@ -54,6 +57,7 @@ from review_supervisor.runtime import (
     _run_authenticated_review_boundary,
     _fallback_authorization_from_denial,
     _spawn_internal,
+    _validate_terminal_process_history,
     _validate_checkout_failed_record,
     _validate_final_authorization_updates,
     authorize_terminal_via_helper,
@@ -969,6 +973,53 @@ class RuntimeHelperTests(unittest.TestCase):
 
         self.assertEqual(lifecycle.state["phase"], "spawn-intent")
         self.assertEqual(lifecycle.state["process_history"][0]["stage"], "reviewer")
+
+    def test_terminal_history_accepts_a_bound_model_fallback_retry(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+
+        def record(stage: str, pid: int, exit_code: int) -> dict[str, object]:
+            leader = {"pid": pid, "pgid": pid, "start_identity": f"start-{pid}"}
+            binding = {"session_id": pid, "profile_sha256": f"{pid:064x}"}
+            return {
+                "stage": stage,
+                "leader": leader,
+                "runtime_binding": binding,
+                "exit_code": exit_code,
+                "closure": "proven-by-owner",
+            }
+
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("reviewer", 424242, 1),
+                            record("reviewer", 424243, 0),
+                        ],
+                    }
+                )
+            ),
+            2,
+        )
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("auth-refresh", 424240, 0),
+                            record("reviewer", 424242, 1),
+                            record("reviewer", 424243, 0),
+                        ],
+                    }
+                )
+            ),
+            3,
+        )
 
     def test_publish_bytes_never_leaves_a_partial_destination(self) -> None:
         with owned_temporary_directory("atomic-artifact-") as root:
