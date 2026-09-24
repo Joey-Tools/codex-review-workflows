@@ -1445,12 +1445,21 @@ def _validate_terminal_process_history(
         if history[1]["stage"] != "reviewer":
             raise ValueError("terminal reviewer history is malformed")
         if len(history) == 2:
-            if history[1]["exit_code"] != 0 or fallback_is_authorized:
+            if (
+                fallback_is_authorized
+                or (
+                    history[1]["exit_code"] != 0
+                    and not allow_incomplete_reviewer
+                )
+            ):
                 raise ValueError("terminal reviewer history is malformed")
         elif (
             history[1]["exit_code"] == 0
             or history[2]["stage"] != "reviewer"
-            or history[2]["exit_code"] != 0
+            or (
+                history[2]["exit_code"] != 0
+                and not allow_incomplete_reviewer
+            )
             or not fallback_is_authorized
         ):
             raise ValueError("terminal model fallback history is malformed")
@@ -1468,7 +1477,10 @@ def _validate_terminal_process_history(
             len(history) != 2
             or history[0]["exit_code"] == 0
             or history[1]["stage"] != "reviewer"
-            or history[1]["exit_code"] != 0
+            or (
+                history[1]["exit_code"] != 0
+                and not allow_incomplete_reviewer
+            )
             or not fallback_is_authorized
         ):
             raise ValueError("terminal model fallback history is malformed")

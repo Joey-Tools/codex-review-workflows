@@ -1021,6 +1021,36 @@ class RuntimeHelperTests(unittest.TestCase):
             3,
         )
 
+    def test_recovery_accepts_a_failed_reviewer_after_auth_refresh(self) -> None:
+        def record(stage: str, pid: int, exit_code: int) -> dict[str, object]:
+            leader = {"pid": pid, "pgid": pid, "start_identity": f"start-{pid}"}
+            binding = {"session_id": pid, "profile_sha256": f"{pid:064x}"}
+            return {
+                "stage": stage,
+                "leader": leader,
+                "runtime_binding": binding,
+                "exit_code": exit_code,
+                "closure": "proven-by-owner",
+            }
+
+        state = {
+            "process_history": [
+                record("auth-refresh", 424240, 0),
+                record("reviewer", 424242, 1),
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "terminal reviewer history"):
+            _validate_terminal_process_history(state)
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    state,
+                    allow_incomplete_reviewer=True,
+                )
+            ),
+            2,
+        )
+
     def test_publish_bytes_never_leaves_a_partial_destination(self) -> None:
         with owned_temporary_directory("atomic-artifact-") as root:
             destination = root / "final.txt"
