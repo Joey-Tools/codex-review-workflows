@@ -1,10 +1,10 @@
 ---
 id: 20260918-a9f218
 title: Review Gate v2 Handoff
-status: active
+status: completed
 created: 2026-09-18
-updated: 2026-09-18
-branch: codex/organization-v2-handoff
+updated: 2026-09-29
+branch: codex/daily-skill-friction-2026-09-29-codex-review-workflows-remove-v1-bridge
 pr:
 supersedes: []
 superseded_by:
@@ -13,18 +13,15 @@ superseded_by:
 # Review Gate v2 Handoff
 
 ## Summary
-- Install the canonical v2 verifier and controller while retaining a temporary v1 legacy bridge.
+- Complete the v2 review-gate handoff and retire the temporary v1 legacy bridge after the organization cutover.
 - Protect the review-gate control plane with `@JoeyTeng` CODEOWNERS coverage.
 
 ## Current State
-- Pull requests can produce both the existing `codex/review-gate` status and the new `codex/github-review-gate` check during the organization-wide handoff.
-- The repository workflow uses the owner-approved floating `JoeyTeng/codex-review-gate-action@v2` selector.
-- This repository change does not modify the organization ruleset, and the legacy bridge remains required until the cohort-wide v2 cutover is complete.
-
-## Next Steps
-- Verify the v2 check on the installed default-branch workflow as part of the full consumer cohort.
-- After the organization ruleset requires v2 and no longer requires v1, remove the legacy bridge in a separate cleanup change.
+- The verifier and controller use the canonical v2 workflows with `JoeyTeng/codex-review-gate-action@v2`.
+- The temporary `codex/review-gate` bridge workflow has been removed; `codex/github-review-gate` remains the review-gate check.
+- `@JoeyTeng` retains CODEOWNERS coverage for the review-gate control plane.
 
 ## Evidence
 - Canonical producer: `JoeyTeng/codex-review-gate-action@v2`.
 - Source handoff implementation: https://github.com/Joey-Tools/codex-review-gate/pull/51.
+- Post-cutover receipt SHA-256: `9a8b38f2188a14168423a07639d6662c87e198fe2dd12041f67fc224f363817e`.
