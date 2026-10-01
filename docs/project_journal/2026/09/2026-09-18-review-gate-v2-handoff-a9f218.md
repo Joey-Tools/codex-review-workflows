@@ -3,7 +3,7 @@ id: 20260918-a9f218
 title: Review Gate v2 Handoff
 status: completed
 created: 2026-09-18
-updated: 2026-09-29
+updated: 2026-10-01
 branch: codex/daily-skill-friction-2026-09-29-codex-review-workflows-remove-v1-bridge
 pr:
 supersedes: []
@@ -18,6 +18,7 @@ superseded_by:
 
 ## Current State
 - The verifier and controller use the canonical v2 workflows with `JoeyTeng/codex-review-gate-action@v2`.
+- The verifier grants read-only Actions access for v2 review-run evidence reconciliation.
 - The temporary `codex/review-gate` bridge workflow has been removed; `codex/github-review-gate` remains the review-gate check.
 - `@JoeyTeng` retains CODEOWNERS coverage for the review-gate control plane.
 
