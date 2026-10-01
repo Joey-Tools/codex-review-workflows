@@ -4989,7 +4989,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 "--cwd",
                 str(self.repo.resolve()),
                 "--model",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "--preflight-result",
                 str(self.root / "missing-preflight.json"),
                 "--authentication-source",
@@ -13946,7 +13946,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "--input-format",
             "text",
             "--model",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "--effort",
             "max",
             "--permission-mode",
@@ -13984,7 +13984,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertIs(profile["settings_parser_acceptance_attested"], False)
         self.assertIs(profile["managed_policy_residual"], True)
         self.assertIs(profile["native_sandbox_effectiveness_attested"], False)
-        self.assertEqual(profile["model"], "claude-opus-4-8")
+        self.assertEqual(profile["model"], "claude-opus-5")
         self.assertEqual(profile["effort"], "max")
         self.assertEqual(profile["worktree"], str(self.repo.resolve()))
         self.assertEqual(
@@ -14227,7 +14227,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
     def test_claude_guard_owned_profile_is_primary_model_only(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
-        for model in ("claude-opus-4-7", "claude-opus-4-8-latest"):
+        for model in ("claude-opus-4-7", "claude-opus-5-latest"):
             with self.subTest(model=model):
                 marker = self.root / f"invalid-model-{model}.marker"
                 invalid = self.make_executable(

@@ -139,7 +139,7 @@ def _codex_cli_0_149_0_strict_config_accepts(argv: tuple[str, ...]) -> bool:
         return False
     if option_values.get("-s") != ["read-only"]:
         return False
-    if option_values.get("-m") != ["gpt-5.6-sol"]:
+    if option_values.get("-m") != ["gpt-5.6-terra"]:
         return False
     if option_values.get("-") != [None]:
         return False
@@ -3936,8 +3936,8 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         contracts = _read("review-lane-contracts.md")
 
         for expected in (
-            "gpt-5.6-sol",
-            'model_reasoning_effort="ultra"',
+            "gpt-5.6-terra",
+            'model_reasoning_effort="max"',
             'fork_turns="none"',
             "Neither adapter has a standing priority",
         ):

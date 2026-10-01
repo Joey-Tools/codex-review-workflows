@@ -380,8 +380,8 @@ class RepositoryContractTest(unittest.TestCase):
             "--ignore-user-config",
             "--strict-config",
             "-s read-only",
-            "-m gpt-5.6-sol",
-            'model_reasoning_effort="ultra"',
+            "-m gpt-5.6-terra",
+            'model_reasoning_effort="max"',
             "-C <absolute-validated-workspace>",
             "exact UTF-8 prompt bytes",
             "stdin descriptor",
@@ -1019,12 +1019,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("secret-delta admission is independent of review", contracts)
         self.assertIn("never supplies a reviewer result", contracts)
 
-    def test_reviewer_role_requests_sol_ultra_and_read_only_findings(self) -> None:
+    def test_reviewer_role_requests_terra_ultra_and_read_only_findings(self) -> None:
         role_path = POLICY_SCOPE_ROOT / "agents/reviewer.toml"
         with role_path.open("rb") as handle:
             role = tomllib.load(handle)
 
-        self.assertEqual(role["model"], "gpt-5.6-sol")
+        self.assertEqual(role["model"], "gpt-5.6-terra")
         self.assertEqual(role["model_reasoning_effort"], "ultra")
         self.assertEqual(role["sandbox_mode"], "read-only")
         instructions = role["developer_instructions"]
@@ -1242,9 +1242,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("effective model family or codex mode", normalized)
         self.assertIn("this is the sole latest-model-lookup trigger", normalized)
         self.assertIn("it never triggers latest-model discovery", normalized)
-        self.assertIn("try the peer adapter with the exact same model", normalized)
+        self.assertIn(
+            "peer adapter at the exact same configured reviewer-subagent model",
+            normalized,
+        )
+        self.assertIn("gpt-5.6-luna", normalized)
+        self.assertIn("max", normalized)
+        self.assertIn("primary terra launch", normalized)
         self.assertIn("do not silently lower the", normalized)
-        self.assertIn("requires explicit user confirmation", normalized)
         self.assertNotIn("highest supported lower mode", normalized)
         self.assertNotIn("cache model discovery for", local.lower())
 
@@ -1718,10 +1723,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("allowallunixsockets: false", normalized_lane)
         self.assertIn("allowlocalbinding: false", normalized_lane)
         for contract in (
-            "the direct guard rejects `claude-opus-4-7` and every other caller-selected model",
-            "retained 4.7 stream schemas or legacy/helper failure classifiers do not authorize a named-direct launch",
-            "the named-direct guard remains 4.8-only and is inconclusive until a separately closed fallback bridge exists",
-            "retained 4.7 stream-schema recognition supplies validation compatibility rather than launch authority",
+            "the direct guard rejects every other caller-selected model",
+            "retained legacy stream schemas or failure classifiers do not authorize a named-direct launch",
+            "the only accepted model control is `--model claude-opus-5`",
+            "a final opus 5 entitlement or organization-policy denial",
         ):
             self.assertIn(contract, normalized_lane + "\n" + normalized_runtime)
         self.assertIn("publisher", runtime.lower())

@@ -20,6 +20,10 @@ from review_supervisor.constants import (
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
 )
+from review_supervisor.appserver_protocol import (
+    AppServerRemoteError,
+    ModelFallbackAuthorization,
+)
 from review_supervisor.evidence import ManifestEntry, manifest_sha256
 from review_supervisor.errors import SupervisorError, inconclusive
 from review_supervisor.ledger import (
@@ -51,7 +55,9 @@ from review_supervisor.runtime import (
     _read_checkout_closure_receipt,
     _run_checkout,
     _run_authenticated_review_boundary,
+    _fallback_authorization_from_denial,
     _spawn_internal,
+    _validate_terminal_process_history,
     _validate_checkout_failed_record,
     _validate_final_authorization_updates,
     authorize_terminal_via_helper,
@@ -138,6 +144,53 @@ class _FakeCatFileBatch:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_model_fallback_requires_an_explicit_bounded_denial(self) -> None:
+        denial = AppServerRemoteError(
+            request_method="thread/start",
+            remote_code=-32001,
+            remote_message="model is not entitled",
+            remote_data={"category": "model_entitlement"},
+        )
+        authorization = _fallback_authorization_from_denial(denial)
+        self.assertIsNotNone(authorization)
+        assert authorization is not None
+        self.assertEqual(authorization.denied_model, "gpt-5.6-terra")
+        self.assertEqual(authorization.selected_model, "gpt-5.6-luna")
+        self.assertEqual(
+            authorization.denial_record_sha256,
+            sha256_bytes(
+                canonical_json(
+                    {
+                        "category": "model_entitlement",
+                        "code": -32001,
+                        "method": "thread/start",
+                    }
+                )
+            ),
+        )
+        for malformed in (
+            AppServerRemoteError(
+                request_method="turn/start",
+                remote_code=-32001,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement"},
+            ),
+            AppServerRemoteError(
+                request_method="thread/start",
+                remote_code=-32000,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement"},
+            ),
+            AppServerRemoteError(
+                request_method="thread/start",
+                remote_code=-32001,
+                remote_message="model is not entitled",
+                remote_data={"category": "model_entitlement", "detail": "extra"},
+            ),
+        ):
+            with self.subTest(error=malformed):
+                self.assertIsNone(_fallback_authorization_from_denial(malformed))
+
     def test_retained_git_control_paths_are_closed_to_the_temporary_root(self) -> None:
         attempt_dir = pathlib.Path("/private/review/attempt-1")
         retained = attempt_dir / "codex-git-control-synthetic"
@@ -874,6 +927,258 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertEqual(lifecycle.state["phase"], "spawn-intent")
         self.assertEqual(lifecycle.state["process_history"][0]["stage"], "auth-refresh")
 
+    def test_reviewer_stage_accepts_a_second_reviewer_after_primary_denial(self) -> None:
+        leader = {"pid": 123, "pgid": 123, "start_identity": "start"}
+        runtime_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": leader,
+                "runtime_process_binding": runtime_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": leader,
+                },
+                "leader_exit": 1,
+                "closure": "proven-by-owner",
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": leader,
+                        "runtime_binding": runtime_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    }
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("reviewer")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["process_history"][0]["stage"], "reviewer")
+
+    def test_fallback_auth_refresh_can_follow_primary_reviewer(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+        leader = {"pid": 123, "pgid": 123, "start_identity": "start"}
+        runtime_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "reviewer",
+                "leader": leader,
+                "runtime_process_binding": runtime_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": leader,
+                },
+                "leader_exit": 1,
+                "closure": "proven-by-owner",
+                "model_fallback_authorization": authorization,
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": leader,
+                        "runtime_binding": runtime_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    }
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("auth-refresh")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["runtime_stage"], "auth-refresh")
+
+    def test_reviewer_can_follow_fallback_auth_refresh(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+        first_leader = {"pid": 123, "pgid": 123, "start_identity": "start-1"}
+        first_binding = {"session_id": 123, "profile_sha256": "a" * 64}
+        refresh_leader = {"pid": 124, "pgid": 124, "start_identity": "start-2"}
+        refresh_binding = {"session_id": 124, "profile_sha256": "b" * 64}
+        lifecycle = DurableProcessLifecycle(
+            entrypoint=ENTRYPOINT,
+            attempt=_fake_attempt(),
+            state={
+                "phase": "validating",
+                "launch_status": "completed",
+                "runtime_stage": "auth-refresh",
+                "leader": refresh_leader,
+                "runtime_process_binding": refresh_binding,
+                "no_child_process_profile": {
+                    "version": 1,
+                    "authenticated": True,
+                    "kernel_enforced": True,
+                    "child_process_limit": 0,
+                    "leader": refresh_leader,
+                },
+                "leader_exit": 0,
+                "closure": "proven-by-owner",
+                "model_fallback_authorization": authorization,
+                "process_history": [
+                    {
+                        "stage": "reviewer",
+                        "leader": first_leader,
+                        "runtime_binding": first_binding,
+                        "exit_code": 1,
+                        "closure": "proven-by-owner",
+                    },
+                    {
+                        "stage": "auth-refresh",
+                        "leader": refresh_leader,
+                        "runtime_binding": refresh_binding,
+                        "exit_code": 0,
+                        "closure": "proven-by-owner",
+                    },
+                ],
+            },
+            state_digest="initial",
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            state = dict(kwargs["state"])
+            state.update(kwargs["updates"])
+            return state, "spawn-intent"
+
+        with mock.patch(
+            "review_supervisor.runtime.commit_via_helper", side_effect=commit
+        ):
+            lifecycle.begin("reviewer")
+
+        self.assertEqual(lifecycle.state["phase"], "spawn-intent")
+        self.assertEqual(lifecycle.state["runtime_stage"], "reviewer")
+
+    def test_terminal_history_accepts_a_bound_model_fallback_retry(self) -> None:
+        authorization = ModelFallbackAuthorization(
+            denial_category="model_entitlement",
+            denial_record_sha256="a" * 64,
+        ).to_json()
+
+        def record(stage: str, pid: int, exit_code: int) -> dict[str, object]:
+            leader = {"pid": pid, "pgid": pid, "start_identity": f"start-{pid}"}
+            binding = {"session_id": pid, "profile_sha256": f"{pid:064x}"}
+            return {
+                "stage": stage,
+                "leader": leader,
+                "runtime_binding": binding,
+                "exit_code": exit_code,
+                "closure": "proven-by-owner",
+            }
+
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("reviewer", 424242, 1),
+                            record("reviewer", 424243, 0),
+                        ],
+                    }
+                )
+            ),
+            2,
+        )
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("auth-refresh", 424240, 0),
+                            record("reviewer", 424242, 1),
+                            record("reviewer", 424243, 0),
+                        ],
+                    }
+                )
+            ),
+            3,
+        )
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    {
+                        "model_fallback_authorization": authorization,
+                        "process_history": [
+                            record("reviewer", 424242, 1),
+                            record("auth-refresh", 424243, 0),
+                            record("reviewer", 424244, 0),
+                        ],
+                    }
+                )
+            ),
+            3,
+        )
+
+    def test_recovery_accepts_a_failed_reviewer_after_auth_refresh(self) -> None:
+        def record(stage: str, pid: int, exit_code: int) -> dict[str, object]:
+            leader = {"pid": pid, "pgid": pid, "start_identity": f"start-{pid}"}
+            binding = {"session_id": pid, "profile_sha256": f"{pid:064x}"}
+            return {
+                "stage": stage,
+                "leader": leader,
+                "runtime_binding": binding,
+                "exit_code": exit_code,
+                "closure": "proven-by-owner",
+            }
+
+        state = {
+            "process_history": [
+                record("auth-refresh", 424240, 0),
+                record("reviewer", 424242, 1),
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "terminal reviewer history"):
+            _validate_terminal_process_history(state)
+        self.assertEqual(
+            len(
+                _validate_terminal_process_history(
+                    state,
+                    allow_incomplete_reviewer=True,
+                )
+            ),
+            2,
+        )
+
     def test_publish_bytes_never_leaves_a_partial_destination(self) -> None:
         with owned_temporary_directory("atomic-artifact-") as root:
             destination = root / "final.txt"
@@ -1036,8 +1341,8 @@ class RuntimeHelperTests(unittest.TestCase):
             "actual_invocation_enabled": False,
             "cli_version_expected": APP_SERVER_CLI_VERSION,
             "no_child_kernel_profile_verified": False,
-            "requested_model": "gpt-5.6-sol",
-            "requested_reasoning_effort": "xhigh",
+            "requested_model": "gpt-5.6-terra",
+            "requested_reasoning_effort": "max",
             "supervisor_executable_authenticated": False,
             "transport": "app-server-stdio",
         }
@@ -1608,8 +1913,8 @@ class RuntimeHelperTests(unittest.TestCase):
                     "worktree": str(root),
                     "worktree_identity": identity.to_json(),
                 },
-                "requested_model": "gpt-5.6-sol",
-                "requested_reasoning_effort": "xhigh",
+                "requested_model": "gpt-5.6-terra",
+                "requested_reasoning_effort": "max",
                 "worktree_path": str(root),
             }
             execution_calls: list[dict[str, object]] = []
@@ -1711,7 +2016,7 @@ class RuntimeHelperTests(unittest.TestCase):
             observed["evidence_bundle_sha256"],
             sha256_bytes(canonical_json(evidence_bundle)),
         )
-        self.assertEqual(observed["requested_model"], "gpt-5.6-sol")
+        self.assertEqual(observed["requested_model"], "gpt-5.6-terra")
         self.assertEqual(observed["transport"], "app-server-stdio")
         self.assertTrue(observed["actual_invocation_enabled"])
         self.assertEqual(

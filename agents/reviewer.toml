@@ -28,6 +28,6 @@ Return findings only, ordered by severity. Each finding must include a concise t
 Any internal delegation available in Codex Ultra remains part of this one logical reviewer invocation. Do not count or report internal workers as additional review lanes, and do not orchestrate another named review.
 """
 nickname_candidates = ["Atlas", "Delta", "Echo"]
-model = "gpt-5.6-sol"
+model = "gpt-5.6-terra"
 model_reasoning_effort = "ultra"
 sandbox_mode = "read-only"
