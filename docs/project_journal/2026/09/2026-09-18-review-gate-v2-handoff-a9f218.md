@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 - The verifier and controller use the canonical v2 workflows with `JoeyTeng/codex-review-gate-action@v2`.
 - The verifier grants read-only Actions access for v2 review-run evidence reconciliation.
+- When `CODEX_REVIEW_GATE_AUTO_REQUEST=true`, the controller requests review for first-attempt pull-request verifier failures and passes `workflow_run.head_sha` as the expected head; the v2 action validates the run's PR association and current PR head.
 - The temporary `codex/review-gate` bridge workflow has been removed; `codex/github-review-gate` remains the review-gate check.
 - `@JoeyTeng` retains CODEOWNERS coverage for the review-gate control plane.
 
