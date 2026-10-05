@@ -9,15 +9,125 @@ This file defines shared scope, independence, counting, outcomes, and rerun rule
 | Named single | One clean logical local Codex lane. |
 | Named double | Named single plus one clean actual Claude Code lane. |
 | Named triple | Named double plus a passing current-head GitHub Codex lane. |
-| `skill-repo-codex-gate` | One clean logical local Codex lane plus a passing current-head GitHub Codex lane. This is an unnamed repository default, not a named shape. |
+| Unnamed PR-bound delivery with an eligible remote provider | Passing current-head repository-configured GitHub Codex or native GitHub Copilot review. No local review by default; explicit local/named lanes remain mandatory. |
+
+Use [Default Review Routing](#default-review-routing) before selecting lanes. Without an
+eligible remote provider, or for local-only delivery, require one local Codex
+lane. Remote pending/inconclusive is not permission for a local-only pass.
+Claude requires explicit user opt-in; unnamed delivery never adds double/triple.
 
 Count logical independent judgments. Do not count:
 
 - retries or adapter switches;
-- Ultra's internal delegation;
+- a reviewer's internal delegation;
 - preparation, validation, admission, CI, or PR-readiness gates;
 - a Claude simulation, another Codex process, or GitHub Copilot in place of actual Claude Code;
 - service-start checks without a review result.
+
+## Default Review Routing
+
+This section owns default lane selection. It does not replace the local
+workspace contract, GitHub Codex evidence authority, CI, conversation checks,
+or repository merge rules.
+
+### Select Before Launch
+
+1. Honour an explicit local/named/provider request first. Single requires local
+   Codex; double additionally requires actual Claude Code; triple additionally
+   requires GitHub Codex. An unambiguous double/triple request is explicit
+   Claude opt-in. Generic review, full workflow, or merge-ready is not.
+2. For unnamed PR-bound delivery, inspect the target's existing review
+   configuration and authenticated provider availability. If GitHub Codex
+   `@codex review` or native GitHub Copilot code review is available, select a
+   remote-only route. Local review is not required by default.
+3. Prefer the repository-configured provider, including any required
+   provider-specific gate. If only one is available, use it. If both are equally
+   eligible and neither is designated, prefer GitHub Codex without adding a
+   second reviewer. Repository requirements that explicitly demand both remain
+   required; do not remove configured required checks or approvals.
+4. For local-only delivery or a target with no eligible remote reviewer,
+   select one fresh local Codex lane. A promised but unavailable integration is
+   not completed review. Missing capability proof leaves routing blocked, not
+   an automatic fallback authorization.
+
+A pending, failed, or inconclusive selected remote lane stays incomplete.
+Do not launch local review as a silent substitute or interpret CI success,
+provider installation, a review request, an empty review list, or lack of
+comments as completed review. The old unnamed local-plus-GitHub
+`skill-repo-codex-gate` default is retired. No unnamed route adds Claude or
+defaults to double/triple.
+
+Record the request, route, selected provider, explicit opt-ins, frozen scope,
+and required lanes before launch. Explicitly requested local review remains
+required even when a remote provider is available. If a new head is created,
+rerun every required lane for that head, not lanes omitted by the selected
+route. Local build, tests, documentation, and secret admission are not review
+lanes and remain required as applicable.
+
+### Local Model and Reasoning Consent
+
+The default local reviewer is `gpt-6.1-sol` at model-default reasoning. The
+currently documented default is `medium`; pin that level in the installed
+role/CLI launch so a stronger parent or ambient configuration cannot silently
+elevate it. Record intent separately from runtime evidence.
+
+Another model or reasoning override requires explicit user opt-in.
+Authorizing GPT-6 Luna, up to Max, for workers can also authorize it for local
+review when the user explicitly includes reviewers. It remains an authorized
+allocation, not the new default or an automatic fallback. Choose and record its
+exact effort within that authorized ceiling. Worker authorization alone is not
+reviewer authorization. No parent-strength comparison authorizes model
+discovery, an upgrade, or a reasoning override.
+
+Claude Code requires separate explicit opt-in. After that opt-in, its default
+is Opus 5.5, `claude-opus-5-5`, at model-default effort (currently `medium`).
+Another Claude model or effort requires explicit selection. Authentication,
+entitlement failure, a strong parent, or cost reduction does not authorize a
+different model, provider, or local Copilot CLI fallback.
+
+### Native GitHub Copilot Code Review
+
+This route uses GitHub's PR review service, not Copilot CLI, IDE review,
+Copilot cloud-agent implementation, or a simulated Claude reviewer. There is
+no parent-selected local model/effort for a native service review.
+
+- Bind the authenticated exact target repository, host, PR number, current
+  full head SHA, and intended base. Require the provider to be available for
+  that repository/account under the platform's supported native review
+  interface; do not infer enterprise-host support from GitHub.com docs.
+- Observe an existing current-head request/review before requesting another.
+  Under delivery/readiness authorization, use the native review-request
+  interface for `copilot-pull-request-reviewer[bot]`, not `@codex review`.
+  A report-only request does not authorize review-request or PR mutations.
+- Read all submitted reviews, review comments/threads, and necessary PR
+  conversation pages with complete pagination. Bind provider identity from the
+  platform-authenticated native reviewer/App, not a display name or a quoted
+  comment. Capture acquisition scope and terminal review identity.
+- Completion requires a submitted, non-dismissed terminal native review for
+  the exact current head, with explicit completion/coverage evidence and no
+  reported skipped/incomplete/error coverage, plus no applicable unresolved
+  provider finding. A pending review, request-only marker, partial/unknown
+  coverage, old-head review, or an empty comment collection is not clean.
+- If actionable findings remain, classify them and fix or adjudicate them.
+  Resolving threads is not automatic dismissal of a valid issue. A code change
+  creates a new head and requires a new native review; pushing does not by
+  itself prove that Copilot re-reviewed.
+- Native Copilot normally submits a Comment review. Do not require an Approve
+  review merely to complete this review lane, and do not claim that completion
+  satisfies separate human/required approval rules.
+- Re-read the current head, terminal review, complete relevant findings and
+  lifecycle before accepting the result. Scope drift invalidates the result.
+  Keep native Copilot evidence separate from GitHub Codex report schemas and
+  classifiers; no Codex-specific reaction or terminal comment is required.
+
+GitHub Codex uses [github-codex-evidence-authority.md](github-codex-evidence-authority.md)
+unchanged: current-head trustworthy terminal clean evidence and no applicable
+unresolved provider finding can complete that lane. Either remote route still
+needs current-head CI, required approvals, conversations, base freshness, and
+merge-policy gates. Remote head coverage does not prove base/merge coverage.
+
+The native request identifier, Comment-review semantics, and re-review behaviour
+are documented in [GitHub's native code review guide](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-code-review).
 
 ## Frozen Range
 
@@ -566,7 +676,7 @@ deviation.
 Read [local-codex-lane.md](local-codex-lane.md).
 
 - A zero-inherited-context `reviewer` subagent and a fresh non-resumed Codex CLI review are peer adapters.
-- The intended installed profile is `gpt-5.6-sol` with Codex mode `ultra`.
+- The default installed profile is `gpt-6.1-sol` at model-default reasoning (currently `medium`).
 - Record requested and effective adapter, model, and mode.
 - Record `self_policy_migration`, plus the instruction-surface status and
   receipt for the selected adapter.
@@ -584,13 +694,14 @@ Read [local-codex-lane.md](local-codex-lane.md).
   unsafe copy/validation blocks
   that adapter; selecting the peer subagent at the same requested profile
   remains the same logical lane.
-- A latest-model network lookup is allowed only when the parent session's
-  effective model family or Codex mode is clearly stronger than this configured
-  reviewer. Runtime rejection, downgrade, or mismatch triggers only local
-  capability diagnosis and the peer adapter at the exact same profile.
+- Do not perform automatic latest-model discovery or upgrade because the parent
+  is stronger. Another model or reasoning override requires explicit user
+  opt-in; an explicitly reviewer-inclusive GPT-6 Luna authorization may cover
+  up to Max. Runtime rejection, downgrade, or mismatch triggers only local
+  capability diagnosis and the peer adapter at the exact same selected profile.
 - Switch to that exact-profile peer adapter first. Lowering the mode or changing
   the model family requires explicit user confirmation.
-- One invocation remains one logical lane even when Ultra delegates internally.
+- One invocation remains one logical lane even with internal delegation.
 
 Both peer adapters use the same effective-profile rule. An exact
 `runtime-attested` match may support clean. When authoritative runtime fields are
@@ -615,6 +726,8 @@ attempt inconclusive even when its terminal text is `No findings.`.
 
 Read [canonical-claude-lane.md](canonical-claude-lane.md).
 
+- Launch only with explicit user opt-in. Default to Opus 5.5 at model-default
+  effort; another model or effort requires explicit selection.
 - Start one actual supported Claude Code process in its own independently prepared workspace.
 - Give it the same frozen range and an independent prompt; never give it Codex findings.
 - During self-policy migration, give it the complete candidate-Markdown subject

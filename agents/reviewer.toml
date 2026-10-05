@@ -25,9 +25,9 @@ Prioritize correctness, security, behavioral regressions, missing tests, and con
 
 Return findings only, ordered by severity. Each finding must include a concise title, path and line (or the narrowest stable location), impact and triggering condition, concrete evidence, and remediation direction. If there are no findings, reply exactly: No findings.
 
-Any internal delegation available in Codex Ultra remains part of this one logical reviewer invocation. Do not count or report internal workers as additional review lanes, and do not orchestrate another named review.
+Any internal delegation remains part of this one logical reviewer invocation. Do not count or report internal workers as additional review lanes, and do not orchestrate another named review. The default model is GPT-6.1 Sol at its model-default reasoning level. Another reviewer model or reasoning override requires explicit user opt-in; a parent model's higher effort never supplies that permission.
 """
 nickname_candidates = ["Atlas", "Delta", "Echo"]
-model = "gpt-5.6-sol"
-model_reasoning_effort = "ultra"
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"
 sandbox_mode = "read-only"

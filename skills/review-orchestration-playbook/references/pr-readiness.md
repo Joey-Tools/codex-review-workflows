@@ -12,6 +12,15 @@ GitHub acquisition and retry mechanics live in
 [github-pr-probes.md](github-pr-probes.md). Do not duplicate those contracts
 here.
 
+Choose required lanes through [Default Review Routing](review-lane-contracts.md#default-review-routing) first.
+An unnamed PR-bound request with an eligible GitHub Codex or native GitHub
+Copilot reviewer uses remote-only review; local review is not required by
+default. Every reference below to local reviews or their provenance applies
+only to local lanes actually required by that route or an explicit request.
+Local scope verification, tests, CI, conversations, and merge policy remain
+required independently; do not turn them into a local-review mandate.
+Native Copilot uses its own completion evidence, not the Codex classifier.
+
 ## Authorization And Selection
 
 Operate only on the PR the user named, the PR this task created, or the unique
@@ -182,12 +191,16 @@ Evaluate the following for the same frozen current state:
    `headRefOid`, and unique local merge base are exact and locally complete.
 2. **Lifecycle:** the PR is open, unmerged, and ready rather than draft when
    merge readiness is claimed.
-3. **Local review:** every lane required by the requested/effective review
-   shape is terminal and clean for exact `base_sha..head_sha`.
+3. **Local review:** every local lane required by the requested/effective review
+   shape is terminal and clean for exact `base_sha..head_sha`. On the
+   remote-only route report `not-required`, never a fabricated local pass.
 4. **Local validation:** relevant build, tests, lint, documentation, and any
    repository-required admission or policy checks pass for the current head.
 5. **GitHub Codex:** when required, the lane is `pass` for exact `head_sha` and
    has no unresolved applicable Codex-provider finding.
+   Native GitHub Copilot, when selected instead, requires its own current-head
+   completed review and no applicable unresolved finding under
+   [Default Review Routing](review-lane-contracts.md#default-review-routing). Neither requires an extra local lane.
 6. **CI and status:** every required current-head or merge-queue check is
    successful, with no required pending, cancelled, skipped, stale, or missing
    result. Prefer a trustworthy related merge/status check when the repository
@@ -228,7 +241,7 @@ merely to satisfy freshness.
 That merge creates a new head. Re-read the PR, require one unique merge base,
 freeze the resulting `merge_base..new_head`, and rerun the complete pre-merge
 verification for that head: local validation and tests, every required local
-review lane, the GitHub Codex lane, CI and status checks, all conversations,
+review lane, the selected remote lane, CI and status checks, all conversations,
 lifecycle/base/head and merge-policy checks, and the final stable reread. Every
 positive, pass, or clean result bound to the old head is stale, and every
 head-bound readiness gate must be reacquired. An ancestry-proven unresolved
@@ -264,7 +277,7 @@ The provider/local split is deliberate:
 | Proof | Owning gate |
 | --- | --- |
 | Trustworthy clean/no-unresolved-finding result for exact latest head | GitHub Codex lane |
-| Current base, unique merge base, and exact whole-PR range | Local scope and Codex-review gates |
+| Current base, unique merge base, and exact whole-PR range | Parent scope/readiness proof; local-review binding only when a local lane is required |
 | Base-sensitive behavior | Local validation and required CI |
 | Human/bot conversations beyond applicable Codex findings | All-conversations gate |
 | Rulesets, approvals, mergeability, and merge method | Branch-policy gate |
@@ -324,8 +337,8 @@ When any substantive gate fails:
    alone requires a fresh review.
 3. Commit and push only when authorized.
 4. Re-read lifecycle, base/head, and merge base.
-5. Rerun every invalidated local lane and validation.
-6. Reacquire GitHub Codex, CI, and conversation evidence for the new state.
+5. Rerun every invalidated required local lane and validation.
+6. Reacquire the selected remote provider, CI, and conversation evidence for the new state.
 7. Repeat until every gate is simultaneously true.
 
 If resolving a finding changes code, that commit creates a new head and the
@@ -575,11 +588,14 @@ pr_readiness:
     predecessor_record_id: null | previous-active-record-id
     base_sha: record-full-object-id
     head_sha: record-full-object-id
-  local_review_shape: single | double | triple | skill-repo-codex-gate
-  local_reviews: pass | blocked | pending
+  review_route: local | remote-only | explicit-named | explicit-provider
+  remote_provider: github-codex | github-copilot | not-required
+  local_review_shape: single | double | triple | not-required
+  local_reviews: pass | blocked | pending | not-required
   github_codex_lane: pass | findings | pending | inconclusive | not-applicable
   github_codex_scope: latest-head-only | not-applicable
-  base_assurance: local-review-and-readiness-gates
+  github_copilot_lane: clean | findings | pending | inconclusive | not-applicable
+  base_assurance: parent-readiness-tests-and-required-ci
   required_checks: pass | blocked | pending
   conversations: resolved | unresolved | unknown
   mergeability: mergeable | blocked | unknown

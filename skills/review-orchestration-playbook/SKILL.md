@@ -1,6 +1,6 @@
 ---
 name: review-orchestration-playbook
-description: Orchestrate Joey's named single, double, and triple code-review shapes plus PR and merge readiness. Use for a fresh local Codex review, a direct Claude Code review, GitHub Cloud `@codex review`, or an authorized review, CI, and conversation fix loop. Single is one logical fresh Codex lane; double adds actual Claude Code; triple adds current-head GitHub Codex.
+description: Orchestrate remote-first PR review and merge readiness using GitHub Codex @codex review or native GitHub Copilot code review. Use for explicitly requested fresh local Codex review, opt-in Claude Code review, named single/double/triple shapes, or an authorized review, CI, and conversation fix loop.
 ---
 
 # Review Orchestration Playbook
@@ -8,6 +8,22 @@ description: Orchestrate Joey's named single, double, and triple code-review sha
 Use this skill as the only entrypoint for named review shapes and PR-readiness orchestration. Count logical reviewer lanes, not processes, retries, helper calls, or a model's internal delegation.
 
 ## Choose The Shape
+
+For an unnamed PR-bound delivery request, use remote-only review when the target
+provides GitHub Codex `@codex review` or native GitHub Copilot code review.
+Local review is not required by default in that route. Prefer the repository's
+configured provider; do not add both merely because both are available.
+Availability selects a route, not a pass: pending or inconclusive remote evidence
+keeps that route incomplete, and local review cannot replace it silently.
+When no eligible remote provider is available, or delivery is local-only, use
+one fresh local Codex lane. An explicit local or named review request remains
+required regardless of remote availability.
+
+Read [Default Review Routing](references/review-lane-contracts.md#default-review-routing) before selecting lanes.
+Claude Code is never a default lane; it requires explicit user opt-in.
+The following named shapes are available only when the user explicitly requests
+one. An unambiguous double/triple request is that Claude opt-in; generic
+`review`, `full workflow`, or `merge-ready` is not.
 
 | Requested shape | Required reviewer lanes |
 | --- | --- |
@@ -17,7 +33,9 @@ Use this skill as the only entrypoint for named review shapes and PR-readiness o
 
 PR readiness is the effective review shape plus current-head CI, conversation, branch/base, and repository merge-policy gates. It does not add another reviewer.
 
-The seven Joey-Tools skill repositories may route an unnamed PR-bound request to `skill-repo-codex-gate`: one local Codex lane plus GitHub Codex. That is a separate repository default, not an alias for single, double, or triple. An explicitly named shape wins.
+Report the actual selected provider and requested/effective lanes. The old
+unnamed `skill-repo-codex-gate` local-plus-GitHub default is retired; do not
+infer a local, Claude, double, or triple lane from a PR-bound request.
 
 ## Freeze Scope Before Review
 
@@ -81,11 +99,31 @@ Read [local-codex-lane.md](references/local-codex-lane.md) and [review-prompt-te
 
 A fresh zero-inherited-context `reviewer` subagent and a fresh non-resumed Codex CLI review process are peer adapters for the same one logical lane. Neither is the default winner. Select the adapter that can most directly realize the intended effective reviewer profile with the least orchestration and context overhead.
 
-The intended installed profile is `gpt-5.6-sol` with Codex mode `ultra`. Ultra may internally delegate; that remains one logical lane. Record the requested and effective adapter, model, and mode. Do not describe `ultra` as an OpenAI API `reasoning.effort` enum value.
+The default installed profile is `gpt-6.1-sol` at the model's default reasoning
+level (currently `medium`). Do not inherit a stronger parent effort or discover
+a replacement model automatically. Another model or reasoning override requires
+explicit user opt-in; a user-authorized GPT-6 Luna allocation, up to Max, may
+also cover local review when the user includes reviewers in that authorization.
+Record requested and effective adapter, model, and reasoning. Internal
+delegation remains part of one logical lane.
 
 ### Claude Code
 
-Double and triple add one actual Claude Code process in a second independent workspace. It starts fresh, receives no Codex findings, and returns its own findings-only result. Another Codex process, GitHub Copilot, or a Claude simulation never satisfies this lane. Read [canonical-claude-lane.md](references/canonical-claude-lane.md) before launching it.
+Only explicit user opt-in adds an actual Claude Code process. Its default is
+Opus 5.5 (`claude-opus-5-5`) at model-default effort; another model or effort
+requires explicit opt-in too. For double/triple it uses a second independent
+workspace, starts fresh, receives no Codex findings, and returns its own
+findings-only result. Another Codex process, native GitHub Copilot review,
+Copilot CLI, or a Claude simulation never satisfies this lane.
+Read [canonical-claude-lane.md](references/canonical-claude-lane.md) before launch.
+
+## Native GitHub Copilot Review
+
+For the remote-only route, read [Native GitHub Copilot Code Review](references/review-lane-contracts.md#native-github-copilot-code-review)
+for native Copilot request, current-head completion, and finding checks.
+Native GitHub Copilot review is a PR review service, not Copilot CLI and not
+the named Claude lane. Do not feed its evidence to the GitHub Codex classifier
+or require a Codex-specific reaction/comment from Copilot.
 
 ## Run The GitHub Lane
 
@@ -308,8 +346,9 @@ When the user authorizes implementation or PR repair, loop on the same explicit 
 2. Resolve valid findings. When resolution changes code, add proportionate
    tests and create a new committed head; a typed thread resolution or
    trustworthy same-head provider correction alone does not require a commit.
-3. Rerun every invalidated lane. A code-changing new head requires fresh local
-   and GitHub review; a resolution-only same-head transition requires the
+3. Rerun every invalidated required lane. A code-changing new head requires fresh
+   review by the selected remote provider and every explicitly required local
+   lane, not an automatic extra local reviewer; a resolution-only same-head transition requires the
    authority's complete stable reread instead.
 4. Wait for required CI and read all review conversations with complete pagination.
 5. Confirm no unresolved blocking finding, the intended base/head relationship, open lifecycle, merge policy, and a final stable reread.
@@ -370,6 +409,7 @@ Use the previously trusted installed bundle outside the candidate range to prepa
 ## Reference Router
 
 - Always read [review-lane-contracts.md](references/review-lane-contracts.md).
+- Before choosing a default route or using native GitHub Copilot, read [Default Review Routing](references/review-lane-contracts.md#default-review-routing).
 - For a local Codex lane, read [local-codex-lane.md](references/local-codex-lane.md), [review-workspace.md](references/review-workspace.md), and [review-prompt-templates.md](references/review-prompt-templates.md).
 - For Claude Code, additionally read [canonical-claude-lane.md](references/canonical-claude-lane.md). Read [claude-runtime-trust.md](references/claude-runtime-trust.md) only when changing or diagnosing its runtime provenance, authentication, process, or stream validator.
 - For GitHub Codex, read [github-codex-evidence-authority.md](references/github-codex-evidence-authority.md). Read [github-pr-probes.md](references/github-pr-probes.md) for authenticated probes.
