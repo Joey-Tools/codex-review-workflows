@@ -534,7 +534,7 @@ class AppServerProtocolTests(unittest.TestCase):
         params = thread_request["params"]
         self.assertEqual(params["model"], MODEL)
         expected_thread_config = no_execution_config()
-        expected_thread_config["model_reasoning_effort"] = "xhigh"
+        expected_thread_config["model_reasoning_effort"] = "max"
         self.assertEqual(params["config"], expected_thread_config)
         self.assertFalse(params["allowProviderModelFallback"])
         self.assertEqual(params["dynamicTools"], [])
@@ -552,7 +552,7 @@ class AppServerProtocolTests(unittest.TestCase):
         self.assertEqual(turn_request["method"], "turn/start")
         turn_params = turn_request["params"]
         self.assertEqual(turn_params["model"], MODEL)
-        self.assertEqual(turn_params["effort"], "xhigh")
+        self.assertEqual(turn_params["effort"], "max")
         self.assertEqual(turn_params["additionalContext"], {})
         self.assertEqual(turn_params["environments"], [])
         self.assertEqual(turn_params["multiAgentMode"], "explicitRequestOnly")
@@ -607,7 +607,7 @@ class AppServerProtocolTests(unittest.TestCase):
         self.assertEqual(result.final_text, "No findings.")
         self.assertEqual(result.attestation["model"], MODEL)
         self.assertEqual(result.attestation["model_attempt"], "primary")
-        self.assertEqual(result.attestation["reasoning_effort"], "xhigh")
+        self.assertEqual(result.attestation["reasoning_effort"], "max")
         self.assertEqual(result.attestation["thread_path"], None)
 
     def test_accepts_bounded_reasoning_and_telemetry_but_retains_only_final(
@@ -958,12 +958,12 @@ class AppServerProtocolTests(unittest.TestCase):
         explicit = AppServerSessionConfig(
             neutral_cwd=NEUTRAL_CWD,
             expected_codex_home=CODEX_HOME,
-            expected_model="gpt-5.5",
+            expected_model="gpt-5.6-luna",
             fallback_authorization=authorization,
         )
         protocol = self.protocol(config=explicit)
         thread_request = advance_to_thread_request(protocol)
-        self.assertEqual(thread_request["params"]["model"], "gpt-5.5")
+        self.assertEqual(thread_request["params"]["model"], "gpt-5.6-luna")
         explicit_result = thread_start_result(explicit)
         protocol.accept_message(
             {
@@ -990,7 +990,7 @@ class AppServerProtocolTests(unittest.TestCase):
 
         primary = self.protocol()
         advance_to_thread_request(primary)
-        substituted = thread_start_result(self.config, model="gpt-5.5")
+        substituted = thread_start_result(self.config, model="gpt-5.6-luna")
         with self.assertRaises(AppServerProtocolError) as raised:
             primary.accept_message({"id": 4, "result": substituted})
         self.assertEqual(raised.exception.code, "thread-attestation-mismatch")
@@ -999,7 +999,7 @@ class AppServerProtocolTests(unittest.TestCase):
             AppServerSessionConfig(
                 neutral_cwd=NEUTRAL_CWD,
                 expected_codex_home=CODEX_HOME,
-                expected_model="gpt-5.5",
+                expected_model="gpt-5.6-luna",
             )
         self.assertEqual(raised.exception.code, "model-policy")
         with self.assertRaises(AppServerProtocolError):

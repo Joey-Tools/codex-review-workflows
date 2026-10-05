@@ -222,7 +222,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
         write_json(
             state_dir / "attempts.json",
-            [{"runtime": "claude", "requested_model": "claude-opus-4-8"}],
+            [{"runtime": "claude", "requested_model": "claude-opus-5"}],
         )
         write_text_atomic(state_dir / state.EXIT_FILE, "0\n")
         write_text_atomic(state_dir / "final.txt", "No findings.\n")
