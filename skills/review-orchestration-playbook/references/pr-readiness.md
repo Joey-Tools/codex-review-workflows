@@ -20,6 +20,12 @@ only to local lanes actually required by that route or an explicit request.
 Local scope verification, tests, CI, conversations, and merge policy remain
 required independently; do not turn them into a local-review mandate.
 Native Copilot uses its own completion evidence, not the Codex classifier.
+Apply the playbook's session choice when support is unknown or unavailable:
+authorized local fallback, local required plus available remote, or remote-only
+wait/retry. Capability observations and historical review never pass a gate.
+A session choice cannot remove a repository-required remote check, approval,
+or unresolved finding; current-head evidence remains mandatory for every
+required lane. New head alone invalidates reviews, not service capability.
 
 ## Authorization And Selection
 

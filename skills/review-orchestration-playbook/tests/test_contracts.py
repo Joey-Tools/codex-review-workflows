@@ -443,12 +443,51 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("explicitly requests", skill)
         self.assertIn("generic", skill)
         self.assertIn("not an automatic fallback authorization", routing)
+        self.assertIn("session choice", readiness)
+        self.assertNotIn("missing capability proof leaves routing blocked", routing)
         self.assertIn("another model or reasoning override requires explicit user opt-in", routing)
         self.assertIn("worker authorization alone is not reviewer authorization", routing)
         self.assertIn("claude code requires separate explicit opt-in", routing)
         self.assertIn("do not add a local lane", delivery)
         self.assertIn("omitted local lanes stay omitted", delivery)
         self.assertIn("local_reviews: pass | blocked | pending | not-required", readiness)
+
+    def test_session_routing_examples_preserve_user_choices_and_required_gates(self) -> None:
+        document = _read("references/review-lane-contracts.md")
+        section = document.split("### Session Review Choice\n", 1)[1].split(
+            "### Local Model and Reasoning Consent\n", 1
+        )[0]
+        decisions: dict[tuple[str, str, str], set[str]] = {}
+        for line in section.splitlines():
+            if not line.startswith("| "):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) != 5 or cells[1] not in {
+                "available", "unknown", "unavailable"
+            }:
+                continue
+            key = tuple(cells[1:4])
+            decisions.setdefault(key, set()).add(cells[4])
+
+        self.assertEqual(
+            decisions,
+            {
+                ("available", "unset", "optional"): {
+                    "remote-only", "remote-only; findings still block"
+                },
+                ("unknown", "unset", "optional"): {"ask-session-choice"},
+                ("unavailable", "unset", "optional"): {"ask-session-choice"},
+                ("unknown", "local-fallback", "optional"): {"local"},
+                ("unavailable", "local-fallback", "required"): {
+                    "local; required-remote remains"
+                },
+                ("available", "local-required", "optional"): {"local-and-remote"},
+                ("unavailable", "remote-only", "optional"): {"wait; no-local"},
+                ("available", "local-fallback", "optional"): {
+                    "remote-recovery; no-local-fallback"
+                },
+            },
+        )
 
     def test_reviewer_inclusive_luna_authorization_keeps_sol_as_default(self) -> None:
         for path in (

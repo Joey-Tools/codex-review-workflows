@@ -60,6 +60,56 @@ comparisons, but use canonical repository identity plus exact `baseRefName` as
 the target-ref identity. Keep the exact `baseRefOid` as another independent
 readiness binding rather than collapsing it into the unique merge base.
 
+## Probe Remote Review Availability
+
+This read-only probe selects a route; it does not request a review or establish
+a current-head pass. Use only GETs and existing provider results; never send a
+dummy review request as an availability probe. All evidence interpretation,
+newer-negative precedence, quota-reset handling, and session choice belong to
+[Remote Review Availability](review-lane-contracts.md#remote-review-availability)
+and [Session Review Choice](review-lane-contracts.md#session-review-choice).
+
+Inspect the selected PR first, then a bounded set of recently active PRs from
+the same repository. The [List pull requests endpoint](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)
+supports update-time sorting, and [GitHub CLI `gh api`](https://cli.github.com/manual/gh_api)
+documents the explicit GET query form below. One REST page has no age cutoff:
+
+```bash
+gh api -X GET repos/<owner>/<repo>/pulls \
+  -f state=all -f sort=updated -f direction=desc -F per_page=10 \
+  --jq '.[] | {number, url: .html_url, updated_at, head_sha: .head.sha, base_ref: .base.ref}'
+```
+
+Deduplicate the selected PR against this list. Check explicit provider
+enablement declarations for the target repository and read-only evidence from
+existing Codex or native Copilot results in the selected PR and up to these ten
+recent candidates. For result collections, use the exact-repository GET
+resources in [Fetch Complete Provider Evidence](#fetch-complete-provider-evidence),
+but enforce a finite task-local budget instead of enabling unbounded
+pagination. Prefer pages containing the newest available records; if ordering
+or pagination metadata prevents reaching that edge within budget, record the
+coverage gap. Preserve the exact repository, PR and head, authenticated
+host/login, provider and actor identities, result state, evidence and
+acquisition times, source endpoint and record ID/URL, candidate query, pages
+inspected, response bytes, elapsed time, and stop reason. Do not infer Codex
+account settings from ordinary-user GitHub APIs or invent private endpoints or
+credentials. Do not use third-party App-installation endpoints requiring an
+App JWT as ordinary-user capability probes.
+
+The command above documents GET syntax and candidate scope only; it is not a
+response-size or elapsed-time enforcement wrapper. `--jq` filters rendered
+fields, and terminal/tool display truncation limits only what is shown; neither
+bounds response bytes transferred, read, or written to disk. Before acquisition,
+set adjustable task-local candidate, page, aggregate-byte, and elapsed-time
+ceilings, then enforce them during the reads themselves. For example, a run may
+start with the selected PR plus at most ten recent candidates, at most two
+pages per result collection per PR, 256 KiB aggregate response bytes per PR,
+1 MiB aggregate response bytes for the whole probe, and 60 seconds total
+elapsed time. Tune these ceilings to the task; they are not universal
+constants. Stop when a ceiling is reached, do not escalate automatically to
+full history, and report the inspected scope. An incomplete newest-edge or
+response capture cannot establish absence of newer evidence.
+
 ## Fetch Complete Provider Evidence
 
 Fetch every page; do not rely on `gh pr view` summaries for authority.

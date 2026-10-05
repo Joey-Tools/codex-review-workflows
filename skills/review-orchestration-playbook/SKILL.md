@@ -15,11 +15,17 @@ Local review is not required by default in that route. Prefer the repository's
 configured provider; do not add both merely because both are available.
 Availability selects a route, not a pass: pending or inconclusive remote evidence
 keeps that route incomplete, and local review cannot replace it silently.
-When no eligible remote provider is available, or delivery is local-only, use
-one fresh local Codex lane. An explicit local or named review request remains
-required regardless of remote availability.
+For local-only delivery, use one fresh local Codex lane. Unknown or unavailable
+PR-bound support requires the user's session choice before selecting a default
+route: local fallback, local required plus available remote, or remote-only
+wait/retry. Reuse that explicit choice within this session; do not persist a
+capability cache. An explicit local or named review request remains required
+regardless of remote availability.
 
 Read [Default Review Routing](references/review-lane-contracts.md#default-review-routing) before selecting lanes.
+Use its capability evidence and session-choice rules, and
+[read-only availability probes](references/github-pr-probes.md#probe-remote-review-availability)
+before inferring support. Historical support selects a route, never a pass.
 Claude Code is never a default lane; it requires explicit user opt-in.
 The following named shapes are available only when the user explicitly requests
 one. An unambiguous double/triple request is that Claude opt-in; generic

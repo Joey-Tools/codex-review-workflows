@@ -14,8 +14,12 @@ and PR readiness without duplicating those contracts across every caller.
 | Triple | Double plus current-head GitHub Codex | Requires an eligible existing `github.com` PR and accepted provider evidence. |
 | Unnamed PR-bound delivery | Repository-configured GitHub Codex or native GitHub Copilot review | Remote-only when either is available; local review is added only when explicitly required. Pending remote review is not a pass. |
 
-Local-only delivery or a target without eligible remote review retains one local
-Codex lane. Local review defaults to GPT-6.1 Sol at model-default reasoning;
+Local-only delivery retains one local Codex lane. Unknown or unavailable
+PR-bound remote support requires an explicit session choice: local fallback,
+local required plus available remote, or remote-only wait/retry. See the
+[routing contract](skills/review-orchestration-playbook/references/review-lane-contracts.md#default-review-routing);
+historical capability is not current-head pass and no choice waives required
+checks. Local review defaults to GPT-6.1 Sol at model-default reasoning;
 alternative models/efforts require explicit opt-in. A user may authorize GPT-6
 Luna, up to Max, for work and local review. Claude is never a generic workflow
 default; when explicitly requested, it defaults to Opus 5.5. Named double/triple

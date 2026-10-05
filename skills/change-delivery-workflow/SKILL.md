@@ -21,9 +21,11 @@ Local build, tests, and documentation are always proportionate to the change;
 local review is not universally mandatory before a PR. For PR-bound delivery,
 delegate review selection to the playbook before launching a reviewer: an
 eligible GitHub Codex or native GitHub Copilot review uses the remote-only
-default unless local review was explicitly requested. A selected remote lane
-must complete at the frozen head before final acceptance; preparing a tested
-commit for authorized PR creation is not a claim that review is already clean.
+default unless local review was explicitly requested. Apply any session choice
+through the playbook, not an independent delivery fallback rule. Every required
+lane under the effective route must complete at the frozen head before final
+acceptance; preparing a tested commit for authorized PR creation is not a claim
+that review is already clean.
 
 ## Workflow
 
