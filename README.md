@@ -12,7 +12,18 @@ and PR readiness without duplicating those contracts across every caller.
 | Single | One fresh-context local Codex review session | The orchestrator may use either the reviewer subagent adapter or the Codex CLI adapter. |
 | Double | Single plus one independent Claude Code review | Claude is opt-in and reviews the same frozen committed range in a separate clean workspace. |
 | Triple | Double plus current-head GitHub Codex | Requires an eligible existing `github.com` PR and accepted provider evidence. |
-| `skill-repo-codex-gate` | One fresh local Codex review plus current-head GitHub Codex | Non-named default for the configured Joey-Tools skill repositories; it never adds Claude implicitly. |
+| Unnamed PR-bound delivery | Repository-configured GitHub Codex or native GitHub Copilot review | Remote-only when either is available; local review is added only when explicitly required. Pending remote review is not a pass. |
+
+Local-only delivery retains one local Codex lane. Unknown or unavailable
+PR-bound remote support requires an explicit session choice: local fallback,
+local required plus available remote, or remote-only wait/retry. See the
+[routing contract](skills/review-orchestration-playbook/references/review-lane-contracts.md#default-review-routing);
+historical capability is not current-head pass and no choice waives required
+checks. Local review defaults to GPT-6.1 Sol at model-default reasoning;
+alternative models/efforts require explicit opt-in. A user may authorize GPT-6
+Luna, up to Max, for work and local review. Claude is never a generic workflow
+default; when explicitly requested, it defaults to Opus 5.5. Named double/triple
+are explicit opt-ins, not default delivery shapes.
 
 Each named local processor gets its own independent, clean Git workspace and
 reviews a frozen `base_sha..head_sha`. A named shape selects logical review
@@ -35,6 +46,8 @@ sessions, not the number of internal workers a high-reasoning model may use.
 
 - [Local Codex lane](skills/review-orchestration-playbook/references/local-codex-lane.md):
   peer subagent/CLI adapters, capability selection, prompt, and findings contract.
+- [Default routing and native Copilot review](skills/review-orchestration-playbook/references/review-lane-contracts.md#default-review-routing):
+  remote-first selection, explicit opt-in, and current-head native-review evidence.
 - [Review workspace](skills/review-orchestration-playbook/references/review-workspace.md):
   independent clean-workspace preparation, validation, cleanup, and incomplete-range guidance.
 - [Claude Code lane](skills/review-orchestration-playbook/references/canonical-claude-lane.md):

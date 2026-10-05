@@ -65,6 +65,8 @@ FIXTURES = {
     )
     if item.identifier in {"access-a", "api-key-a"} and item.value is not None
 }
+LEGACY_CLAUDE_MODEL_CHAIN = ("claude-opus-4-8", "claude-opus-4-7")
+LEGACY_CLAUDE_WRONG_MODEL = "claude-opus-4-8"
 
 
 def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
@@ -31084,7 +31086,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         mismatched = self.record_claude_result(
             json.dumps(
-                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                {**base, "modelUsage": {LEGACY_CLAUDE_WRONG_MODEL: {}}}
             ).encode(),
             returncode=0,
             index=108,
@@ -31176,7 +31178,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ("malformed", [], "runtime-unverified", "malformed-model-usage"),
             (
                 "wrong",
-                {providers.CLAUDE_MODELS[1]: {}},
+                {LEGACY_CLAUDE_WRONG_MODEL: {}},
                 "model-mismatch",
                 "effective-model-mismatch",
             ),
@@ -31320,7 +31322,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_all_supported_failures_require_requested_model_binding(self) -> None:
         model = providers.CLAUDE_MODELS[0]
-        wrong_model = providers.CLAUDE_MODELS[1]
+        wrong_model = LEGACY_CLAUDE_WRONG_MODEL
         payloads = {
             "auth": {"result": "Not logged in - please run /login"},
             "entitlement": {
@@ -31634,7 +31636,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         wrong = self.record_claude_result(
             json.dumps(
-                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                {**base, "modelUsage": {LEGACY_CLAUDE_WRONG_MODEL: {}}}
             ).encode(),
             index=103,
         )
@@ -33001,24 +33003,23 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
-    def test_codex_falls_back_from_56_to_55_only_on_entitlement(
+    def test_codex_default_is_61_medium_without_automatic_model_fallback(
         self,
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        codex_attempt.side_effect = (
-            self.attempt("codex", "gpt-5.6-sol", "entitlement"),
-            self.attempt("codex", "gpt-5.5", "success", final_text="No findings."),
-        )
+        first = self.attempt("codex", "gpt-6.1-sol", "entitlement")
+        codex_attempt.return_value = first
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
         )
-        self.assertEqual(outcome.returncode, 0)
-        self.assertEqual(
-            [item.requested_model for item in outcome.attempts],
-            list(providers.CODEX_MODELS),
-        )
+        self.assertEqual(outcome.returncode, 1)
+        self.assertEqual(outcome.attempts, (first,))
+        self.assertEqual(providers.CODEX_MODELS, ("gpt-6.1-sol",))
+        self.assertEqual(providers.CODEX_REASONING_EFFORT, "medium")
+        codex_attempt.assert_called_once()
+        self.assertEqual(codex_attempt.call_args.kwargs["model"], "gpt-6.1-sol")
         self.assertEqual(
             _environment.call_args.kwargs["passthrough_keys"],
             providers.CODEX_ENV_KEYS,
@@ -33319,10 +33320,10 @@ class ProviderPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "interrupted fallback"):
             providers._run_model_chain(
                 review=self.review,
-                models=providers.CODEX_MODELS,
+                models=("gpt-5.6-sol", "gpt-5.5"),
                 runner=runner,
                 runtime="codex",
-                requested_effort=providers.CODEX_REASONING_EFFORT,
+                requested_effort="xhigh",
                 env={},
                 attempts=attempts,
             )
@@ -33373,7 +33374,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_model_chain_supervision_diagnostic_uses_bound_attempts_directory(
         self,
     ) -> None:
-        model = "gpt-5.6-sol"
+        model = providers.CODEX_MODELS[0]
         stdout_name = f"01-codex-{model}.stdout.log"
         stderr_name = f"01-codex-{model}.stderr.log"
         attempts_path = self.review.container_dir / "attempts"
@@ -33518,7 +33519,7 @@ class ProviderPolicyTest(unittest.TestCase):
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        codex_attempt.return_value = self.attempt("codex", "gpt-5.6-sol", "transient")
+        codex_attempt.return_value = self.attempt("codex", "gpt-6.1-sol", "transient")
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
@@ -33543,7 +33544,7 @@ class ProviderPolicyTest(unittest.TestCase):
         codex_attempt.assert_called_once()
         self.assertEqual(len(outcome.attempts), 1)
         self.assertEqual(outcome.attempts[0].runtime, "codex")
-        self.assertEqual(outcome.attempts[0].requested_model, "gpt-5.6-sol")
+        self.assertEqual(outcome.attempts[0].requested_model, "gpt-6.1-sol")
         self.assertEqual(outcome.attempts[0].category, "inconclusive")
         self.assertTrue(pathlib.Path(outcome.attempts[0].stderr_path).is_file())
         self.assertIn(
@@ -33860,7 +33861,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_family_order_is_opus_4_8_then_4_7_on_both_runtimes(
+    def test_claude_default_is_opus_5_5_before_consented_copilot_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -33889,11 +33890,17 @@ class ProviderPolicyTest(unittest.TestCase):
                 egress_consent="explicit-claude-with-copilot-fallback",
             )
         self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(providers.CLAUDE_MODELS, ("claude-opus-5-5",))
+        self.assertEqual(providers.CLAUDE_REASONING_EFFORT, "medium")
+        claude_attempt.assert_called_once()
+        self.assertEqual(
+            claude_attempt.call_args.kwargs["model"],
+            "claude-opus-5-5",
+        )
         self.assertEqual(
             [(item.runtime, item.requested_model) for item in outcome.attempts],
             [
-                ("claude", "claude-opus-4-8"),
-                ("claude", "claude-opus-4-7"),
+                ("claude", "claude-opus-5-5"),
                 ("copilot", "claude-opus-4.8"),
                 ("copilot", "claude-opus-4.7"),
             ],
@@ -35333,22 +35340,23 @@ class ProviderPolicyTest(unittest.TestCase):
         error = providers.ClaudeKeychainCredentialUnavailable(
             "second model credential refresh failed"
         )
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
-        )
+        first = self.attempt("claude", LEGACY_CLAUDE_MODEL_CHAIN[0], "entitlement")
         claude_attempt.side_effect = (first, error)
 
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="explicit-claude-with-copilot-fallback",
-        )
+        with mock.patch.object(
+            providers,
+            "CLAUDE_MODELS",
+            LEGACY_CLAUDE_MODEL_CHAIN,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-with-copilot-fallback",
+            )
 
         self.assertEqual(outcome.returncode, 2)
         self.assertEqual(outcome.attempts, (first,))
-        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
+        self.assertEqual(claude_attempt.call_count, len(LEGACY_CLAUDE_MODEL_CHAIN))
         copilot_attempt.assert_not_called()
         resolve.assert_not_called()
         self.assertIn(
@@ -35395,16 +35403,21 @@ class ProviderPolicyTest(unittest.TestCase):
                 resolve.reset_mock()
                 first = self.attempt(
                     "claude",
-                    providers.CLAUDE_MODELS[0],
+                    LEGACY_CLAUDE_MODEL_CHAIN[0],
                     "entitlement",
                 )
                 claude_attempt.side_effect = (first, error)
 
-                outcome = providers.run_review(
-                    review=self.review,
-                    reviewer="claude",
-                    egress_consent="explicit-claude-review",
-                )
+                with mock.patch.object(
+                    providers,
+                    "CLAUDE_MODELS",
+                    LEGACY_CLAUDE_MODEL_CHAIN,
+                ):
+                    outcome = providers.run_review(
+                        review=self.review,
+                        reviewer="claude",
+                        egress_consent="explicit-claude-review",
+                    )
 
                 self.assertEqual(outcome.returncode, 2)
                 self.assertEqual(outcome.attempts, (first,))
@@ -36191,7 +36204,7 @@ class ProviderPolicyTest(unittest.TestCase):
             review=self.review,
             index=1,
             runtime="claude",
-            model="claude-opus-4-8",
+            model=providers.CLAUDE_MODELS[0],
             completed=completed,
             final_text="No findings.",
             effective_model="claude-opus-4-7",
@@ -37654,8 +37667,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "turn_context",
                     "payload": {
-                        "model": "gpt-5.6-sol",
-                        "effort": "xhigh",
+                        "model": "gpt-6.1-sol",
+                        "effort": "medium",
                         "approval_policy": "never",
                         "sandbox_policy": {"type": "read-only"},
                         "permission_profile": {
@@ -37727,7 +37740,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command.side_effect = complete
         attempt = providers._codex_attempt(
             review=self.review,
-            model="gpt-5.6-sol",
+            model="gpt-6.1-sol",
             index=1,
             env={
                 "CODEX_HOME": str(codex_home),
@@ -37735,8 +37748,8 @@ class ProviderPolicyTest(unittest.TestCase):
             },
         )
         argv = run_command.call_args.args[0]
-        self.assertIn("gpt-5.6-sol", argv)
-        self.assertIn('model_reasoning_effort="xhigh"', argv)
+        self.assertIn("gpt-6.1-sol", argv)
+        self.assertIn('model_reasoning_effort="medium"', argv)
         configs = [argv[index + 1] for index, value in enumerate(argv) if value == "-c"]
         self.assertIn('approval_policy="never"', configs)
         self.assertIn('default_permissions="isolated_review"', configs)
@@ -37793,8 +37806,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("-s", argv)
         self.assertNotIn("-o", argv)
         self.assertEqual(attempt.final_text, "No findings.")
-        self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
-        self.assertEqual(attempt.effective_effort, "xhigh")
+        self.assertEqual(attempt.effective_model, "gpt-6.1-sol")
+        self.assertEqual(attempt.effective_effort, "medium")
         self.assertEqual(attempt.category, "success")
         self.assertEqual(
             run_command.call_args.kwargs["timeout_seconds"],
@@ -37906,7 +37919,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "_codex_session_metadata",
-                return_value=(model, "xhigh", True),
+                return_value=(model, providers.CODEX_REASONING_EFFORT, True),
             ),
         ):
             launch.freeze_prompt()
@@ -38881,7 +38894,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 argv=("sandbox",),
                 returncode=1,
                 stdout=json.dumps(
-                    {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+                    {**base, "modelUsage": {LEGACY_CLAUDE_WRONG_MODEL: {}}}
                 ).encode(),
                 stderr=b"",
             ),
@@ -40733,10 +40746,10 @@ class ProviderPolicyTest(unittest.TestCase):
         source = self.review.source_root / ".claude" / ".credentials.json"
         staged = mock.Mock(config_dir=runtime_root / "staged-config")
         attempts = (
-            self.attempt("claude", providers.CLAUDE_MODELS[0], "entitlement"),
+            self.attempt("claude", LEGACY_CLAUDE_MODEL_CHAIN[0], "entitlement"),
             self.attempt(
                 "claude",
-                providers.CLAUDE_MODELS[1],
+                LEGACY_CLAUDE_MODEL_CHAIN[1],
                 "success",
                 final_text="No findings.",
             ),
@@ -40972,7 +40985,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
             category, final_text = providers._run_model_chain(
                 review=self.review,
-                models=providers.CLAUDE_MODELS,
+                models=LEGACY_CLAUDE_MODEL_CHAIN,
                 runner=runner,
                 runtime="claude",
                 requested_effort=providers.CLAUDE_REASONING_EFFORT,
@@ -40988,14 +41001,16 @@ class ProviderPolicyTest(unittest.TestCase):
                 proxy_tls_env,
                 proxy_tls_snapshot_sha256,
             )
-            self.assertEqual(len(tls_inputs), len(providers.CLAUDE_MODELS))
+            self.assertEqual(len(tls_inputs), len(LEGACY_CLAUDE_MODEL_CHAIN))
             self.assertTrue(
                 all(
                     item["SSL_CERT_FILE"] == "/helper/proxy-ca.pem"
                     for item in tls_inputs
                 )
             )
-            for call in connect_proxy.call_args_list[: len(providers.CLAUDE_MODELS)]:
+            for call in connect_proxy.call_args_list[
+                : len(LEGACY_CLAUDE_MODEL_CHAIN)
+            ]:
                 self.assertEqual(call.args[1], proxy_tls_env)
                 self.assertIs(
                     call.kwargs["upstream_ssl_context"],
@@ -41007,7 +41022,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     call.kwargs["requested_model"]
                     for call in validate_stream.call_args_list
                 ],
-                list(providers.CLAUDE_MODELS),
+                list(LEGACY_CLAUDE_MODEL_CHAIN),
             )
             self.assertTrue(
                 all(
@@ -41017,7 +41032,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(
                 stage_credentials.call_count,
-                len(providers.CLAUDE_MODELS),
+                len(LEGACY_CLAUDE_MODEL_CHAIN),
             )
             for call in stage_credentials.call_args_list:
                 self.assertEqual(call.args, (source, runtime_root))
@@ -41025,7 +41040,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertTrue(all(callback() for callback in quiescence_callbacks))
             self.assertEqual(
                 lifecycle_exit_states,
-                [(True, True)] * len(providers.CLAUDE_MODELS),
+                [(True, True)] * len(LEGACY_CLAUDE_MODEL_CHAIN),
             )
             for call in build_sandbox.call_args_list:
                 self.assertFalse(call.args[0].node_extra_ca_certs_configured)
@@ -41047,7 +41062,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
             self.assertEqual(
                 stage_credentials.call_count,
-                len(providers.CLAUDE_MODELS),
+                len(LEGACY_CLAUDE_MODEL_CHAIN),
             )
             for captured in (
                 isolation_probe.call_args.args[0],
@@ -43206,7 +43221,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_linux_arguments_confine_file_tools_to_workspace(self) -> None:
         settings = providers._claude_review_settings(linux=True)
         arguments = providers._claude_review_arguments(
-            model="claude-opus-4-8",
+            model=providers.CLAUDE_MODELS[0],
             settings=settings,
             linux=True,
         )
@@ -43232,7 +43247,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         settings = providers._claude_review_settings(linux=False)
         arguments = providers._claude_review_arguments(
-            model="claude-opus-4-8",
+            model=providers.CLAUDE_MODELS[0],
             settings=settings,
             linux=False,
         )
@@ -43264,7 +43279,7 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=contextlib.nullcontext(43210),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_command_pins_model_and_max_with_local_login_safe_mode(
+    def test_claude_command_pins_model_and_medium_with_local_login_safe_mode(
         self,
         run_command: mock.Mock,
         _proxy: mock.Mock,
@@ -43295,7 +43310,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "subtype": "success",
             "is_error": False,
             "result": "No findings.",
-            "modelUsage": {"claude-opus-4-8": {}},
+            "modelUsage": {"claude-opus-5-5": {}},
         }
         run_command.side_effect = (
             Completed(
@@ -43319,7 +43334,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         providers._claude_attempt(
             review=self.review,
-            model="claude-opus-4-8",
+            model="claude-opus-5-5",
             index=1,
             env={
                 "ALL_PROXY": "http://all-user:all-secret@proxy.invalid:8080",
@@ -43347,8 +43362,8 @@ class ProviderPolicyTest(unittest.TestCase):
             refresh_lock_protocol=self.claude_refresh_lock_protocol,
         )
         argv = run_command.call_args_list[2].args[0]
-        self.assertIn("claude-opus-4-8", argv)
-        self.assertEqual(argv[argv.index("--effort") + 1], "max")
+        self.assertIn("claude-opus-5-5", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         self.assertNotIn("--prompt-suggestions", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
@@ -44519,7 +44534,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "error": {"code": "model_not_enabled"},
-                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
+                    "modelUsage": {LEGACY_CLAUDE_MODEL_CHAIN[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -44533,7 +44548,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "success",
                     "is_error": False,
                     "result": "No findings.",
-                    "modelUsage": {providers.CLAUDE_MODELS[1]: {}},
+                    "modelUsage": {LEGACY_CLAUDE_MODEL_CHAIN[1]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -44566,6 +44581,11 @@ class ProviderPolicyTest(unittest.TestCase):
             return completed
 
         with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_MODELS",
+                LEGACY_CLAUDE_MODEL_CHAIN,
+            ),
             mock.patch.object(
                 providers,
                 "child_environment",
@@ -44666,7 +44686,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "error": {"code": "model_not_enabled"},
-                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
+                    "modelUsage": {LEGACY_CLAUDE_MODEL_CHAIN[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -44697,6 +44717,11 @@ class ProviderPolicyTest(unittest.TestCase):
             return first
 
         with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_MODELS",
+                LEGACY_CLAUDE_MODEL_CHAIN,
+            ),
             mock.patch.object(
                 providers,
                 "child_environment",

@@ -2886,6 +2886,47 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assertEqual(outcome["classification"], "accepted")
 
+    def test_current_opus_5_5_binding_requires_matching_model_evidence(self) -> None:
+        events = self._full_events()
+        events[0]["model"] = "claude-opus-5-5"
+        events[1]["message"]["model"] = "claude-opus-5-5"
+        events[-1]["modelUsage"] = {"claude-opus-5-5": {"inputTokens": 1}}
+
+        accepted = self._validate(events, requested_model="claude-opus-5-5")
+
+        self.assertEqual(accepted["classification"], "accepted")
+
+        events[-1]["modelUsage"] = {"claude-opus-4-8": {"inputTokens": 1}}
+        mismatched = self._validate(events, requested_model="claude-opus-5-5")
+
+        self.assertEqual(mismatched["classification"], "blocked")
+        self.assertIn(
+            "terminal.modelUsage.primary-model-substitution",
+            mismatched["reasons"],
+        )
+
+    def test_validator_cli_accepts_current_and_legacy_model_identities(self) -> None:
+        parser = validator._build_parser()
+        required = [
+            "--cwd",
+            "/workspace",
+            "--preflight-result",
+            "/tmp/preflight.json",
+            "--authentication-source",
+            "local-login",
+            "--process-returncode",
+            "0",
+        ]
+
+        for model in (
+            "claude-opus-5-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+        ):
+            with self.subTest(model=model):
+                args = parser.parse_args([*required, "--model", model])
+                self.assertEqual(args.model, model)
+
     def test_authentication_source_maps_to_exact_init_api_key_source(self) -> None:
         self.assertEqual(validator.CLAUDE_AUTH_ENV_NAME, "ANTHROPIC_API_KEY")
         cases = {

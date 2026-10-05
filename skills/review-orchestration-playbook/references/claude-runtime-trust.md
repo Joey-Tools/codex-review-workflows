@@ -1535,7 +1535,7 @@ described as an enforced final launch.
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
 | Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | The low-level helper may use its existing machine-classified same-runtime fallback; the named-direct guard remains 4.8-only and is inconclusive until a separately closed fallback bridge exists | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Another model requires explicit opt-in; the default helper chain has only Opus 5.5 and the named-direct guard remains 5.5-only. Without an authorized alternative the lane is inconclusive | Only after a separate explicit supplemental Copilot request, including its model/effort; never satisfies named double |
 
 If the primary runtime is unavailable and the authorized fallback executable is
 also absent before any model launch, the lane is deterministically blocked with
@@ -1553,14 +1553,15 @@ Only stderr and structured primary error fields are failure-classification
 evidence. Primary authentication evidence wins over mixed transient or
 entitlement words, while repository-controlled partial result text is never
 classified and cannot authorize an authentication, model, or Copilot fallback.
-Only a strict entitlement result from a launched final review can advance the
-low-level helper to its later Opus model. It does not authorize the canonical
-named-direct `run-claude` guard to accept 4.7: that interface is 4.8-only, and
-retained 4.7 stream-schema recognition supplies validation compatibility rather
-than launch authority. Until a separate bridge consumes and binds the trusted
-4.8 launch, stream, return-code, cwd, preflight, session, and closed denial
-classification, a 4.8 entitlement or organization-policy denial leaves the
-named-direct lane inconclusive. After the complete low-level Claude chain is
+Only a strict entitlement result from a launched final review can advance an
+explicitly authorized multi-model helper chain. The default chain contains
+only Opus 5.5; denial alone never authorizes another model. The canonical
+named-direct `run-claude` guard is 5.5-only. Retained older stream-schema
+recognition supplies validation compatibility rather than launch authority.
+Until a separate bridge consumes and binds the trusted 5.5 launch, stream,
+return-code, cwd, preflight, session, and closed denial classification, a 5.5
+entitlement or organization-policy denial leaves the named-direct lane
+inconclusive. After an explicitly authorized low-level Claude chain is
 entitlement-blocked, the low-level helper may enter its compatibility Copilot backend only when the user
 separately requested that supplemental provider; named double/triple consent is
 not that request, and the result never completes the Claude Code lane. Missing

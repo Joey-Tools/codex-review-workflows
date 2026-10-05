@@ -99,7 +99,7 @@ CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION = pathlib.Path("/dev/null")
 CLAUDE_DIRECT_READ_OVERLAP_EXCEPTIONS = frozenset(
     ((CLAUDE_DIRECT_GIT_NULL_READ_EXCEPTION, pathlib.Path("/dev")),)
 )
-CLAUDE_DIRECT_MODELS = ("claude-opus-4-8",)
+CLAUDE_DIRECT_MODELS = ("claude-opus-5-5",)
 CLAUDE_DIRECT_REQUIRED_OPTIONS = (
     "--print",
     "--input-format",
@@ -120,7 +120,7 @@ CLAUDE_DIRECT_REQUIRED_OPTIONS = (
     "--allowedTools",
     "--disallowedTools",
 )
-CLAUDE_DIRECT_EFFORT = "max"
+CLAUDE_DIRECT_EFFORT = "medium"
 CLAUDE_DIRECT_PERMISSION_MODE = "dontAsk"
 CLAUDE_DIRECT_VISIBLE_TOOLS = "Read,Grep,Glob,Bash"
 CLAUDE_DIRECT_ALLOWED_TOOLS = "Read(./**),Grep,Glob,Bash"
