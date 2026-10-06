@@ -2,6 +2,11 @@
 
 A named double or triple adds one actual Claude Code process. It is independent of the Codex lane and runs in a different validated workspace over the same frozen range.
 
+Launch only after explicit user opt-in. An unambiguous named double/triple
+request supplies that opt-in; an unnamed workflow never does. The default is
+Opus 5.5 (`claude-opus-5-5`) at model-default effort (currently `medium`).
+Another model or effort requires explicit selection.
+
 ## Required Inputs
 
 The parent supplies:
@@ -85,9 +90,9 @@ control options, `--` is followed by exactly the preflight-bound absolute Claude
 executable and no caller-owned Claude argument. This is a security-tightening
 replacement for the former full-tail call shape; do not preserve or reconstruct
 that obsolete entrypoint. The only accepted model control is
-`--model claude-opus-4-8`; the direct guard rejects `claude-opus-4-7` and every
-other caller-selected model. Retained 4.7 stream schemas or legacy/helper
-failure classifiers do not authorize a named-direct launch. A final 4.8
+`--model claude-opus-5-5`; the direct guard rejects `claude-opus-4-8` and every
+other caller-selected model. Retained older stream schemas or legacy/helper
+failure classifiers do not authorize a named-direct launch. A final 5.5
 entitlement or organization-policy denial therefore leaves the named-direct
 lane inconclusive until a separately closed, evidence-bound fallback bridge is
 defined. The guard constructs this exact ordered argument profile:
@@ -96,7 +101,7 @@ defined. The guard constructs this exact ordered argument profile:
 --print
 --input-format text
 --model <guard-validated-model>
---effort max
+--effort medium
 --permission-mode dontAsk
 --output-format stream-json
 --verbose

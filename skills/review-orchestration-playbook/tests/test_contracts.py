@@ -370,7 +370,8 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("subagent", normalized)
             self.assertIn("cli", normalized)
             self.assertIn("peer", normalized)
-            self.assertIn("ultra", normalized)
+            self.assertIn("gpt-6.1-sol", normalized)
+            self.assertIn("medium", normalized)
             self.assertIn("internal delegation", normalized)
         self.assertIn("Neither adapter has a standing priority", local)
         self.assertIn('fork_turns="none"', local)
@@ -380,8 +381,8 @@ class RepositoryContractTest(unittest.TestCase):
             "--ignore-user-config",
             "--strict-config",
             "-s read-only",
-            "-m gpt-5.6-sol",
-            'model_reasoning_effort="ultra"',
+            "-m gpt-6.1-sol",
+            'model_reasoning_effort="medium"',
             "-C <absolute-validated-workspace>",
             "exact UTF-8 prompt bytes",
             "stdin descriptor",
@@ -425,6 +426,103 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("requested and effective model and Codex mode", local)
         self.assertIn("using both does not create extra consent", consent)
         self.assertNotIn("sole lane that satisfies", _normalize(skill + local))
+
+    def test_remote_first_routing_does_not_require_an_extra_local_lane(self) -> None:
+        skill = _normalize(_read("SKILL.md"))
+        routing = _normalize(_read("references/review-lane-contracts.md"))
+        readiness = _normalize(_read("references/pr-readiness.md"))
+        delivery = _normalize(
+            (POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md").read_text(
+                encoding="utf-8"
+            )
+        )
+        for document in (skill, routing, readiness):
+            self.assertIn("remote-only", document)
+            self.assertIn("local review is not required by default", document)
+            self.assertIn("native github copilot", document)
+        self.assertIn("explicitly requests", skill)
+        self.assertIn("generic", skill)
+        self.assertIn("not an automatic fallback authorization", routing)
+        self.assertIn("session choice", readiness)
+        self.assertNotIn("missing capability proof leaves routing blocked", routing)
+        self.assertIn("another model or reasoning override requires explicit user opt-in", routing)
+        self.assertIn("worker authorization alone is not reviewer authorization", routing)
+        self.assertIn("claude code requires separate explicit opt-in", routing)
+        self.assertIn("do not add a local lane", delivery)
+        self.assertIn("omitted local lanes stay omitted", delivery)
+        self.assertIn("local_reviews: pass | blocked | pending | not-required", readiness)
+
+    def test_session_routing_examples_preserve_user_choices_and_required_gates(self) -> None:
+        document = _read("references/review-lane-contracts.md")
+        section = document.split("### Session Review Choice\n", 1)[1].split(
+            "### Local Model and Reasoning Consent\n", 1
+        )[0]
+        decisions: dict[tuple[str, str, str], set[str]] = {}
+        for line in section.splitlines():
+            if not line.startswith("| "):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) != 5 or cells[1] not in {
+                "available", "unknown", "unavailable"
+            }:
+                continue
+            key = tuple(cells[1:4])
+            decisions.setdefault(key, set()).add(cells[4])
+
+        self.assertEqual(
+            decisions,
+            {
+                ("available", "unset", "optional"): {
+                    "remote-only", "remote-only; findings still block"
+                },
+                ("unknown", "unset", "optional"): {"ask-session-choice"},
+                ("unavailable", "unset", "optional"): {"ask-session-choice"},
+                ("unknown", "local-fallback", "optional"): {"local"},
+                ("unavailable", "local-fallback", "required"): {
+                    "local; required-remote remains"
+                },
+                ("available", "local-required", "optional"): {"local-and-remote"},
+                ("unavailable", "remote-only", "optional"): {"wait; no-local"},
+                ("available", "local-fallback", "optional"): {
+                    "remote-recovery; no-local-fallback"
+                },
+            },
+        )
+
+    def test_reviewer_inclusive_luna_authorization_keeps_sol_as_default(self) -> None:
+        for path in (
+            "SKILL.md",
+            "references/local-codex-lane.md",
+            "references/review-lane-contracts.md",
+        ):
+            with self.subTest(path=path):
+                document = _normalize(_read(path))
+                self.assertIn("gpt-6.1-sol", document)
+                self.assertIn("gpt-6 luna", document)
+                self.assertIn("up to max", document)
+
+        routing = _normalize(_read("references/review-lane-contracts.md"))
+        self.assertIn("when the user explicitly includes reviewers", routing)
+        self.assertIn("not the new default or an automatic fallback", routing)
+        self.assertIn("choose and record its exact effort", routing)
+        local = _normalize(_read("references/local-codex-lane.md"))
+        self.assertIn("record the exact selected profile and authorization", local)
+
+    def test_native_copilot_completion_is_not_codex_or_cli_evidence(self) -> None:
+        routing = _normalize(_read("references/review-lane-contracts.md"))
+        for contract in (
+            "copilot-pull-request-reviewer[bot]",
+            "complete pagination",
+            "exact current head",
+            "non-dismissed terminal native review",
+            "explicit completion/coverage evidence",
+            "no applicable unresolved provider finding",
+            "normally submits a comment review",
+            "do not require an approve review",
+            "not copilot cli",
+            "keep native copilot evidence separate from github codex report schemas",
+        ):
+            self.assertIn(contract, routing)
 
     def test_named_shapes_and_prompts_preserve_processor_independence(self) -> None:
         skill = _normalize(_read("SKILL.md"))
@@ -651,7 +749,7 @@ class RepositoryContractTest(unittest.TestCase):
         for rerun_gate in (
             "local validation and tests",
             "every required local review lane",
-            "the github codex lane",
+            "the selected remote lane",
             "ci and status checks",
             "all conversations",
             "lifecycle/base/head and merge-policy checks",
@@ -1019,13 +1117,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("secret-delta admission is independent of review", contracts)
         self.assertIn("never supplies a reviewer result", contracts)
 
-    def test_reviewer_role_requests_sol_ultra_and_read_only_findings(self) -> None:
+    def test_reviewer_role_requests_sol_model_default_and_read_only_findings(self) -> None:
         role_path = POLICY_SCOPE_ROOT / "agents/reviewer.toml"
         with role_path.open("rb") as handle:
             role = tomllib.load(handle)
 
-        self.assertEqual(role["model"], "gpt-5.6-sol")
-        self.assertEqual(role["model_reasoning_effort"], "ultra")
+        self.assertEqual(role["model"], "gpt-6.1-sol")
+        self.assertEqual(role["model_reasoning_effort"], "medium")
         self.assertEqual(role["sandbox_mode"], "read-only")
         instructions = role["developer_instructions"]
         for anchor in (
@@ -1240,7 +1338,8 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("parent session's", normalized)
         self.assertIn("effective model family or codex mode", normalized)
-        self.assertIn("this is the sole latest-model-lookup trigger", normalized)
+        self.assertIn("never authorizes an automatic upgrade", normalized)
+        self.assertIn("only when the user requests model discovery", normalized)
         self.assertIn("it never triggers latest-model discovery", normalized)
         self.assertIn("try the peer adapter with the exact same model", normalized)
         self.assertIn("do not silently lower the", normalized)
@@ -1718,10 +1817,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("allowallunixsockets: false", normalized_lane)
         self.assertIn("allowlocalbinding: false", normalized_lane)
         for contract in (
-            "the direct guard rejects `claude-opus-4-7` and every other caller-selected model",
-            "retained 4.7 stream schemas or legacy/helper failure classifiers do not authorize a named-direct launch",
-            "the named-direct guard remains 4.8-only and is inconclusive until a separately closed fallback bridge exists",
-            "retained 4.7 stream-schema recognition supplies validation compatibility rather than launch authority",
+            "the direct guard rejects `claude-opus-4-8` and every other caller-selected model",
+            "retained older stream schemas or legacy/helper failure classifiers do not authorize a named-direct launch",
+            "the named-direct guard remains 5.5-only",
+            "recognition supplies validation compatibility rather than launch authority",
         ):
             self.assertIn(contract, normalized_lane + "\n" + normalized_runtime)
         self.assertIn("publisher", runtime.lower())
@@ -1732,8 +1831,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("One fresh-context OpenAI Codex lane", consent)
         self.assertIn("actual Anthropic Claude Code", consent)
         self.assertIn("GitHub Codex on an existing exact-host `github.com` PR", consent)
-        self.assertIn("It does not silently opt", consent)
-        self.assertIn("into Claude Code, GitHub Copilot", consent)
+        self.assertIn(
+            "it does not silently opt into claude code, copilot cli",
+            _normalize(consent),
+        )
+        self.assertIn("native GitHub Copilot PR code review", consent)
         self.assertIn("untracked private files", consent)
         self.assertNotIn("double-review", providers.CLAUDE_EGRESS_CONSENTS)
         self.assertNotIn("triple-review", providers.CLAUDE_EGRESS_CONSENTS)
