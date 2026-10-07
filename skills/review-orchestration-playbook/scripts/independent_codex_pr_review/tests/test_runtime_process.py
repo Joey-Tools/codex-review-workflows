@@ -247,6 +247,125 @@ class LinuxProcessGroupEnumerationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+class BoundedGitProcessTests(unittest.TestCase):
+    def test_fast_exit_during_session_binding_returns_bounded_result(self) -> None:
+        with owned_temporary_directory("git-fast-exit-binding-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(
+                b"#!/bin/sh\n"
+                b"printf fast-stdout\n"
+                b"printf fast-stderr >&2\n"
+                b"exit 7\n"
+            )
+            executable.chmod(0o700)
+
+            def bind_after_terminal(process: object) -> object:
+                pid = getattr(process, "pid")
+                assert isinstance(pid, int)
+                wait_terminal(
+                    pid,
+                    deadline=time.monotonic() + 2,
+                )
+                raise ProcessLookupError(errno.ESRCH, "process exited", pid)
+
+            with mock.patch.object(
+                gitraw,
+                "_bind_fresh_session",
+                side_effect=bind_after_terminal,
+            ):
+                result = run_bounded(
+                    (str(executable),),
+                    cwd=root,
+                    environment=sanitized_git_environment(),
+                    timeout=3,
+                    stdout_limit=8192,
+                    stderr_limit=8192,
+                )
+
+        self.assertEqual(result, (7, b"fast-stdout", b"fast-stderr"))
+
+    def test_fast_terminal_output_still_obeys_each_stream_limit(self) -> None:
+        for stream in ("stdout", "stderr"):
+            with (
+                self.subTest(stream=stream),
+                owned_temporary_directory(f"git-fast-exit-{stream}-overflow-") as root,
+            ):
+                executable = root / "fake-git"
+                output = (
+                    b"printf xx\n"
+                    if stream == "stdout"
+                    else b"printf xx >&2\n"
+                )
+                executable.write_bytes(b"#!/bin/sh\n" + output + b"exit 7\n")
+                executable.chmod(0o700)
+                spawned: list[object] = []
+
+                def bind_after_terminal(process: object) -> object:
+                    spawned.append(process)
+                    pid = getattr(process, "pid")
+                    assert isinstance(pid, int)
+                    wait_terminal(pid, deadline=time.monotonic() + 2)
+                    raise ProcessLookupError(errno.ESRCH, "process exited", pid)
+
+                with (
+                    mock.patch.object(
+                        gitraw,
+                        "_bind_fresh_session",
+                        side_effect=bind_after_terminal,
+                    ),
+                    self.assertRaisesRegex(
+                        OverflowError,
+                        "bounded Git output exceeded its byte cap",
+                    ),
+                ):
+                    run_bounded(
+                        (str(executable),),
+                        cwd=root,
+                        environment=sanitized_git_environment(),
+                        timeout=3,
+                        stdout_limit=1 if stream == "stdout" else 8192,
+                        stderr_limit=1 if stream == "stderr" else 8192,
+                    )
+
+                self.assertEqual(len(spawned), 1)
+                self.assertEqual(getattr(spawned[0], "returncode"), 7)
+
+    def test_live_session_binding_lookup_failure_remains_fatal(self) -> None:
+        with owned_temporary_directory("git-live-binding-failure-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(b"#!/bin/sh\nexec /bin/sleep 30\n")
+            executable.chmod(0o700)
+            spawned: list[object] = []
+
+            def fail_while_live(process: object) -> object:
+                spawned.append(process)
+                pid = getattr(process, "pid")
+                assert isinstance(pid, int)
+                self.assertIsNone(gitraw.terminal_status(pid))
+                raise ProcessLookupError(errno.ESRCH, "synthetic lookup failure")
+
+            with (
+                mock.patch.object(
+                    gitraw,
+                    "_bind_fresh_session",
+                    side_effect=fail_while_live,
+                ),
+                self.assertRaises(ProcessLookupError),
+            ):
+                run_bounded(
+                    (str(executable),),
+                    cwd=root,
+                    environment=sanitized_git_environment(),
+                    timeout=3,
+                    stdout_limit=8192,
+                    stderr_limit=8192,
+                )
+
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(getattr(spawned[0], "returncode"))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
 class AnchoredProcessGroupTests(unittest.TestCase):
     def test_post_fork_identity_failure_retains_receipt_after_cleanup_gap(
         self,
