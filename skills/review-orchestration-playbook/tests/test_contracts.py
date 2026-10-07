@@ -244,6 +244,7 @@ class RepositoryContractTest(unittest.TestCase):
         private_overlay = _workflow_job_blocks(workflow)["private_overlay_tests"]
         modules = _workflow_matrix_modules(private_overlay)
         expected_modules = [
+            "test_cisco_ghe_probe.py",
             "test_codex_personal_sync.py",
             "test_generated_sync_source_lock.py",
             "test_jira_issue_probe.py",

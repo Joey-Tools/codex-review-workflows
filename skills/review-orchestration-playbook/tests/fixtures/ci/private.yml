@@ -240,6 +240,7 @@ jobs:
       fail-fast: false
       matrix:
         module:
+          - test_cisco_ghe_probe.py
           - test_codex_personal_sync.py
           - test_generated_sync_source_lock.py
           - test_jira_issue_probe.py
