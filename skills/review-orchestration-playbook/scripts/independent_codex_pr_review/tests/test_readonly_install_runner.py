@@ -738,37 +738,51 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             6_006,
             process_state=b"\x03",
         )
-        clock = {"now": 0.0}
-
-        def advance(duration: float) -> None:
-            clock["now"] += duration
-
-        with (
-            mock.patch.object(
-                runner,
-                "_darwin_same_uid_processes",
-                return_value=(supervisor, escaped),
-            ),
-            mock.patch.object(
-                runner,
-                "_reap_terminal_same_uid_children",
-            ),
-            mock.patch.object(runner.os, "kill") as kill,
-            mock.patch.object(
-                runner.time,
-                "monotonic",
-                side_effect=lambda: clock["now"],
-            ),
-            mock.patch.object(runner.time, "sleep", side_effect=advance),
-            self.assertRaises(runner.ChildProcessTreeClosureUnproven) as closure,
+        for deadline, expected_deadline in (
+            (None, runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS),
+            (0.02, 0.02),
         ):
-            runner._require_no_new_same_uid_processes(
-                (supervisor,),
-                deadline=0.02,
-            )
+            with self.subTest(deadline=deadline):
+                clock = {"now": 0.0}
 
-        self.assertEqual(closure.exception.processes, (escaped,))
-        kill.assert_not_called()
+                def advance(duration: float) -> None:
+                    clock["now"] += duration
+
+                with (
+                    mock.patch.object(
+                        runner,
+                        "_darwin_same_uid_processes",
+                        return_value=(supervisor, escaped),
+                    ) as census,
+                    mock.patch.object(
+                        runner,
+                        "_reap_terminal_same_uid_children",
+                    ),
+                    mock.patch.object(runner.os, "kill") as kill,
+                    mock.patch.object(
+                        runner.time,
+                        "monotonic",
+                        side_effect=lambda: clock["now"],
+                    ),
+                    mock.patch.object(runner.time, "sleep", side_effect=advance),
+                    self.assertRaises(
+                        runner.ChildProcessTreeClosureUnproven
+                    ) as closure,
+                ):
+                    runner._require_no_new_same_uid_processes(
+                        (supervisor,),
+                        deadline=deadline,
+                    )
+
+                self.assertEqual(clock["now"], expected_deadline)
+                self.assertGreater(census.call_count, 0)
+                self.assertEqual(
+                    census.call_args_list,
+                    [mock.call(deadline=expected_deadline)] * census.call_count,
+                )
+                self.assertEqual(closure.exception.processes, (escaped,))
+                self.assertIsNone(closure.exception.cause)
+                kill.assert_not_called()
 
     def test_dedicated_uid_scope_rejects_nonisolated_baseline(self) -> None:
         supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
@@ -6980,6 +6994,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             stop_marker = root / "stop-escaped-process"
             custody_receipt = root / "escaped-process-custody"
             marker_delay_seconds = 0.2
+            child_timeout_seconds = 10.0
             escaped_identity: runner.DarwinProcessIdentity | None = None
 
             def parse_identity(
@@ -7089,7 +7104,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                                 "PATH": "/usr/bin:/bin",
                                 "PYTHONDONTWRITEBYTECODE": "1",
                             },
-                            timeout=10,
+                            timeout=child_timeout_seconds,
                             stdout_limit=1024,
                             stderr_limit=1024,
                         )
@@ -7104,7 +7119,13 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
                     )
                     self.assertLess(
                         time.monotonic() - started,
-                        runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS + 1.0,
+                        # This live integration includes the initial census,
+                        # child execution, and final census. Verify the exact
+                        # census deadline separately with the controlled clock;
+                        # reserve five seconds here for real-process scheduling.
+                        child_timeout_seconds
+                        + 2 * runner.DARWIN_PROCESS_CENSUS_TIMEOUT_SECONDS
+                        + 5.0,
                     )
                     self.assertIsNone(escaped.exception.__cause__)
                     if escaped.exception.cause is not None:
