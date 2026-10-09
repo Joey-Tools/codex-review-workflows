@@ -730,7 +730,7 @@ class ReadOnlyInstallRunnerTests(unittest.TestCase):
             ],
         )
 
-    def test_same_uid_closure_honors_default_and_explicit_deadlines(self) -> None:
+    def test_same_uid_closure_rejects_persistent_exact_identity(self) -> None:
         supervisor = runner.DarwinProcessIdentity(os.getpid(), 1, 1)
         escaped = runner.DarwinProcessIdentity(
             90_006,
