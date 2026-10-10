@@ -542,11 +542,27 @@ The same consumer resource's `required_report_schema` and `report_fixtures`
 are the executable, closed, basis-discriminated report contract. They reject
 cross-variant field combinations rather than relying on YAML examples alone.
 
+The version-1 record/report envelope contains an additive, explicitly named
+`clean_issue_v2` / `clean-issue-v2` branch for the observed official team-settings
+disclosure. It reuses only v1 presentation and commit binding and requires its
+own exact closed disclosure lines; disclosure-free or legacy disclosure carriers
+remain v1. Unknown URLs, missing or extra nonblank prose, and mixed disclosures
+remain malformed. A consumer release must pin the resource bytes and implement
+both named branches before accepting v2; old consumers fail closed rather than
+silently reinterpreting their v1 branch. This is not a generic prose parser.
+
 The resource is deliberately a consumer contract. It does not define, validate,
 or authorize a GitHub Action, status producer, workflow name, check conclusion,
 or ruleset. Those producer integrations belong to their separately reviewed
 workstream and can supply a preferred basis only through the association rules
 above.
+
+Before considering a comment transport retry, apply the
+[read-only request preflight](github-pr-probes.md#read-only-request-preflight).
+An existing exact request is reused; only independent proof that the HTTP
+request was not sent preserves the unused write budget. An absent or delayed
+GET result cannot prove non-delivery. Every possibly sent attempt still consumes
+the epoch budget.
 
 ## Terminal Results
 
@@ -909,7 +925,7 @@ evidence:
   url: https://github.com/...
   channel: issue-comment | review
   grammar: github-codex-terminal-carriers-v1
-  grammar_branch: clean-issue-v1 | clean-review-v1
+  grammar_branch: clean-issue-v1 | clean-issue-v2 | clean-review-v1
   grammar_status: accepted
   artifact_commit: 40-lowercase-hex
   server_time: RFC3339
@@ -922,8 +938,9 @@ For `basis: terminal-clean`, `artifact_commit` is required, non-null, and equal
 to the envelope `head_sha`; `head_binding` is exactly `explicit-commit`.
 `artifact_commit: null` and `head_binding: stable-request-epoch` are
 structurally invalid for terminal clean. The clean channel and grammar branch
-are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
-requires `clean-review-v1`; crossing those pairs is malformed evidence.
+are a closed pair: `issue-comment` requires `clean-issue-v1` or `clean-issue-v2`,
+while `review` requires `clean-review-v1`; crossing those pairs is malformed
+evidence.
 
 This evidence object cannot self-prove complete final state: terminal-clean
 pass also requires the independent `complete_pr_snapshot` to select this exact

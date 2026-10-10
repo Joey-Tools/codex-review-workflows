@@ -179,6 +179,39 @@ Post the exact body:
 @codex review
 ```
 
+### Read-Only Request Preflight
+
+Before a first request or any proposed transport retry, revalidate the exact
+repository/PR/head and enumerate the complete visible exact-request set under
+one parent mutation owner. Combine that read with the retained transport
+outcome; absence from GitHub alone is not proof of non-delivery.
+
+Scope stability is a prerequisite, not retained transport evidence. Prove the
+canonical repository identity, exact PR and feature head unchanged across the
+complete initial/final acquisition before binding any visible request or using
+transport evidence. A visible request cannot supply that proof. A changed scope
+stops the old decision even when a request is present; freeze the new scope and
+acquire its own request set and epoch ledger without transferring old request
+identities or delivery evidence. An unreadable or unproved scope is inconclusive,
+not unchanged. The scope column makes the rows mutually exclusive.
+
+| Scope | Visible exact request | Retained transport evidence | Decision |
+| --- | --- | --- | --- |
+| Changed | Any | Any | Stop this decision and freeze the new scope; never transfer the old request identity. |
+| Unverified | Any | Any | Acquisition is inconclusive; do not POST or bind a request. |
+| Unchanged | Present | Any | Bind and observe the existing request; do not POST. |
+| Unchanged | Absent | Independently proved not sent | The unused write budget permits the same logical request, after scope and authorization revalidation. |
+| Unchanged | Absent | Possibly sent or unknown | Read-only observation; do not POST. |
+| Unchanged | Incomplete or unreadable | Any | Acquisition is inconclusive; do not POST. |
+
+A transport proof of `not sent` must establish failure before any request byte
+could reach GitHub (for example, a local auth/preparation failure before the
+HTTP action was invoked). For a first request, the single owner's retained
+epoch ledger must show that no create-comment HTTP action was invoked; an empty
+GET alone is still insufficient. A timeout, EOF, lost response, or empty successful GET
+does not establish that property. This preflight is a decision step, not a new
+idempotency contract, second logical review, or extra mutation authorization.
+
 Define one comment-mutation epoch by the canonical repository identity, exact PR, and feature
 head. In each epoch, permit at most one possibly delivered create-comment
 POST. Before that POST, reread the unchanged PR head and completely enumerate
