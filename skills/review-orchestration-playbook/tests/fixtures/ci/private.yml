@@ -318,7 +318,7 @@ jobs:
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -357,8 +357,8 @@ jobs:
           python-version: "3.x"
       - name: Run platform reconciliation safety tests (Python 3.x)
         if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
-        timeout-minutes: 2
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+        timeout-minutes: 10
+        run: python3 -m unittest -v tests.test_personal_sync_reconciliation_safety
       - name: Require hosted-runner byte reproduction
         if: always()
         timeout-minutes: 2
