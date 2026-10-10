@@ -925,7 +925,7 @@ evidence:
   url: https://github.com/...
   channel: issue-comment | review
   grammar: github-codex-terminal-carriers-v1
-  grammar_branch: clean-issue-v1 | clean-review-v1
+  grammar_branch: clean-issue-v1 | clean-issue-v2 | clean-review-v1
   grammar_status: accepted
   artifact_commit: 40-lowercase-hex
   server_time: RFC3339
@@ -938,8 +938,9 @@ For `basis: terminal-clean`, `artifact_commit` is required, non-null, and equal
 to the envelope `head_sha`; `head_binding` is exactly `explicit-commit`.
 `artifact_commit: null` and `head_binding: stable-request-epoch` are
 structurally invalid for terminal clean. The clean channel and grammar branch
-are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
-requires `clean-review-v1`; crossing those pairs is malformed evidence.
+are a closed pair: `issue-comment` requires `clean-issue-v1` or `clean-issue-v2`,
+while `review` requires `clean-review-v1`; crossing those pairs is malformed
+evidence.
 
 This evidence object cannot self-prove complete final state: terminal-clean
 pass also requires the independent `complete_pr_snapshot` to select this exact

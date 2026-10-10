@@ -1200,10 +1200,9 @@ class _ReportValidator:
             "issue-comment": {"clean-issue-v1", "clean-issue-v2"},
             "review": {"clean-review-v1"},
         }
-        return (
-            evidence["grammar_branch"] in branch_by_channel.get(evidence["channel"], set())
-            and self._clean_evidence_url_matches_scope(report, evidence)
-        )
+        return evidence["grammar_branch"] in branch_by_channel.get(
+            evidence["channel"], set()
+        ) and self._clean_evidence_url_matches_scope(report, evidence)
 
     def _direct_positive_scope_matches(self, report: dict[str, object]) -> bool:
         parent_scope = self.direct_positive_parent_scope
@@ -5270,6 +5269,76 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.assertIn(anchor, authority)
         self.assertNotIn("artifact_commit: 40-lowercase-hex-or-null", authority)
 
+    def test_authority_terminal_clean_union_matches_json_contract(self) -> None:
+        authority = AUTHORITY_PATH.read_text(encoding="utf-8")
+        declarations = re.findall(
+            r"^  grammar_branch: (clean-[^\n]+)$", authority, re.MULTILINE
+        )
+        self.assertEqual(len(declarations), 1)
+        documented_branches = declarations[0].split(" | ")
+        contract_branches = self.grammar["required_report_schema"]["basis_rules"][
+            "terminal-clean"
+        ]["branches"]
+        self.assertEqual(len(documented_branches), len(set(documented_branches)))
+        self.assertEqual(len(contract_branches), len(set(contract_branches)))
+        self.assertEqual(set(documented_branches), set(contract_branches))
+
+    def test_authority_terminal_clean_channel_pairs_match_contract_and_consumer(
+        self,
+    ) -> None:
+        authority = AUTHORITY_PATH.read_text(encoding="utf-8")
+        binding_text = authority.split("are a closed pair:", 1)[1].split(
+            "crossing those pairs", 1
+        )[0]
+        documented_pairs = re.findall(
+            r"`(issue-comment|review)`\s+requires ([^,;]+)", binding_text
+        )
+        self.assertEqual(len(documented_pairs), 2)
+        documented_bindings = {
+            channel: set(re.findall(r"`([^`]+)`", branches))
+            for channel, branches in documented_pairs
+        }
+        rules = self.grammar["required_report_schema"]["basis_rules"]["terminal-clean"]
+        contract_bindings = {
+            channel: set(branches.split(" or "))
+            for channel, branches in (
+                clause.split(" exactly ", 1)
+                for clause in rules["channel_branch_binding"].split("; ")
+            )
+        }
+        self.assertEqual(documented_bindings, contract_bindings)
+        self.assertEqual(set(contract_bindings), {"issue-comment", "review"})
+        self.assertEqual(
+            set().union(*contract_bindings.values()), set(rules["branches"])
+        )
+
+        validator = self._validator_for_selection(
+            self.selected_parent_selection_outcome
+        )
+        report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        for channel, accepted_branches in contract_bindings.items():
+            for branch in (*rules["branches"], "clean-issue-v999"):
+                evidence = copy.deepcopy(report["evidence"])
+                evidence["channel"] = channel
+                evidence["grammar_branch"] = branch
+                evidence["server_time_field"] = (
+                    "created_at" if channel == "issue-comment" else "submitted_at"
+                )
+                fragment = (
+                    "issuecomment"
+                    if channel == "issue-comment"
+                    else "pullrequestreview"
+                )
+                evidence["url"] = (
+                    f"https://github.com/{report['repository']}/pull/"
+                    f"{report['pull_request']}#{fragment}-{evidence['id']}"
+                )
+                with self.subTest(channel=channel, branch=branch):
+                    self.assertEqual(
+                        validator._clean_terminal_evidence(report, evidence),
+                        branch in accepted_branches,
+                    )
+
     def test_v2_clean_report_keeps_complete_scope_and_finding_guards(self) -> None:
         report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
         report["evidence"]["grammar_branch"] = "clean-issue-v2"
@@ -5281,7 +5350,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             snapshot[f"{phase}_basis_selection"]["terminal_evidence"] = copy.deepcopy(
                 report["evidence"]
             )
-        self.assertTrue(self._validator_with_complete_snapshot(snapshot).validate(report))
+        self.assertTrue(
+            self._validator_with_complete_snapshot(snapshot).validate(report)
+        )
         for field, value in (
             ("unresolved_provider_findings", 1),
             ("status", "incomplete"),
@@ -5295,13 +5366,21 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
                 )
         changed = copy.deepcopy(snapshot)
         changed["final_scope"]["head_sha"] = "f" * 40
-        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+        self.assertFalse(
+            self._validator_with_complete_snapshot(changed).validate(report)
+        )
         changed = copy.deepcopy(snapshot)
         changed["final_page_inventory"]["review_threads_pages_complete"] = False
-        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+        self.assertFalse(
+            self._validator_with_complete_snapshot(changed).validate(report)
+        )
         changed = copy.deepcopy(snapshot)
-        changed["final_terminal_selection"]["evidence"]["grammar_branch"] = "clean-issue-v1"
-        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+        changed["final_terminal_selection"]["evidence"]["grammar_branch"] = (
+            "clean-issue-v1"
+        )
+        self.assertFalse(
+            self._validator_with_complete_snapshot(changed).validate(report)
+        )
 
     def test_v2_short_head_requires_scope_bound_stable_resolution(self) -> None:
         record = copy.deepcopy(self.grammar["bases"]["clean_issue"])
@@ -5310,7 +5389,9 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         record["body"] = (
             "Codex Review: Didn't find any major issues.\n\n"
             f"**Reviewed commit:** `{short}`\n\n"
-            + "\n".join(self.grammar["branches"]["clean_issue_v2"]["required_disclosure_lines"])
+            + "\n".join(
+                self.grammar["branches"]["clean_issue_v2"]["required_disclosure_lines"]
+            )
         )
         record["commit_resolution"] = {
             "repository": record["scope"]["repository"],
@@ -5329,13 +5410,19 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             changed = copy.deepcopy(record)
             changed["commit_resolution"][field] = value
             with self.subTest(field=field):
-                self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
+                self.assertEqual(
+                    self.classifier.classify(changed)["classification"], "malformed"
+                )
         changed = copy.deepcopy(record)
         changed["commit_resolution"] = None
-        self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
+        self.assertEqual(
+            self.classifier.classify(changed)["classification"], "malformed"
+        )
         changed = copy.deepcopy(record)
         changed["body"] += "\n" + "\n".join(self.grammar["disclosure_lines"])
-        self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
+        self.assertEqual(
+            self.classifier.classify(changed)["classification"], "malformed"
+        )
 
     def test_fixture_matrix_matches_the_reference_classifier(self) -> None:
         fixtures = self.grammar["fixtures"]
