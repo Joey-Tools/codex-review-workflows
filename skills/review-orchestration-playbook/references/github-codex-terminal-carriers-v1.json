@@ -88,6 +88,7 @@
   "terminal_commit_binding": {
     "hashless_branches": [],
     "clean_issue_v1": "reviewed-commit marker",
+    "clean_issue_v2": "reviewed-commit marker",
     "clean_review_v1": "native review commit_id",
     "top_level_finding_v1": "finding blob URL, native review commit_id when applicable, and complete ancestor projection for a non-head commit",
     "inline_parent_v1": "native parent, child commit_id, child original_commit_id, exact child thread join, and complete ancestor projection for a non-head commit"

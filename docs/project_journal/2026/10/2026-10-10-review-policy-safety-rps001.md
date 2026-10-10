@@ -18,6 +18,9 @@ Request preflight reads the complete exact-head request set and retained
 transport evidence under one mutation owner. A visible request is reused.
 Only independently proved non-delivery leaves an unused POST budget; empty
 GET, timeout, EOF or lost response never supplies that proof.
+Stable repository/PR/head scope is a prerequisite before request reuse or
+transport decisions. The explicit scope dimension makes the decision rows
+exclusive; changed or unverified scope cannot bind a visible old-epoch request.
 
 The named `clean-issue-v2` branch accepts only the exact observed official
 disclosure. Existing v1 presentation and disclosure remain unchanged.
@@ -27,15 +30,20 @@ remain mandatory. Generic, partial and mixed disclosure prose fails closed.
 The authoritative terminal union and channel binding include v2 explicitly;
 semantic regressions compare those definitions with the JSON contract and
 reference consumer, including rejected cross-channel and unknown branches.
+Every terminal branch has an explicit commit-binding entry; v2 uses the same
+reviewed-commit marker rule as v1 without undocumented dispatch inheritance.
 
 ## Validation
 
-Python 3.13.0 passed 66 GitHub carrier/recovery tests and 43 repository
+Python 3.13.0 passed 68 GitHub carrier/recovery tests and 43 repository
 contracts, with one private-layout-only skip. Selected Ruff, skill validation,
 whitespace and source-only checks passed. These are contract/reference-consumer
 checks, not production Actions or remote reviewer pass evidence.
 The two new authority-consistency tests first failed against the omitted v2
 definitions and passed after the definitions were aligned.
+The commit-binding coverage and scope-row regressions also failed before their
+fixes; the scope decision matrix checks all 18 scope/request/transport states
+for exactly one matching row.
 
 ## Boundary
 

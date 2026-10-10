@@ -5269,6 +5269,19 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             self.assertIn(anchor, authority)
         self.assertNotIn("artifact_commit: 40-lowercase-hex-or-null", authority)
 
+    def test_every_terminal_branch_has_explicit_commit_binding(self) -> None:
+        bindings = self.grammar["terminal_commit_binding"]
+        self.assertEqual(
+            set(bindings) - {"hashless_branches"}, set(self.grammar["branches"])
+        )
+        for branch in self.grammar["branches"]:
+            with self.subTest(branch=branch):
+                self.assertIsInstance(bindings[branch], str)
+                self.assertTrue(bindings[branch].strip())
+        self.assertEqual(bindings["clean_issue_v1"], "reviewed-commit marker")
+        self.assertEqual(bindings["clean_issue_v2"], bindings["clean_issue_v1"])
+        self.assertEqual(bindings["hashless_branches"], [])
+
     def test_authority_terminal_clean_union_matches_json_contract(self) -> None:
         authority = AUTHORITY_PATH.read_text(encoding="utf-8")
         declarations = re.findall(

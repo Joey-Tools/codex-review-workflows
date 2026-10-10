@@ -186,13 +186,23 @@ repository/PR/head and enumerate the complete visible exact-request set under
 one parent mutation owner. Combine that read with the retained transport
 outcome; absence from GitHub alone is not proof of non-delivery.
 
-| Visible exact request | Retained transport evidence | Decision |
-| --- | --- | --- |
-| Present | Any | Bind and observe the existing request; do not POST. |
-| Absent | Independently proved not sent | The unused write budget permits the same logical request, after scope and authorization revalidation. |
-| Absent | Possibly sent or unknown | Read-only observation; do not POST. |
-| Incomplete or unreadable | Any | Acquisition is inconclusive; do not POST. |
-| Any | Changed head or identity | Stop this decision and freeze the new scope; never transfer the old request identity. |
+Scope stability is a prerequisite, not retained transport evidence. Prove the
+canonical repository identity, exact PR and feature head unchanged across the
+complete initial/final acquisition before binding any visible request or using
+transport evidence. A visible request cannot supply that proof. A changed scope
+stops the old decision even when a request is present; freeze the new scope and
+acquire its own request set and epoch ledger without transferring old request
+identities or delivery evidence. An unreadable or unproved scope is inconclusive,
+not unchanged. The scope column makes the rows mutually exclusive.
+
+| Scope | Visible exact request | Retained transport evidence | Decision |
+| --- | --- | --- | --- |
+| Changed | Any | Any | Stop this decision and freeze the new scope; never transfer the old request identity. |
+| Unverified | Any | Any | Acquisition is inconclusive; do not POST or bind a request. |
+| Unchanged | Present | Any | Bind and observe the existing request; do not POST. |
+| Unchanged | Absent | Independently proved not sent | The unused write budget permits the same logical request, after scope and authorization revalidation. |
+| Unchanged | Absent | Possibly sent or unknown | Read-only observation; do not POST. |
+| Unchanged | Incomplete or unreadable | Any | Acquisition is inconclusive; do not POST. |
 
 A transport proof of `not sent` must establish failure before any request byte
 could reach GitHub (for example, a local auth/preparation failure before the
