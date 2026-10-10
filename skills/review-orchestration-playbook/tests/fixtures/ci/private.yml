@@ -357,8 +357,8 @@ jobs:
           python-version: "3.x"
       - name: Run platform reconciliation safety tests (Python 3.x)
         if: ${{ always() && steps.setup_latest_python.outcome == 'success' }}
-        timeout-minutes: 2
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+        timeout-minutes: 10
+        run: python3 -m unittest -v tests.test_personal_sync_reconciliation_safety
       - name: Require hosted-runner byte reproduction
         if: always()
         timeout-minutes: 2
