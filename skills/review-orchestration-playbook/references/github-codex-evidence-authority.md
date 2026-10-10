@@ -542,11 +542,27 @@ The same consumer resource's `required_report_schema` and `report_fixtures`
 are the executable, closed, basis-discriminated report contract. They reject
 cross-variant field combinations rather than relying on YAML examples alone.
 
+The version-1 record/report envelope contains an additive, explicitly named
+`clean_issue_v2` / `clean-issue-v2` branch for the observed official team-settings
+disclosure. It reuses only v1 presentation and commit binding and requires its
+own exact closed disclosure lines; disclosure-free or legacy disclosure carriers
+remain v1. Unknown URLs, missing or extra nonblank prose, and mixed disclosures
+remain malformed. A consumer release must pin the resource bytes and implement
+both named branches before accepting v2; old consumers fail closed rather than
+silently reinterpreting their v1 branch. This is not a generic prose parser.
+
 The resource is deliberately a consumer contract. It does not define, validate,
 or authorize a GitHub Action, status producer, workflow name, check conclusion,
 or ruleset. Those producer integrations belong to their separately reviewed
 workstream and can supply a preferred basis only through the association rules
 above.
+
+Before considering a comment transport retry, apply the
+[read-only request preflight](github-pr-probes.md#read-only-request-preflight).
+An existing exact request is reused; only independent proof that the HTTP
+request was not sent preserves the unused write budget. An absent or delayed
+GET result cannot prove non-delivery. Every possibly sent attempt still consumes
+the epoch budget.
 
 ## Terminal Results
 

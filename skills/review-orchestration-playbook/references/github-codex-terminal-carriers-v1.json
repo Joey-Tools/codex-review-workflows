@@ -161,6 +161,21 @@
       ],
       "optional_disclosure": "two LF, nonblank first line, then disclosure_lines after per-line trim and blank-line removal"
     },
+    "clean_issue_v2": {
+      "presentation": "clean_issue_v1",
+      "required_disclosure": "two LF, nonblank first line, then required_disclosure_lines after per-line trim and blank-line removal",
+      "required_disclosure_lines": [
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+        "<br/>",
+        "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+        "- Open a pull request for review",
+        "- Mark a draft as ready",
+        "- Comment \"@codex review\".",
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+        "Codex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".",
+        "</details>"
+      ]
+    },
     "clean_review_v1": {
       "state": "APPROVED",
       "body": "No findings.",
@@ -998,9 +1013,10 @@
         "evidence_kind": "terminal-artifact",
         "branches": [
           "clean-issue-v1",
+          "clean-issue-v2",
           "clean-review-v1"
         ],
-        "channel_branch_binding": "issue-comment exactly clean-issue-v1; review exactly clean-review-v1",
+        "channel_branch_binding": "issue-comment exactly clean-issue-v1 or clean-issue-v2; review exactly clean-review-v1",
         "stable_identity": "positive evidence ID and exact HTTPS github.com selected-repository /pull/<selected-PR> URL whose fragment is issuecomment-<evidence-ID> for issue-comment or pullrequestreview-<evidence-ID> for review",
         "parent_scope_binding": "report repository, pull request, and head equal a separate closed parent-owned selected-pr scope input",
         "parent_identity_input": "separate closed parent-owned terminal identity whose kind, evidence ID, URL, and channel equal the report evidence",
@@ -2971,6 +2987,122 @@
     }
   },
   "fixtures": [
+    {
+      "id": "clean-issue-v2-positive",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>"
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v2",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-blank-and-indent",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n  <details> <summary>ℹ️ About Codex in GitHub</summary>  \n\n  <br/>  \n\n  [Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you  \n\n  - Open a pull request for review  \n\n  - Mark a draft as ready  \n\n  - Comment \"@codex review\".  \n\n  If Codex has suggestions, it will comment; otherwise it will react with 👍.  \n\n  Codex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".  \n\n  </details>  "
+      },
+      "expected": {
+        "classification": "clean",
+        "branch": "clean-issue-v2",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-wrong-settings-url",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://example.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-extra-prose",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>\nEverything looks safe."
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-missing-line",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n</details>"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-appended-finding",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>\n[P1] Unresolved issue"
+      },
+      "expected": {
+        "classification": "malformed",
+        "branch": null,
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-stale-head",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `ffffffffffffffffffffffffffffffffffffffff`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>"
+      },
+      "expected": {
+        "classification": "stale",
+        "branch": "clean-issue-v2",
+        "semantic_time_field": "created_at",
+        "semantic_time": "2026-08-23T09:00:00Z",
+        "unresolved_findings": 0
+      }
+    },
+    {
+      "id": "clean-issue-v2-wrong-provider",
+      "base": "clean_issue",
+      "patch": {
+        "body": "Codex Review: Didn't find any major issues. Can't wait for the next one!\n\n**Reviewed commit:** `0123456789abcdef0123456789abcdef01234567`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n</details>",
+        "user": {
+          "login": "another-bot[bot]",
+          "type": "Bot"
+        }
+      },
+      "expected": {
+        "classification": "irrelevant",
+        "branch": null,
+        "semantic_time_field": null,
+        "semantic_time": null,
+        "unresolved_findings": 0
+      }
+    },
     {
       "id": "clean-issue-positive",
       "base": "clean_issue",

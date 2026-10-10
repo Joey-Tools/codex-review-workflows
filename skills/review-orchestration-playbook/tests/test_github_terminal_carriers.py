@@ -665,6 +665,7 @@ class _ReferenceClassifier:
         self, record: dict[str, object], carrier: str, semantic: tuple[str, str]
     ) -> dict[str, object]:
         branch = self.branches["clean_issue_v1"]
+        result_branch = "clean-issue-v1"
         first, separator, rest = carrier.partition("\n")
         blank, second_separator, tail = rest.partition("\n")
         marker_line, suffix_separator, suffix = tail.partition("\n")
@@ -693,7 +694,10 @@ class _ReferenceClassifier:
                 line.strip() for line in disclosure.split("\n") if line.strip()
             )
             if normalized_disclosure != tuple(self.grammar["disclosure_lines"]):
-                return self._result("malformed", None, semantic)
+                v2 = self.branches["clean_issue_v2"]
+                if normalized_disclosure != tuple(v2["required_disclosure_lines"]):
+                    return self._result("malformed", None, semantic)
+                result_branch = "clean-issue-v2"
         commit_ref = marker.group(1)
         head = record["scope"]["head_sha"]
         resolution = record["commit_resolution"]
@@ -701,7 +705,7 @@ class _ReferenceClassifier:
             if resolution is not None:
                 return self._result("malformed", None, semantic)
             if commit_ref != head:
-                return self._result("stale", "clean-issue-v1", semantic)
+                return self._result("stale", result_branch, semantic)
         else:
             if not self._closed(resolution, "commit_resolution"):
                 return self._result("malformed", None, semantic)
@@ -715,7 +719,7 @@ class _ReferenceClassifier:
                 or not head.startswith(commit_ref)
             ):
                 return self._result("malformed", None, semantic)
-        return self._result("clean", "clean-issue-v1", semantic)
+        return self._result("clean", result_branch, semantic)
 
     def _review(
         self, record: dict[str, object], body: str, semantic: tuple[str, str]
@@ -1193,12 +1197,13 @@ class _ReportValidator:
         if not self._terminal_evidence(report, evidence):
             return False
         branch_by_channel = {
-            "issue-comment": "clean-issue-v1",
-            "review": "clean-review-v1",
+            "issue-comment": {"clean-issue-v1", "clean-issue-v2"},
+            "review": {"clean-review-v1"},
         }
-        return evidence["grammar_branch"] == branch_by_channel.get(
-            evidence["channel"]
-        ) and self._clean_evidence_url_matches_scope(report, evidence)
+        return (
+            evidence["grammar_branch"] in branch_by_channel.get(evidence["channel"], set())
+            and self._clean_evidence_url_matches_scope(report, evidence)
+        )
 
     def _direct_positive_scope_matches(self, report: dict[str, object]) -> bool:
         parent_scope = self.direct_positive_parent_scope
@@ -3091,7 +3096,7 @@ class _ReportValidator:
                 classified = self.reference_classifier.classify(candidate)
                 if (
                     classified["classification"] == "clean"
-                    and classified["branch"] == "clean-issue-v1"
+                    and classified["branch"] in {"clean-issue-v1", "clean-issue-v2"}
                     and not self._issue_resolution_matches_range(
                         candidate, expected_scope
                     )
@@ -4760,6 +4765,7 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
             set(self.grammar["branches"]),
             {
                 "clean_issue_v1",
+                "clean_issue_v2",
                 "clean_review_v1",
                 "top_level_finding_v1",
                 "inline_parent_v1",
@@ -5263,6 +5269,73 @@ class GitHubTerminalCarrierContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, authority)
         self.assertNotIn("artifact_commit: 40-lowercase-hex-or-null", authority)
+
+    def test_v2_clean_report_keeps_complete_scope_and_finding_guards(self) -> None:
+        report = copy.deepcopy(self.grammar["report_bases"]["terminal_clean"])
+        report["evidence"]["grammar_branch"] = "clean-issue-v2"
+        snapshot = copy.deepcopy(self.clean_complete_pr_parent_snapshot)
+        for phase in ("initial", "final"):
+            snapshot[f"{phase}_terminal_selection"]["evidence"] = copy.deepcopy(
+                report["evidence"]
+            )
+            snapshot[f"{phase}_basis_selection"]["terminal_evidence"] = copy.deepcopy(
+                report["evidence"]
+            )
+        self.assertTrue(self._validator_with_complete_snapshot(snapshot).validate(report))
+        for field, value in (
+            ("unresolved_provider_findings", 1),
+            ("status", "incomplete"),
+            ("final_snapshot_sha256", "f" * 64),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed[field] = value
+            with self.subTest(field=field):
+                self.assertFalse(
+                    self._validator_with_complete_snapshot(changed).validate(report)
+                )
+        changed = copy.deepcopy(snapshot)
+        changed["final_scope"]["head_sha"] = "f" * 40
+        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+        changed = copy.deepcopy(snapshot)
+        changed["final_page_inventory"]["review_threads_pages_complete"] = False
+        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+        changed = copy.deepcopy(snapshot)
+        changed["final_terminal_selection"]["evidence"]["grammar_branch"] = "clean-issue-v1"
+        self.assertFalse(self._validator_with_complete_snapshot(changed).validate(report))
+
+    def test_v2_short_head_requires_scope_bound_stable_resolution(self) -> None:
+        record = copy.deepcopy(self.grammar["bases"]["clean_issue"])
+        head = record["scope"]["head_sha"]
+        short = head[:10]
+        record["body"] = (
+            "Codex Review: Didn't find any major issues.\n\n"
+            f"**Reviewed commit:** `{short}`\n\n"
+            + "\n".join(self.grammar["branches"]["clean_issue_v2"]["required_disclosure_lines"])
+        )
+        record["commit_resolution"] = {
+            "repository": record["scope"]["repository"],
+            "commit_ref": short,
+            "initial_resolved_commit": head,
+            "final_resolved_commit": head,
+        }
+        self.assertEqual(self.classifier.classify(record)["branch"], "clean-issue-v2")
+        self.assertEqual(self.classifier.classify(record)["classification"], "clean")
+        for field, value in (
+            ("repository", "other/review-fixture"),
+            ("commit_ref", "f" * 10),
+            ("initial_resolved_commit", "f" * 40),
+            ("final_resolved_commit", "f" * 40),
+        ):
+            changed = copy.deepcopy(record)
+            changed["commit_resolution"][field] = value
+            with self.subTest(field=field):
+                self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
+        changed = copy.deepcopy(record)
+        changed["commit_resolution"] = None
+        self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
+        changed = copy.deepcopy(record)
+        changed["body"] += "\n" + "\n".join(self.grammar["disclosure_lines"])
+        self.assertEqual(self.classifier.classify(changed)["classification"], "malformed")
 
     def test_fixture_matrix_matches_the_reference_classifier(self) -> None:
         fixtures = self.grammar["fixtures"]

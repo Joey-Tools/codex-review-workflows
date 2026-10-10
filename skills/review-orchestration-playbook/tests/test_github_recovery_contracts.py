@@ -4772,6 +4772,50 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         self.assertIn("never extends to comment creation", combined)
         self.assertNotIn("before every repetition", combined)
 
+    def test_request_preflight_preserves_non_delivery_proof_boundary(self) -> None:
+        preflight = self.probes.split("### Read-Only Request Preflight", 1)[1].split(
+            "Define one comment-mutation epoch", 1
+        )[0]
+        rows = [
+            tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+            for line in preflight.splitlines()
+            if line.startswith("| ")
+        ]
+        self.assertEqual(
+            rows[2:],
+            [
+                ("Present", "Any", "Bind and observe the existing request; do not POST."),
+                (
+                    "Absent",
+                    "Independently proved not sent",
+                    "The unused write budget permits the same logical request, after scope and authorization revalidation.",
+                ),
+                ("Absent", "Possibly sent or unknown", "Read-only observation; do not POST."),
+                (
+                    "Incomplete or unreadable",
+                    "Any",
+                    "Acquisition is inconclusive; do not POST.",
+                ),
+                (
+                    "Any",
+                    "Changed head or identity",
+                    "Stop this decision and freeze the new scope; never transfer the old request identity.",
+                ),
+            ],
+        )
+        normalized = _normalize(preflight)
+        for anchor in (
+            "complete visible exact-request set",
+            "one parent mutation owner",
+            "absence from github alone is not proof of non-delivery",
+            "failure before any request byte could reach github",
+            "timeout, eof, lost response, or empty successful get",
+            "does not establish that property",
+            "not a new idempotency contract, second logical review, or extra mutation authorization",
+        ):
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, normalized)
+
     def test_retry_schedule_cannot_repeat_comment_creation(self) -> None:
         request = self.probes.split("## Request The Review", 1)[1].split(
             "## Discover Related Checks Dynamically", 1

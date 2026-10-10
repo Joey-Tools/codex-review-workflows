@@ -179,6 +179,29 @@ Post the exact body:
 @codex review
 ```
 
+### Read-Only Request Preflight
+
+Before a first request or any proposed transport retry, revalidate the exact
+repository/PR/head and enumerate the complete visible exact-request set under
+one parent mutation owner. Combine that read with the retained transport
+outcome; absence from GitHub alone is not proof of non-delivery.
+
+| Visible exact request | Retained transport evidence | Decision |
+| --- | --- | --- |
+| Present | Any | Bind and observe the existing request; do not POST. |
+| Absent | Independently proved not sent | The unused write budget permits the same logical request, after scope and authorization revalidation. |
+| Absent | Possibly sent or unknown | Read-only observation; do not POST. |
+| Incomplete or unreadable | Any | Acquisition is inconclusive; do not POST. |
+| Any | Changed head or identity | Stop this decision and freeze the new scope; never transfer the old request identity. |
+
+A transport proof of `not sent` must establish failure before any request byte
+could reach GitHub (for example, a local auth/preparation failure before the
+HTTP action was invoked). For a first request, the single owner's retained
+epoch ledger must show that no create-comment HTTP action was invoked; an empty
+GET alone is still insufficient. A timeout, EOF, lost response, or empty successful GET
+does not establish that property. This preflight is a decision step, not a new
+idempotency contract, second logical review, or extra mutation authorization.
+
 Define one comment-mutation epoch by the canonical repository identity, exact PR, and feature
 head. In each epoch, permit at most one possibly delivered create-comment
 POST. Before that POST, reread the unchanged PR head and completely enumerate
