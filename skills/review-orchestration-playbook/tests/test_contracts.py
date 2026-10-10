@@ -191,7 +191,15 @@ class RepositoryContractTest(unittest.TestCase):
     def test_private_reconciliation_step_has_bounded_budget_and_progress(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         job = _workflow_job_blocks(workflow)["independent_supervisor_tests"]
-        self.assertIn("\n    timeout-minutes: 20\n", job)
+        job_budgets = re.findall(r"(?m)^    timeout-minutes: ([0-9]+)$", job)
+        step_budgets = re.findall(r"(?m)^        timeout-minutes: ([0-9]+)$", job)
+        self.assertEqual(job_budgets, ["30"])
+        self.assertEqual(step_budgets, ["10", "2", "10", "2"])
+        # Reserve five minutes beyond all declared step caps for bootstrap
+        # and source-only final validation, even after earlier step timeouts.
+        self.assertGreaterEqual(
+            int(job_budgets[0]), sum(map(int, step_budgets)) + 5
+        )
         steps = re.findall(
             r"(?ms)^      - name: Run platform reconciliation safety tests "
             r"\(Python 3\.x\)\n(?P<body>.*?)(?=^      - |\Z)",

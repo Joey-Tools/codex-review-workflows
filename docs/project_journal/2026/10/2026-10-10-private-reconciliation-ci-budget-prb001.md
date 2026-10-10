@@ -15,11 +15,20 @@ superseded_by:
 ## Outcome
 
 The canonical private CI fixture gives the complete latest-Python reconciliation
-safety module a ten-minute step budget and verbose per-test progress. The
-twenty-minute parent job cap, all test cases, the independent supervisor,
+safety module a ten-minute step budget and verbose per-test progress. All
+test cases, the independent supervisor,
 hosted-runner fail-closed check, byte reproduction, and required aggregate remain
 unchanged. A regression contract preserves the bounded step, setup-success
 condition, full module invocation, and progress output.
+
+The parent cap is increased from twenty to thirty minutes: the declared step
+caps total 24 minutes (supervisor10, latest-Python setup2, reconciliation10,
+byte reproduction2), leaving six minutes for bootstrap and final validation.
+The regression asserts at least five minutes beyond that sum. This addresses
+PR133 finding `4235575634`, which correctly identified that retaining a
+twenty-minute cap could cancel the later failure-independent checks after a
+slow or timed-out earlier step. The reserve is finite headroom, not a guarantee
+against arbitrary hangs in otherwise uncapped bootstrap operations.
 
 ## Evidence and Decision
 
@@ -51,6 +60,13 @@ one private-layout-only skip, bounded supervisor exit zero and no incomplete
 result (log SHA-256
 `ecc7a78a5b8a4fa6bbbc30e85d05f5fbead0536c97bfea83ac28ede2b47fe06c`).
 Skill validation, journal validation, and whitespace checks also passed.
+
+After the valid reserve finding, the complete 43-test contract module passed
+again in 3.308 seconds with the revised job budget and explicit sum/reserve
+assertion (log SHA-256
+`a83e225f3aed48f9ac07e90dc70a31e3d95f5ebe99d798f08ce7d99c84636a84`); one
+private-layout-only case remained skipped. The original native module timing
+is unchanged-runtime evidence, not a claim that the hosted successor CI passed.
 
 This focused source fix does not claim PR221 review, merge, release, installation,
 or PR190 cleanup is complete. Those outcomes retain their own exact-head gates.
