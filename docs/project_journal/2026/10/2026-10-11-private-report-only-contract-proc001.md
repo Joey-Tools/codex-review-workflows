@@ -15,28 +15,37 @@ superseded_by:
 ## Outcome
 
 The report-only contract test inspects a closed noun list governed by the
-negative verb in the exact bare named-review AGENTS rule. It requires branch
-creation, commits, push, PR creation/update, and merge to remain prohibited
-without requiring the canonical sentence's exact conjunctions. Unrecognised
-list entries, additional verbs, exceptions, and conditional grants fail closed.
-The private policy's additional
-mutation, metadata, Actions, and transport restrictions remain unchanged.
+negative verb in the unique bare named-review AGENTS rule. The permitted prefix
+and complete suffix must match the selected layout's declared policy;
+truncating at punctuation cannot hide an added grant. The private suffix is
+read as literal bytes from its producer declaration using AST, without executing
+the producer or copying its long policy into this suite.
+
+The canonical profile requires five prohibitions. The private profile separately
+requires branch mutation, metadata changes, Actions reruns, dispatch,
+reconciliation and unrelated mutation as well. Composite entries retain each
+operation instead of collapsing private restrictions to canonical aliases.
+Unrecognised entries, added predicates, exceptions and conditional grants fail
+closed. Denial-list conjunctions may differ; runtime policy is unchanged.
 
 A regression accepts both canonical and private wording. Removing any one of
 the five operations from either denial remains detectable even when a later,
 unrelated rule mentions that operation. Twenty adversarial grants and
 exceptions also remain rejected; they reproduced the review finding before
-the correction. No existing test method is removed.
+the correction. Fifteen prefix/suffix grants and the lost private composite
+denials also reproduced failure before the subsequent correction. Private
+operation omissions and a canonical-only list cannot satisfy the private
+expected set. No existing test method is removed.
 Production controls, generated private policy, CI, and authorization rules
 are unchanged.
 
 ## Validation
 
-Python 3.13.0 passed 135 relevant canonical contract, carrier, recovery,
+Python 3.13.0 passed 137 relevant canonical contract, carrier, recovery,
 local-lane, and trusted-manifest tests (one private-layout-only skip).
 The stock private text replacement function was independently checked against
 the existing generated test, then used in memory to project this successor.
-All 49 repository contracts passed against the real private layout, including
+All 51 repository contracts passed against the real private layout, including
 its CI matrix; no generated file was edited for this proof.
 Selected Ruff, skill metadata, journal frontmatter, and whitespace checks pass.
 These results do not claim remote review, platform CI, or private release

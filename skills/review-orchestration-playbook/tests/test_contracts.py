@@ -74,36 +74,84 @@ def _normalize(value: str) -> str:
     return " ".join(value.split()).lower()
 
 
-def _report_only_denials(agents: str) -> frozenset[str]:
-    rule = next(
-        line for line in agents.splitlines()
-        if line.startswith("- A bare named-review request is report-only")
-    )
-    denial = _normalize(rule).split("does not authorize", 1)[1]
-    denial = re.split(r"[.;]", denial, maxsplit=1)[0]
+REPORT_ONLY_DENIALS_BY_PROFILE = {
+    "canonical": frozenset(("branch creation", "commits", "push", "pr creation/update", "merge")),
+    "private": frozenset((
+        "branch creation", "branch mutation", "commits", "push", "pr creation/update",
+        "metadata changes", "merge", "any github actions rerun", "dispatch",
+        "reconciliation", "unrelated mutation",
+    )),
+}
+CANONICAL_REPORT_ONLY_RULE = (
+    "- A bare named-review request is report-only. It does not authorize "
+    "branch creation, commits, push, PR creation/update, or merge; "
+    "exact `@codex review` on an already-existing eligible PR is the "
+    "only mutation implied by bare triple."
+)
+
+
+def _report_only_rule(agents: str) -> str:
+    rules = [line for line in agents.splitlines()
+             if line.startswith("- A bare named-review request is report-only")]
+    return rules[0] if len(rules) == 1 else ""
+
+
+def _expected_report_only_rule() -> str:
+    if CI_PROFILE == "canonical":
+        return CANONICAL_REPORT_ONLY_RULE
+    # Reuse the private producer's declared policy, without importing or running it.
+    # Do not duplicate its long retry/Actions suffix in the canonical test suite.
+    tree = ast.parse((REPO_ROOT / "scripts/sync_private_overlay_sources.py").read_text())
+    declarations = [
+        node for node in tree.body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name)
+                and target.id == "PERSONAL_AGENTS_CURRENT_REVIEW_BLOCK"
+                for target in node.targets)
+    ]
+    if len(declarations) != 1:
+        raise AssertionError("private report-only policy declaration is ambiguous")
+    block = ast.literal_eval(declarations[0].value)
+    if not isinstance(block, bytes):
+        raise AssertionError("private report-only policy declaration is not literal bytes")
+    rule = _report_only_rule(block.decode("utf-8"))
+    if not rule:
+        raise AssertionError("private producer lacks one report-only policy rule")
+    return rule
+
+
+def _report_only_denials(agents: str, expected_rule: str = CANONICAL_REPORT_ONLY_RULE) -> frozenset[str]:
+    rule = _report_only_rule(agents)
+    parts = _normalize(rule).partition("does not authorize")
+    expected = _normalize(expected_rule).partition("does not authorize")
+    if not parts[1] or not expected[1] or parts[0] != expected[0]:
+        return frozenset()
+    denial = re.split(r"([.;])", parts[2], maxsplit=1)
+    template = re.split(r"([.;])", expected[2], maxsplit=1)
+    if len(denial) != 3 or len(template) != 3 or denial[1:] != template[1:]:
+        return frozenset()
     # Accept only noun-list entries governed by the single negative verb.
     # Additional verbs, exceptions, and conditional grants fail closed.
     allowed = {
-        "branch creation": "branch creation",
-        "branch creation or mutation": "branch creation",
-        "commits": "commits",
-        "push": "push",
-        "pr creation/update": "pr creation/update",
-        "pr creation/update or metadata changes": "pr creation/update",
-        "merge": "merge",
-        "any rerun": "any rerun",
-        "any github actions rerun": "any github actions rerun",
-        "dispatch": "dispatch",
-        "reconciliation": "reconciliation",
-        "unrelated mutation": "unrelated mutation",
+        "branch creation": {"branch creation"},
+        "branch creation or mutation": {"branch creation", "branch mutation"},
+        "commits": {"commits"},
+        "push": {"push"},
+        "pr creation/update": {"pr creation/update"},
+        "pr creation/update or metadata changes": {"pr creation/update", "metadata changes"},
+        "merge": {"merge"},
+        "any rerun": {"any github actions rerun"},
+        "any github actions rerun": {"any github actions rerun"},
+        "dispatch": {"dispatch"},
+        "reconciliation": {"reconciliation"},
+        "unrelated mutation": {"unrelated mutation"},
     }
     items = [
         re.sub(r"^(?:or|and) ", "", item.strip())
-        for item in denial.split(",")
+        for item in denial[0].split(",")
     ]
     if any(item not in allowed for item in items):
         return frozenset()
-    return frozenset(allowed[item] for item in items)
+    return frozenset(operation for item in items for operation in allowed[item])
 
 
 def _active_policy_paths() -> tuple[pathlib.Path, ...]:
@@ -722,9 +770,8 @@ class RepositoryContractTest(unittest.TestCase):
         combined = _normalize("\n".join((agents, skill_raw, readiness, contracts)))
 
         self.assertIn("a bare named-review request is report-only", combined)
-        denials = _report_only_denials(agents)
-        for operation in ("branch creation", "commits", "push", "pr creation/update", "merge"):
-            self.assertIn(operation, denials)
+        denials = _report_only_denials(agents, _expected_report_only_rule())
+        self.assertEqual(REPORT_ONLY_DENIALS_BY_PROFILE[CI_PROFILE], denials)
         self.assertIn("references/egress-consent.md", skill_raw)
         self.assertIn("base_sha = pr_merge_base", combined)
         self.assertIn("head_sha = head_ref_oid", combined)
@@ -752,10 +799,10 @@ class RepositoryContractTest(unittest.TestCase):
         for statement in statements:
             for operation in operations:
                 with self.subTest(statement=statement, operation=operation):
-                    self.assertIn(operation, _report_only_denials(statement))
+                    self.assertIn(operation, _report_only_denials(statement, statement))
                     missing = re.sub(re.escape(operation), "omitted", statement, flags=re.I)
                     missing += "\n- Another rule does not authorize " + operation + "."
-                    self.assertNotIn(operation, _report_only_denials(missing))
+                    self.assertNotIn(operation, _report_only_denials(missing, statement))
 
     def test_report_only_denials_reject_reauthorization_inside_the_list(self) -> None:
         operations = ("branch creation", "commits", "push", "pr creation/update", "merge")
@@ -767,12 +814,57 @@ class RepositoryContractTest(unittest.TestCase):
                 operation + " when requested",
             ):
                 with self.subTest(operation=operation, grant=grant):
-                    policy = (
-                        "- A bare named-review request is report-only and does not authorize "
-                        + ", ".join(item for item in operations if item != operation)
-                        + ", " + grant + "."
-                    )
+                    prefix, _, rest = CANONICAL_REPORT_ONLY_RULE.partition("does not authorize")
+                    suffix = ";" + rest.split(";", 1)[1]
+                    policy = prefix + "does not authorize " + ", ".join(
+                        item for item in operations if item != operation
+                    ) + ", " + grant + suffix
                     self.assertNotIn(operation, _report_only_denials(policy))
+
+    def test_report_only_denials_reject_grants_outside_the_list(self) -> None:
+        rule = (
+            "- A bare named-review request is report-only. It does not authorize "
+            "branch creation, commits, push, PR creation/update, or merge; "
+            "exact `@codex review` on an already-existing eligible PR is the "
+            "only mutation implied by bare triple."
+        )
+        for operation in ("branch creation", "commits", "push", "pr creation/update", "merge"):
+            for changed in (
+                rule + "; " + operation + " is also authorized",
+                rule + " The request does authorize " + operation + ".",
+                rule.replace("It does not authorize", operation + " is allowed. It does not authorize"),
+            ):
+                with self.subTest(operation=operation, changed=changed):
+                    self.assertFalse(_report_only_denials(changed))
+
+    def test_report_only_denials_preserve_private_operations(self) -> None:
+        rule = (
+            "- A bare named-review request is report-only and does not authorize "
+            "branch creation or mutation, commits, push, PR creation/update or "
+            "metadata changes, merge, any GitHub Actions rerun, dispatch, or "
+            "reconciliation, or unrelated mutation. Bare triple has a narrow exception."
+        )
+        expected = {
+            "branch creation", "branch mutation", "commits", "push", "pr creation/update",
+            "metadata changes", "merge", "any github actions rerun", "dispatch",
+            "reconciliation", "unrelated mutation",
+        }
+        self.assertEqual(expected, REPORT_ONLY_DENIALS_BY_PROFILE["private"])
+        self.assertEqual(expected, _report_only_denials(rule, rule))
+        for removed in (
+            " or mutation", " or metadata changes", ", any GitHub Actions rerun",
+            ", dispatch", ", or reconciliation", ", or unrelated mutation",
+        ):
+            with self.subTest(removed=removed):
+                self.assertNotEqual(expected, _report_only_denials(rule.replace(removed, ""), rule))
+        self.assertNotEqual(expected, _report_only_denials(CANONICAL_REPORT_ONLY_RULE))
+        for changed in (
+            rule + "; merge is also authorized",
+            rule + " The request authorizes commits.",
+            rule.replace("and does not authorize", "and permits push but does not authorize"),
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(_report_only_denials(changed, rule))
 
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
