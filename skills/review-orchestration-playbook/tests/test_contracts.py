@@ -74,13 +74,36 @@ def _normalize(value: str) -> str:
     return " ".join(value.split()).lower()
 
 
-def _report_only_denials(agents: str) -> str:
+def _report_only_denials(agents: str) -> frozenset[str]:
     rule = next(
         line for line in agents.splitlines()
         if line.startswith("- A bare named-review request is report-only")
     )
     denial = _normalize(rule).split("does not authorize", 1)[1]
-    return re.split(r"[.;]", denial, maxsplit=1)[0]
+    denial = re.split(r"[.;]", denial, maxsplit=1)[0]
+    # Accept only noun-list entries governed by the single negative verb.
+    # Additional verbs, exceptions, and conditional grants fail closed.
+    allowed = {
+        "branch creation": "branch creation",
+        "branch creation or mutation": "branch creation",
+        "commits": "commits",
+        "push": "push",
+        "pr creation/update": "pr creation/update",
+        "pr creation/update or metadata changes": "pr creation/update",
+        "merge": "merge",
+        "any rerun": "any rerun",
+        "any github actions rerun": "any github actions rerun",
+        "dispatch": "dispatch",
+        "reconciliation": "reconciliation",
+        "unrelated mutation": "unrelated mutation",
+    }
+    items = [
+        re.sub(r"^(?:or|and) ", "", item.strip())
+        for item in denial.split(",")
+    ]
+    if any(item not in allowed for item in items):
+        return frozenset()
+    return frozenset(allowed[item] for item in items)
 
 
 def _active_policy_paths() -> tuple[pathlib.Path, ...]:
@@ -733,6 +756,23 @@ class RepositoryContractTest(unittest.TestCase):
                     missing = re.sub(re.escape(operation), "omitted", statement, flags=re.I)
                     missing += "\n- Another rule does not authorize " + operation + "."
                     self.assertNotIn(operation, _report_only_denials(missing))
+
+    def test_report_only_denials_reject_reauthorization_inside_the_list(self) -> None:
+        operations = ("branch creation", "commits", "push", "pr creation/update", "merge")
+        for operation in operations:
+            for grant in (
+                "but does authorize " + operation,
+                operation + " is allowed",
+                "except " + operation,
+                operation + " when requested",
+            ):
+                with self.subTest(operation=operation, grant=grant):
+                    policy = (
+                        "- A bare named-review request is report-only and does not authorize "
+                        + ", ".join(item for item in operations if item != operation)
+                        + ", " + grant + "."
+                    )
+                    self.assertNotIn(operation, _report_only_denials(policy))
 
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
