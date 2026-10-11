@@ -26,6 +26,11 @@ Duplicated URL/path, canonical-JSON and repository-field details in the
 producer reference are replaced by links to the owning evidence authority and
 versioned machine contract.
 
+Local-lane tests no longer require the entrypoint to duplicate ordinary
+guidance fields or the full Claude self-policy paragraph. Their authoritative
+reference, prompt, role, typed-field, negative-case, and candidate-control
+checks remain intact; existing entrypoint routing tests cover the short entry.
+
 Shared scope, independence, full-DAG coverage, consent, self-policy isolation,
 exact merge bindings, and current-head readiness remain required. The shorter
 GitHub entry still requires read-only request discovery, independent
@@ -51,6 +56,14 @@ new-head invalidation and the no-empty-commit rule remain checked. Complete
 reruns pass; initial failures are not counted as successful validation.
 These checks validate the documentation/reference contracts, not a production
 Actions result or formal remote review.
+
+A complete rerun of the affected local-lane module passed all 14 tests on
+Python 3.13.0, including the two tests exposed by the platform CI failure.
+Fresh reruns also passed 47 repository contracts (one private-layout-only skip)
+and 68 GitHub carrier/recovery tests. Only duplicate entrypoint assertions and
+obsolete heading extraction were removed; neither test method was disabled.
+Selected Ruff, source-only syntax and whitespace checks passed. The earlier
+failed platform runs are not successful evidence for this successor.
 
 ## Boundary
 
