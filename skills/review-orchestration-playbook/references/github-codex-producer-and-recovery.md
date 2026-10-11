@@ -215,3 +215,7 @@ wakes the same active thread; when that capability is unavailable, keep a
 cancellable hourly wait in the active thread. Remove the wake-up when the
 result becomes terminal or the PR closes, merges, or is superseded.
 
+## Continue With PR Readiness
+
+A completed GitHub lane does not complete CI or merge readiness. Continue with
+[pr-readiness.md](pr-readiness.md) for the existing full gate.

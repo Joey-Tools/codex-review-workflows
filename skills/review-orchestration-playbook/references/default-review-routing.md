@@ -200,3 +200,7 @@ merge-policy gates. Remote head coverage does not prove base/merge coverage.
 The native request identifier, Comment-review semantics, and re-review behaviour
 are documented in [GitHub's native code review guide](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-code-review).
 
+## Shared Scope
+
+For shared scope, independence, outcomes, and rerun rules, use
+[review-lane-contracts.md](review-lane-contracts.md).
