@@ -25,30 +25,6 @@ Count logical independent judgments. Do not count:
 - a Claude simulation, another Codex process, or GitHub Copilot in place of actual Claude Code;
 - service-start checks without a review result.
 
-## Default Review Routing
-
-Read the preserved [Default Review Routing](default-review-routing.md#default-review-routing) contract in the dedicated routing reference.
-
-### Select Before Launch
-
-Read the preserved [Select Before Launch](default-review-routing.md#select-before-launch) contract in the dedicated routing reference.
-
-### Remote Review Availability
-
-Read the preserved [Remote Review Availability](default-review-routing.md#remote-review-availability) contract in the dedicated routing reference.
-
-### Session Review Choice
-
-Read the preserved [Session Review Choice](default-review-routing.md#session-review-choice) contract in the dedicated routing reference.
-
-### Local Model and Reasoning Consent
-
-Read the preserved [Local Model and Reasoning Consent](default-review-routing.md#local-model-and-reasoning-consent) contract in the dedicated routing reference.
-
-### Native GitHub Copilot Code Review
-
-Read the preserved [Native GitHub Copilot Code Review](default-review-routing.md#native-github-copilot-code-review) contract in the dedicated routing reference.
-
 ## Frozen Range
 
 Every local lane uses the same exact full-object-ID `base_sha..head_sha` range.

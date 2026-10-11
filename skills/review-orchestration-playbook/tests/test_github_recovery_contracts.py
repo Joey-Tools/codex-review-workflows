@@ -4961,8 +4961,8 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         self.assertIn("only applicable unresolved provider findings block", combined)
         self.assertIn("requires fresh review", combined)
         self.assertIn(
-            "a typed thread resolution or trustworthy same-head provider correction alone does not require a commit",
-            combined,
+            "do not manufacture an empty commit for a resolution-only state change",
+            _normalize(self.readiness),
         )
         self.assertNotIn(
             "provider findings block until fixed and resolved on a new reviewed head",

@@ -122,7 +122,7 @@ def _workflow_matrix_modules(job: str) -> list[str]:
 class RepositoryContractTest(unittest.TestCase):
     def test_entrypoint_routes_details_without_loading_unrelated_lane_contracts(self) -> None:
         skill = _read("SKILL.md")
-        self.assertLess(len(skill.splitlines()), 300)
+        self.assertLess(len(skill.splitlines()), 160)
         for path in (
             "default-review-routing.md",
             "github-codex-producer-and-recovery.md",
@@ -132,8 +132,16 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("When evaluating a producer/status pass basis", skill)
         self.assertNotIn("`github-codex-recovery-operation-preflight-v1`", skill)
         self.assertIn("An ambiguous response never authorizes a duplicate comment POST", skill)
+        self.assertNotIn("## Reference Router", skill)
+        for field_detail in (
+            "candidate-markdown-subject-inventory-v2",
+            "`active_record_id`", "`merge_expected_base_ref`",
+        ):
+            self.assertNotIn(field_detail, skill)
+        self.assertIn("Fixed receipt fields", skill)
+        self.assertIn("Self-Policy Trust", skill)
 
-    def test_shared_contracts_preserve_old_routing_anchor_redirects(self) -> None:
+    def test_routing_callers_use_direct_links_without_legacy_redirects(self) -> None:
         shared = _read("references/review-lane-contracts.md")
         routing = _read("references/default-review-routing.md")
         for title in (
@@ -142,8 +150,13 @@ class RepositoryContractTest(unittest.TestCase):
             "Local Model and Reasoning Consent", "Native GitHub Copilot Code Review",
         ):
             anchor = title.lower().replace(" ", "-")
-            self.assertRegex(shared, rf"(?m)^#{{2,3}} {re.escape(title)}$")
-            self.assertIn(f"default-review-routing.md#{anchor}", shared)
+            self.assertNotRegex(shared, rf"(?m)^#{{2,3}} {re.escape(title)}$")
+            for path in _active_policy_paths():
+                self.assertNotIn(
+                    f"review-lane-contracts.md#{anchor}",
+                    path.read_text(encoding="utf-8"),
+                    str(path),
+                )
             self.assertIn(title, routing)
         self.assertNotIn("| `local-fallback` |", shared)
         self.assertIn("| `local-fallback` |", routing)
@@ -166,6 +179,7 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "SKILL.md", REFERENCES / "default-review-routing.md",
             REFERENCES / "github-codex-producer-and-recovery.md",
             REFERENCES / "review-lane-contracts.md", REFERENCES / "github-pr-probes.md",
+            REFERENCES / "pr-readiness.md",
         ]
         if CI_PROFILE == "canonical":
             paths.append(REPO_ROOT / "README.md")
@@ -458,7 +472,7 @@ class RepositoryContractTest(unittest.TestCase):
         local = _read("references/local-codex-lane.md")
         consent = _read("references/egress-consent.md")
 
-        for document in (skill, contracts, local):
+        for document in (contracts, local):
             normalized = _normalize(document)
             self.assertIn("one logical", normalized)
             self.assertIn("subagent", normalized)
@@ -530,11 +544,13 @@ class RepositoryContractTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        for document in (skill, routing, readiness):
+        for document in (routing, readiness):
             self.assertIn("remote-only", document)
             self.assertIn("local review is not required by default", document)
             self.assertIn("native github copilot", document)
-        self.assertIn("explicitly requests", skill)
+        self.assertIn("without adding local review", skill)
+        self.assertIn("an explicit local or named request remains required", skill)
+        self.assertIn("references/default-review-routing.md", skill)
         self.assertIn("generic", skill)
         self.assertIn("not an automatic fallback authorization", routing)
         self.assertIn("session choice", readiness)
@@ -585,7 +601,6 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_reviewer_inclusive_luna_authorization_keeps_sol_as_default(self) -> None:
         for path in (
-            "SKILL.md",
             "references/local-codex-lane.md",
             "references/default-review-routing.md",
         ):
@@ -674,10 +689,9 @@ class RepositoryContractTest(unittest.TestCase):
         contracts = _read("references/review-lane-contracts.md")
         combined = _normalize("\n".join((agents, skill_raw, readiness, contracts)))
 
-        self.assertIn(
-            "a report-only review request does not authorize a branch, commit, push, pr creation, pr retarget, or metadata change",
-            combined,
-        )
+        self.assertIn("a bare named-review request is report-only", combined)
+        self.assertIn("it does not authorize branch creation, commits, push, pr creation/update, or merge", combined)
+        self.assertIn("references/egress-consent.md", skill_raw)
         self.assertIn("base_sha = pr_merge_base", combined)
         self.assertIn("head_sha = head_ref_oid", combined)
         self.assertIn("current `headrefoid` equals `head_sha`", combined)
@@ -703,12 +717,13 @@ class RepositoryContractTest(unittest.TestCase):
         report_contract = readiness.split("## Merge-Ready Report", 1)[1]
         normalized_freeze = _normalize(freeze_contract)
 
-        for document in (normalized_skill, normalized_readiness):
-            self.assertIn("parent-owned immutable `range_origin`", document)
-            self.assertIn("`caller-supplied`", document)
-            self.assertIn("`pr-derived`", document)
-            self.assertIn("`lineage_id`", document)
-            self.assertIn("`active_record_id`", document)
+        for field in (
+            "parent-owned immutable `range_origin`", "`caller-supplied`",
+            "`pr-derived`", "`lineage_id`", "`active_record_id`",
+        ):
+            self.assertIn(field, normalized_readiness)
+        self.assertIn("references/pr-readiness.md#freeze-the-whole-pr-range", skill)
+        self.assertIn("parent-owned origin", normalized_skill)
 
         for schema_field in (
             "range_origin:",
@@ -799,8 +814,8 @@ class RepositoryContractTest(unittest.TestCase):
             "Require branches to be up to date before merging",
             "Require linear history",
         ):
-            self.assertIn(exact_github_name, skill)
             self.assertIn(exact_github_name, freshness_contract)
+        self.assertIn("references/pr-readiness.md", skill)
 
         self.assertIn(
             "when a merge queue owns freshness, follow the queue's merge-group and check semantics",
@@ -816,7 +831,7 @@ class RepositoryContractTest(unittest.TestCase):
             "freeze the resulting `merge_base..new_head`", normalized_freshness
         )
         self.assertIn(
-            "invalidates every old-head positive/pass/clean result and every head-bound readiness gate",
+            "a new head invalidates old-head positive evidence",
             normalized_skill,
         )
         self.assertIn(
@@ -868,10 +883,12 @@ class RepositoryContractTest(unittest.TestCase):
             )[0]
         )
 
-        for document in (skill, readiness, probes, authority):
+        for document in (readiness, probes, authority):
             self.assertIn("`baserefname`", document)
             self.assertIn("`baserefoid`", document)
             self.assertIn("readiness", document)
+        self.assertIn("target-ref or base-tip change invalidates readiness", skill)
+        self.assertIn("even when the head and merge base are unchanged", skill)
 
         self.assertIn(
             "even when the head and unique merge base remain unchanged",
@@ -1054,23 +1071,13 @@ class RepositoryContractTest(unittest.TestCase):
             normalized_execution,
         )
 
-        self.assertIn("direct merge and merge-queue enrollment", skill)
         self.assertIn("--match-head-commit <head_sha>", skill)
-        self.assertIn("asynchronous merge request", skill)
-        self.assertIn("`merge_action: merge_queue`", skill)
-        self.assertIn("a polled `expected_head_sha`", skill)
-        self.assertIn("long-lived auto-merge request", skill)
-        self.assertIn("the queue path is blocked", skill)
-        self.assertIn("a separate head read is not an atomic substitute", skill)
-        self.assertIn("a mismatch fails closed", skill)
-        self.assertIn("exact-base property is preferred", skill)
-        self.assertIn("proven monotonic range contraction", skill)
-        self.assertIn("frozen `merge_expected_base_ref`", skill)
-        self.assertIn("strict alone", skill)
-        self.assertIn("force-push or deletion permission", skill)
-        self.assertIn("any configured base-update or merge bypass", skill)
-        self.assertIn("trusted external control plane", skill)
-        self.assertIn("a separate base read is not an atomic substitute", skill)
+        self.assertIn("state-changing server request itself", skill)
+        self.assertIn("references/pr-readiness.md", skill)
+        self.assertIn("persistent queue binding", skill)
+        self.assertIn("exact-base or proven monotonic-contraction rule", skill)
+        self.assertIn("is not an atomic substitute", skill)
+        self.assertIn("missing proof blocks the mutation", skill)
 
         report = _normalize(readiness.split("## Merge-Ready Report", 1)[1])
         self.assertIn("base_ref_name: exact-base-ref-name", report)
@@ -1537,7 +1544,7 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
         self.assertIn(
-            "Treat the range as the complete Git DAG comparison",
+            "Compare the complete Git DAG",
             _read("SKILL.md"),
         )
         self.assertIn("promisor: bool", runtime)
@@ -1597,7 +1604,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_self_policy_migration_uses_the_prior_trusted_bundle(self) -> None:
         skill = _read("SKILL.md")
         contracts = _read("references/review-lane-contracts.md")
-        for document in (skill, contracts):
+        for document in (contracts,):
             normalized = _normalize(document)
             self.assertIn("trusted installed bundle", normalized)
             self.assertIn("outside the candidate range", normalized)
@@ -1606,6 +1613,9 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("merge and release", normalized)
             self.assertIn("smoke-test", normalized)
         self.assertIn("never execute candidate-head Python, shell", contracts)
+        self.assertIn("outside the candidate range", skill)
+        self.assertIn("references/review-lane-contracts.md#self-policy-migration-trust-boundary", skill)
+        self.assertIn("Do not execute candidate control code to approve itself", skill)
 
     def test_github_lane_passes_on_current_head_clean_without_findings(self) -> None:
         authority = _read("references/github-codex-evidence-authority.md")
@@ -1641,7 +1651,7 @@ class RepositoryContractTest(unittest.TestCase):
             normalized,
         )
         self.assertIn(
-            "A successful service-start check alone is not", _read("SKILL.md")
+            "service-start markers and unknown prose do not pass", _normalize(_read("SKILL.md"))
         )
         self.assertIn(
             "latest head plus no unresolved provider finding passes",

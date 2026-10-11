@@ -6,35 +6,12 @@ Read this reference before evaluating a producer/status pass basis or any author
 
 Before any GitHub-lane action, read [github-codex-evidence-authority.md](github-codex-evidence-authority.md). It is the field-level authority for producer identity, complete pagination, lifecycle, terminal selection, unresolved findings, fallback reactions, and machine-readable reporting.
 
-For every GitHub-lane semantic join, require a valid ASCII `owner/name`
-repository locator and compare its two components case-insensitively. Apply that
-canonical repository identity to same-repository tests, closure and reachability
-keys, selector repository segments, candidate-range exclusion,
-action-manifest-directory uniqueness, and repository-scoped URL/ref joins. Do
-not case-fold paths, commits, refs, or URL suffix/query/fragment fields, and do
-not rewrite the original repository spelling inside a raw or digest-bound
-record: those bytes remain exact and type-preserving. Repository case folding
-is not rename following and does not imply that this version possesses an
-immutable repository ID.
-
-Accept a GitHub web or API URL only when its raw ASCII text contains no C0,
-space, or DEL character, uses the exact lowercase `https://github.com/` or
-`https://api.github.com/` prefix required by that field, and parses then
-recomposes byte-for-byte. Only the `owner/name` segment is compared by canonical
-repository identity; path, ref, SHA, query, fragment, and delimiter presence
-remain exact. Uppercase scheme/host spellings, stripped whitespace, and an empty
-`?` or `#` delimiter that a parser would discard are malformed. A claimed safe
-canonical repository path must be a nonempty relative POSIX path with at least
-one component and no NUL, backslash, absolute form, empty/dot component, or
-noncanonical spelling; `.` is not a file path.
-
-Before copying, canonicalizing, or digesting a parent/report JSON value, apply
-the closed canonical-JSON resource profile: exact acyclic list/dict containers,
-at most 256 container levels and 100,000 value nodes, at most 1 MiB of UTF-8 per
-string value or object key, and at most 16 MiB of aggregate UTF-8 across all
-string values and keys. Reject a string whose code-point count already exceeds
-1 MiB before bounded UTF-8 encoding; malformed or over-limit inputs are
-status-only rather than exceptions.
+Use the authority's [repository and exact-field rules](github-codex-evidence-authority.md#repository-identity-and-exact-fields)
+and the versioned [machine contract](github-codex-terminal-carriers-v1.json)
+for URL/path parsing, canonical JSON resource limits and field validation.
+Do not reproduce their field tables here or replace validation with semantic
+similarity. Preserve raw digest-bound bytes; only repository owner/name identity
+uses case-insensitive comparison.
 
 The intended current policy is:
 

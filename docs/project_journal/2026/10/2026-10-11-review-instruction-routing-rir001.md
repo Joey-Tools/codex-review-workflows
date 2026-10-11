@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-11
 updated: 2026-10-11
 branch: codex/review-instruction-routing-20261011
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/135
 supersedes: []
 superseded_by:
 ---
@@ -19,10 +19,12 @@ The playbook entrypoint routes default provider selection to
 `default-review-routing.md` and conditional GitHub producer/status and Actions
 recovery details to `github-codex-producer-and-recovery.md`.
 
-The moved blocks retain the latest target-branch policy bytes, except for the
-relative evidence-authority link needed by the producer reference's location.
-Old shared-contract routing headings remain as linked redirects. README and
-availability-probe links point directly to the new reference.
+The entrypoint is reduced from 423 to 130 lines. Default routing is preserved
+in its dedicated reference; six obsolete shared-contract redirects are removed
+and every current repository caller points directly to the new reference.
+Duplicated URL/path, canonical-JSON and repository-field details in the
+producer reference are replaced by links to the owning evidence authority and
+versioned machine contract.
 
 Shared scope, independence, full-DAG coverage, consent, self-policy isolation,
 exact merge bindings, and current-head readiness remain required. The shorter
@@ -33,17 +35,20 @@ and status-only uncertainty remain in the routed detailed contract.
 
 ## Validation
 
-Repository contract tests cover conditional routing, compatibility anchors,
-relative Markdown links, unchanged provider decisions, and preserved producer
-and recovery safety boundaries. The relocated blocks are separately compared
-against the exact target-branch baseline before publication.
+Repository contract tests cover conditional routing, direct links, removed
+redirects, unchanged provider decisions, and producer/recovery boundaries.
+Detailed assertions target their owning references rather than requiring the
+same prose in the entrypoint. Read-only byte comparisons verify unchanged
+machine contracts, executable controls, routing decisions, shared scope, and
+the remaining producer/readiness contracts.
 
 Python 3.13.0 passed all 47 repository contracts (one private-layout-only skip)
 and all 68 GitHub carrier/recovery tests. Selected Ruff, source-only syntax,
 skill metadata, journal frontmatter, and whitespace validation passed.
-The initial GitHub-module run exposed two assertions still reading the old
-entrypoint. Their document inputs now include the routed producer reference;
-the original semantic assertions remain unchanged and the complete rerun passes.
+Initial documentation tests exposed old entrypoint-specific assertions. Their
+inputs now include the owning references, while typed finding resolution,
+new-head invalidation and the no-empty-commit rule remain checked. Complete
+reruns pass; initial failures are not counted as successful validation.
 These checks validate the documentation/reference contracts, not a production
 Actions result or formal remote review.
 
