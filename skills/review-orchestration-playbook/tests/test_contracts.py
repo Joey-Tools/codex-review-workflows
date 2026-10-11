@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import os
 import pathlib
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 try:
     import tomllib
@@ -88,6 +90,11 @@ CANONICAL_REPORT_ONLY_RULE = (
     "exact `@codex review` on an already-existing eligible PR is the "
     "only mutation implied by bare triple."
 )
+# Independently reviewed private PR222, merge b47a626b0f6e4432af466be97d52ef8b903fb451.
+# Pin normalized prefix/suffix, not the denial list's conjunctions or whitespace.
+PRIVATE_REPORT_ONLY_BOUNDARY_SHA256 = (
+    "1e600287ae39a36b34f3be09e272552f6f80f83843918620a4aecda0e3714792"
+)
 
 
 def _report_only_rule(agents: str) -> str:
@@ -116,6 +123,13 @@ def _expected_report_only_rule() -> str:
     rule = _report_only_rule(block.decode("utf-8"))
     if not rule:
         raise AssertionError("private producer lacks one report-only policy rule")
+    prefix, marker, rest = _normalize(rule).partition("does not authorize")
+    parts = re.split(r"([.;])", rest, maxsplit=1)
+    if not marker or len(parts) != 3:
+        raise AssertionError("private report-only boundary is incomplete")
+    boundary = prefix + "\0" + "".join(parts[1:])
+    if hashlib.sha256(boundary.encode()).hexdigest() != PRIVATE_REPORT_ONLY_BOUNDARY_SHA256:
+        raise AssertionError("private report-only boundary differs from the independent baseline")
     return rule
 
 
@@ -865,6 +879,21 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             with self.subTest(changed=changed):
                 self.assertFalse(_report_only_denials(changed, rule))
+
+    @unittest.skipUnless(CI_PROFILE == "private", "private producer layout only")
+    def test_private_report_only_template_rejects_coupled_producer_grants(self) -> None:
+        rule = _expected_report_only_rule()
+        for changed in (
+            rule + " The request authorizes commits.",
+            rule + "; merge is also authorized",
+            rule.replace("and does not authorize", "and permits push but does not authorize"),
+        ):
+            declaration = "PERSONAL_AGENTS_CURRENT_REVIEW_BLOCK = " + repr(changed.encode())
+            with self.subTest(changed=changed), patch.object(
+                pathlib.Path, "read_text", return_value=declaration
+            ):
+                with self.assertRaises(AssertionError):
+                    _expected_report_only_rule()
 
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
