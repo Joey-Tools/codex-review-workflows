@@ -74,6 +74,15 @@ def _normalize(value: str) -> str:
     return " ".join(value.split()).lower()
 
 
+def _report_only_denials(agents: str) -> str:
+    rule = next(
+        line for line in agents.splitlines()
+        if line.startswith("- A bare named-review request is report-only")
+    )
+    denial = _normalize(rule).split("does not authorize", 1)[1]
+    return re.split(r"[.;]", denial, maxsplit=1)[0]
+
+
 def _active_policy_paths() -> tuple[pathlib.Path, ...]:
     paths = [
         POLICY_SCOPE_ROOT / "AGENTS.md",
@@ -690,7 +699,9 @@ class RepositoryContractTest(unittest.TestCase):
         combined = _normalize("\n".join((agents, skill_raw, readiness, contracts)))
 
         self.assertIn("a bare named-review request is report-only", combined)
-        self.assertIn("it does not authorize branch creation, commits, push, pr creation/update, or merge", combined)
+        denials = _report_only_denials(agents)
+        for operation in ("branch creation", "commits", "push", "pr creation/update", "merge"):
+            self.assertIn(operation, denials)
         self.assertIn("references/egress-consent.md", skill_raw)
         self.assertIn("base_sha = pr_merge_base", combined)
         self.assertIn("head_sha = head_ref_oid", combined)
@@ -703,6 +714,25 @@ class RepositoryContractTest(unittest.TestCase):
             skill_raw.index("## Freeze Scope Before Review"),
             skill_raw.index("## Run Local Lanes"),
         )
+
+    def test_report_only_denials_accept_both_layouts_without_later_rule_leakage(self) -> None:
+        statements = (
+            "- A bare named-review request is report-only. It does not authorize "
+            "branch creation, commits, push, PR creation/update, or merge; "
+            "exact review is the narrow exception.",
+            "- A bare named-review request is report-only and does not authorize "
+            "branch creation or mutation, commits, push, PR creation/update or "
+            "metadata changes, merge, any rerun, dispatch, or unrelated mutation. "
+            "Bare triple has a narrow exception.",
+        )
+        operations = ("branch creation", "commits", "push", "pr creation/update", "merge")
+        for statement in statements:
+            for operation in operations:
+                with self.subTest(statement=statement, operation=operation):
+                    self.assertIn(operation, _report_only_denials(statement))
+                    missing = re.sub(re.escape(operation), "omitted", statement, flags=re.I)
+                    missing += "\n- Another rule does not authorize " + operation + "."
+                    self.assertNotIn(operation, _report_only_denials(missing))
 
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
