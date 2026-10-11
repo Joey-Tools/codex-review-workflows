@@ -66,8 +66,8 @@ This read-only probe selects a route; it does not request a review or establish
 a current-head pass. Use only GETs and existing provider results; never send a
 dummy review request as an availability probe. All evidence interpretation,
 newer-negative precedence, quota-reset handling, and session choice belong to
-[Remote Review Availability](review-lane-contracts.md#remote-review-availability)
-and [Session Review Choice](review-lane-contracts.md#session-review-choice).
+[Remote Review Availability](default-review-routing.md#remote-review-availability)
+and [Session Review Choice](default-review-routing.md#session-review-choice).
 
 Inspect the selected PR first, then a bounded set of recently active PRs from
 the same repository. The [List pull requests endpoint](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)

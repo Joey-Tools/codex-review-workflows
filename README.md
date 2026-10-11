@@ -17,7 +17,7 @@ and PR readiness without duplicating those contracts across every caller.
 Local-only delivery retains one local Codex lane. Unknown or unavailable
 PR-bound remote support requires an explicit session choice: local fallback,
 local required plus available remote, or remote-only wait/retry. See the
-[routing contract](skills/review-orchestration-playbook/references/review-lane-contracts.md#default-review-routing);
+[routing contract](skills/review-orchestration-playbook/references/default-review-routing.md#default-review-routing);
 historical capability is not current-head pass and no choice waives required
 checks. Local review defaults to GPT-6.1 Sol at model-default reasoning;
 alternative models/efforts require explicit opt-in. A user may authorize GPT-6
@@ -46,7 +46,7 @@ sessions, not the number of internal workers a high-reasoning model may use.
 
 - [Local Codex lane](skills/review-orchestration-playbook/references/local-codex-lane.md):
   peer subagent/CLI adapters, capability selection, prompt, and findings contract.
-- [Default routing and native Copilot review](skills/review-orchestration-playbook/references/review-lane-contracts.md#default-review-routing):
+- [Default routing and native Copilot review](skills/review-orchestration-playbook/references/default-review-routing.md#default-review-routing):
   remote-first selection, explicit opt-in, and current-head native-review evidence.
 - [Review workspace](skills/review-orchestration-playbook/references/review-workspace.md):
   independent clean-workspace preparation, validation, cleanup, and incomplete-range guidance.
@@ -54,6 +54,8 @@ sessions, not the number of internal workers a high-reasoning model may use.
   runtime and output validation for the optional Claude processor.
 - [GitHub Codex evidence authority](skills/review-orchestration-playbook/references/github-codex-evidence-authority.md):
   provider identity, current-head result classification, and unresolved-finding rules.
+- [GitHub Codex producer and recovery](skills/review-orchestration-playbook/references/github-codex-producer-and-recovery.md):
+  conditional producer trust, immutable closure, exact Actions transactions, and recovery budgets.
 - [PR readiness](skills/review-orchestration-playbook/references/pr-readiness.md):
   branch, lifecycle, CI, and conversation gates around the requested review shape.
 - [`named_lane_guard`](skills/review-orchestration-playbook/scripts/named_lane_guard):

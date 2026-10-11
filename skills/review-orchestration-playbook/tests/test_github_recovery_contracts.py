@@ -1591,6 +1591,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.skill = _read(SKILL_ROOT / "SKILL.md")
+        cls.producer = _read(REFERENCES / "github-codex-producer-and-recovery.md")
         cls.probes = _read(REFERENCES / "github-pr-probes.md")
         cls.authority = _read(REFERENCES / "github-codex-evidence-authority.md")
         cls.contracts = _read(REFERENCES / "review-lane-contracts.md")
@@ -4688,7 +4689,9 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             self.assertIn(anchor, combined)
 
     def test_merge_status_basis_binds_subject_scope_and_contract_clean(self) -> None:
-        combined = _normalize(self.skill + "\n" + self.probes + "\n" + self.authority)
+        combined = _normalize(
+            "\n".join((self.skill, self.probes, self.authority, self.producer))
+        )
         for anchor in (
             "feature head",
             "current base",
@@ -4953,13 +4956,13 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         self.assertIn("commit that change as a new head", normalized)
 
         combined = _normalize(
-            self.skill + "\n" + self.authority + "\n" + self.readiness
+            "\n".join((self.skill, self.authority, self.readiness, self.producer))
         )
         self.assertIn("only applicable unresolved provider findings block", combined)
         self.assertIn("requires fresh review", combined)
         self.assertIn(
-            "a typed thread resolution or trustworthy same-head provider correction alone does not require a commit",
-            combined,
+            "do not manufacture an empty commit for a resolution-only state change",
+            _normalize(self.readiness),
         )
         self.assertNotIn(
             "provider findings block until fixed and resolved on a new reviewed head",

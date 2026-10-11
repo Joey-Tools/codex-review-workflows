@@ -12,7 +12,7 @@ GitHub acquisition and retry mechanics live in
 [github-pr-probes.md](github-pr-probes.md). Do not duplicate those contracts
 here.
 
-Choose required lanes through [Default Review Routing](review-lane-contracts.md#default-review-routing) first.
+Choose required lanes through [Default Review Routing](default-review-routing.md#default-review-routing) first.
 An unnamed PR-bound request with an eligible GitHub Codex or native GitHub
 Copilot reviewer uses remote-only review; local review is not required by
 default. Every reference below to local reviews or their provenance applies
@@ -206,7 +206,7 @@ Evaluate the following for the same frozen current state:
    has no unresolved applicable Codex-provider finding.
    Native GitHub Copilot, when selected instead, requires its own current-head
    completed review and no applicable unresolved finding under
-   [Default Review Routing](review-lane-contracts.md#default-review-routing). Neither requires an extra local lane.
+   [Default Review Routing](default-review-routing.md#default-review-routing). Neither requires an extra local lane.
 6. **CI and status:** every required current-head or merge-queue check is
    successful, with no required pending, cancelled, skipped, stale, or missing
    result. Prefer a trustworthy related merge/status check when the repository
