@@ -88,6 +88,8 @@ def _active_policy_paths() -> tuple[pathlib.Path, ...]:
         REFERENCES / "local-codex-lane.md",
         REFERENCES / "pr-readiness.md",
         REFERENCES / "review-lane-contracts.md",
+        REFERENCES / "default-review-routing.md",
+        REFERENCES / "github-codex-producer-and-recovery.md",
         REFERENCES / "review-prompt-templates.md",
         REFERENCES / "review-workspace.md",
     ]
@@ -118,6 +120,68 @@ def _workflow_matrix_modules(job: str) -> list[str]:
 
 
 class RepositoryContractTest(unittest.TestCase):
+    def test_entrypoint_routes_details_without_loading_unrelated_lane_contracts(self) -> None:
+        skill = _read("SKILL.md")
+        self.assertLess(len(skill.splitlines()), 300)
+        for path in (
+            "default-review-routing.md",
+            "github-codex-producer-and-recovery.md",
+        ):
+            self.assertIn(f"references/{path}", skill)
+            self.assertIn(REFERENCES / path, _active_policy_paths())
+        self.assertIn("When evaluating a producer/status pass basis", skill)
+        self.assertNotIn("`github-codex-recovery-operation-preflight-v1`", skill)
+        self.assertIn("An ambiguous response never authorizes a duplicate comment POST", skill)
+
+    def test_shared_contracts_preserve_old_routing_anchor_redirects(self) -> None:
+        shared = _read("references/review-lane-contracts.md")
+        routing = _read("references/default-review-routing.md")
+        for title in (
+            "Default Review Routing", "Select Before Launch",
+            "Remote Review Availability", "Session Review Choice",
+            "Local Model and Reasoning Consent", "Native GitHub Copilot Code Review",
+        ):
+            anchor = title.lower().replace(" ", "-")
+            self.assertRegex(shared, rf"(?m)^#{{2,3}} {re.escape(title)}$")
+            self.assertIn(f"default-review-routing.md#{anchor}", shared)
+            self.assertIn(title, routing)
+        self.assertNotIn("| `local-fallback` |", shared)
+        self.assertIn("| `local-fallback` |", routing)
+
+    def test_moved_producer_details_keep_closed_safety_and_recovery_boundaries(self) -> None:
+        producer = _normalize(_read("references/github-codex-producer-and-recovery.md"))
+        for rule in (
+            "complete immutable closure", "outside the candidate range",
+            "full-entry edge", "exactly one total inbound edge",
+            "candidate-range implementation bytes or an unbound actual run cannot pass",
+            "http 201 and no request body", "previous_attempt_url",
+            "workflow_dispatch", "status-only", "current mutation authorization remains separate",
+            "issue-comment creation is never eligible", "never reconcile an explicit code finding",
+            "single-flight", "maximum of 50", "hourly monitoring without a time limit",
+        ):
+            self.assertIn(rule, producer)
+
+    def test_instruction_routing_relative_markdown_links_resolve(self) -> None:
+        paths = [
+            SKILL_ROOT / "SKILL.md", REFERENCES / "default-review-routing.md",
+            REFERENCES / "github-codex-producer-and-recovery.md",
+            REFERENCES / "review-lane-contracts.md", REFERENCES / "github-pr-probes.md",
+        ]
+        if CI_PROFILE == "canonical":
+            paths.append(REPO_ROOT / "README.md")
+        for source in paths:
+            for target in re.findall(r"(?<!!)\[[^\]\n]+\]\(([^)\n]+)\)", source.read_text()):
+                if "://" in target:
+                    continue
+                path, _, fragment = target.partition("#")
+                destination = source.parent / path if path else source
+                with self.subTest(source=source.name, target=target):
+                    self.assertTrue(destination.is_file())
+                    if fragment:
+                        headings = re.findall(r"(?m)^#{1,6} (.+)$", destination.read_text())
+                        anchors = {re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-") for h in headings}
+                        self.assertIn(fragment, anchors)
+
     def test_ci_matches_the_reviewed_distribution_profile(self) -> None:
         actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
         expected = (CI_FIXTURE_ROOT / f"{CI_PROFILE}.yml").read_bytes()
@@ -459,7 +523,7 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_remote_first_routing_does_not_require_an_extra_local_lane(self) -> None:
         skill = _normalize(_read("SKILL.md"))
-        routing = _normalize(_read("references/review-lane-contracts.md"))
+        routing = _normalize(_read("references/default-review-routing.md"))
         readiness = _normalize(_read("references/pr-readiness.md"))
         delivery = _normalize(
             (POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md").read_text(
@@ -483,7 +547,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("local_reviews: pass | blocked | pending | not-required", readiness)
 
     def test_session_routing_examples_preserve_user_choices_and_required_gates(self) -> None:
-        document = _read("references/review-lane-contracts.md")
+        document = _read("references/default-review-routing.md")
         section = document.split("### Session Review Choice\n", 1)[1].split(
             "### Local Model and Reasoning Consent\n", 1
         )[0]
@@ -523,7 +587,7 @@ class RepositoryContractTest(unittest.TestCase):
         for path in (
             "SKILL.md",
             "references/local-codex-lane.md",
-            "references/review-lane-contracts.md",
+            "references/default-review-routing.md",
         ):
             with self.subTest(path=path):
                 document = _normalize(_read(path))
@@ -531,7 +595,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("gpt-6 luna", document)
                 self.assertIn("up to max", document)
 
-        routing = _normalize(_read("references/review-lane-contracts.md"))
+        routing = _normalize(_read("references/default-review-routing.md"))
         self.assertIn("when the user explicitly includes reviewers", routing)
         self.assertIn("not the new default or an automatic fallback", routing)
         self.assertIn("choose and record its exact effort", routing)
@@ -539,7 +603,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("record the exact selected profile and authorization", local)
 
     def test_native_copilot_completion_is_not_codex_or_cli_evidence(self) -> None:
-        routing = _normalize(_read("references/review-lane-contracts.md"))
+        routing = _normalize(_read("references/default-review-routing.md"))
         for contract in (
             "copilot-pull-request-reviewer[bot]",
             "complete pagination",
@@ -1636,7 +1700,8 @@ class RepositoryContractTest(unittest.TestCase):
     def test_github_recovery_is_dynamic_single_flight_and_cost_aware(self) -> None:
         skill = _read("SKILL.md")
         probes = _read("references/github-pr-probes.md")
-        normalized = _normalize(skill + "\n" + probes)
+        producer = _read("references/github-codex-producer-and-recovery.md")
+        normalized = _normalize(skill + "\n" + probes + "\n" + producer)
         for anchor in (
             "missing or stale",
             "cancelled or skipped",
