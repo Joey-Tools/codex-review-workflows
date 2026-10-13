@@ -69,11 +69,12 @@ evidence; raw provider ancestry claims never substitute for this parent proof.
 An observed target `baseRefName` change or advance of the target base tip does
 not by itself invalidate head-bound provider evidence. If the head and unique
 merge base are unchanged, the frozen local range endpoints are unchanged too,
-but the new exact target-ref identity or `baseRefOid`
-invalidates every prior local PR-wide review, local validation and test result,
-CI/status result, conversation/readiness decision, and final reread. Reacquire
-all of them before counting readiness again; unchanged range provenance does
-not preserve those earlier results. Retain the head-bound provider result only
+but the new exact target-ref identity or `baseRefOid` requires a fresh scope
+check and final reread. In routine mode, revalidate prior evidence according to
+its declared dependencies using the classifier in [pr-readiness.md](pr-readiness.md);
+strict mode retains full base-bound invalidation. Unchanged range provenance
+alone does not preserve evidence declared dependent on the changed base. Retain
+the head-bound provider result only
 after a complete final reread confirms its exact head is still current and no
 applicable provider finding remains unresolved. Do not claim that a provider
 comment, review, reaction, or ordinary check proves the base. The retained
@@ -83,11 +84,12 @@ base-sensitive instead: any change to its frozen base ref, base tip, unique
 merge base, feature head, or check-subject SHA invalidates it and requires a
 new producer result for the recomputed current scope.
 
-This observed-change invalidation rule is unchanged by the narrow atomic-window
-alternative in [pr-readiness.md](pr-readiness.md): only an unobserved movement
-of the same frozen target ref during the direct merge's atomic window may use a
-parent-proved monotonic range contraction. Authorized PR-retarget actors belong
-to that proof's trusted external control plane, not provider evidence.
+The routine profile accepts the trusted GitHub/repository control plane and
+reports the residual race between final reread and direct merge. Only the
+opt-in strict-base-proof profile uses the atomic-window monotonic-contraction
+alternative in [pr-readiness.md](pr-readiness.md). Authorized PR-retarget
+actors belong to that strict proof's external control plane, not provider
+evidence.
 
 After a merge-base change on an unchanged head, the parent may reuse the
 head-bound GitHub result after a complete final reread confirms the same head
@@ -96,8 +98,10 @@ local and readiness gate against the new merge base only after the parent-owned
 `range_origin` provenance gate in [pr-readiness.md](pr-readiness.md) authorizes
 that local PR-wide range. This authority neither selects nor rewrites a local
 range: missing or unknown origin may block local readiness while the
-trustworthy head-only GitHub result remains reusable. Reconcile any
-base-sensitive merge/status check. Do not post another `@codex review` merely
+trustworthy head-only GitHub result remains reusable. In routine mode, rerun
+only other evidence classified as dependent on the changed dimension; strict
+mode keeps the complete base-bound rerun. Reconcile any base-sensitive
+merge/status check. Do not post another `@codex review` merely
 because the base changed, and never describe the reused provider artifact as a
 review of the new base. The raw provider artifact may remain in the audit
 inventory, but old `finding_page_receipt`, `finding_range_receipt`, and
