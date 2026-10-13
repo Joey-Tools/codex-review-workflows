@@ -91,10 +91,12 @@ For example, a head-bound check or local review of an unchanged
 `base_sha..head_sha` range can remain countable when only `base_ref_oid`
 advances, while a merge-group check or test declared base-sensitive must be
 reacquired. A changed merge base changes the local range and invalidates its
-range-bound reviews and validations. A changed head invalidates every
-head-bound result and the complete local range. A retained head-only provider
-result still requires the complete fresh provider reread described by its
-authority.
+range-bound positive reviews and validations. A changed head invalidates every
+head-bound positive/pass/clean result and the complete local range. An
+applicable negative provider finding remains a separate blocker until typed
+resolution or an accepted later corrective artifact; it is not an item in the
+planner's positive evidence array. A retained head-only provider result still
+requires the complete fresh provider reread described by its authority.
 
 The classifier accepts one closed JSON object with `profile`, four boolean
 `changes` (`head`, `base_ref`, `base_tip`, `merge_base`), an `evidence` array
@@ -103,10 +105,12 @@ whose records give an `id`, `kind`, and exact dependency list, and a closed
 and `head_binding`; direct accepts only `match-head-commit` or `none`, while
 `merge_queue` accepts only `persistent-queue-merge-async-sha` or `none`.
 Mismatched operation/binding pairs fail closed. Routine `merge` input also
-requires `admin_bypass_requested`; strict input additionally requires the
-complete strict-base and bypass-audit fields. Strict queue input additionally
-requires `all_invalidated_gates_on_required_merge_group` and
-`non_bypassed_completion_hold`. Strict queue proof is named
+requires `admin_bypass_requested`; every queue input additionally requires
+`all_invalidated_gates_on_required_merge_group`,
+`non_bypassed_completion_hold`, and `queue_bypass_rules` (the observed request
+option, `false` only when proven; `true` or unknown blocks reuse). Strict input
+additionally requires the complete strict-base and bypass-audit fields. Strict
+queue proof is named
 `strict_queue_full_gate_binding`, is accepted only with the `merge_queue`
 operation, and requires complete actor inventory plus either proof that every
 invalidated gate is bound to the required merge group or a non-bypassed hold
@@ -118,20 +122,29 @@ by the evidence subject; missing or ambiguous classification blocks reuse.
 Invoke it with parent-owned evidence classification, for
 example `python skills/review-orchestration-playbook/scripts/readiness_plan.py
 --input <readiness-plan.json>`. The output is a revalidation, merge-profile,
-and queue-enrollment action plan only. For queue operations, routine base-tip
-or merge-base changes on the same target ref retain the existing exact-head
-enrollment across merge-group rebuilds; a target-ref retarget or head change
-cancels it, and strict base changes cancel/re-enroll after full base
-revalidation. Its `queue_enrollment_action` is one of
+and queue-enrollment action plan only. The evidence array contains positive,
+pass, or clean artifacts only; negative findings and unresolved conversations
+stay in their independent blocking gate and are never eligible for planner
+invalidation or reuse. For queue operations, routine base-tip or merge-base
+changes on the same target ref retain the existing exact-head enrollment only
+when no positive out-of-band artifact was invalidated or every invalidated
+gate is covered by the required merge group or a non-bypassed completion hold.
+Otherwise cancel/re-enroll after affected evidence is reacquired. A target-ref
+retarget or head change cancels the entry, and strict base changes
+cancel/re-enroll after full base revalidation. The queue request must prove
+`bypass_rules: false`; an enabled or unknown value never qualifies for
+retention. Its `queue_enrollment_action` is one of
 `not_applicable`, `blocked_missing_persistent_head_binding`,
 `retain_if_exact_head_binding_remains_current`,
 `retain_across_merge_group_rebuild`,
 `cancel_and_reenroll_after_base_retarget`,
-`cancel_and_reenroll_after_head_change`, or
-`cancel_and_reenroll_after_strict_base_rerun`. The caller must inspect actual
-request state and verify the exact head binding. The planner never acquires
-evidence, establishes full readiness, authorizes a merge, or replaces the
-human-owned final gate. Candidate code cannot be used to approve this
+`cancel_and_reenroll_after_head_change`,
+`cancel_and_reenroll_after_strict_base_rerun`,
+`cancel_and_reenroll_after_affected_evidence_revalidation`, or
+`blocked_queue_bypass_rules_enabled_or_unknown`. The caller must inspect
+actual request state and verify the exact head binding. The planner never
+acquires evidence, establishes full readiness, authorizes a merge, or replaces
+the human-owned final gate. Candidate code cannot be used to approve this
 playbook's own migration.
 
 When the unique merge base and head did not change, the active `range_origin`
@@ -286,10 +299,31 @@ the separate linear-history rule. Never infer a rebase requirement from the
 freshness setting.
 
 When a merge queue owns freshness, follow the queue's merge-group and check
-semantics instead of updating the feature branch unnecessarily. In routine
-mode, a base-tip or merge-base change on the same target ref and unchanged
-head preserves the existing persistent `merge-async` SHA-bound enrollment
-across a merge-group rebuild.
+semantics instead of updating the feature branch unnecessarily. Submit every
+new asynchronous queue request with `bypass_rules: false`, and retain the
+exact submitted head/action/options together with its acknowledged request
+UUID and scope. A 202 alone does not echo those options: when status is still
+pending, verify its details show the exact `expected_head_sha`,
+`merge_action == "merge_queue"`, and literal `bypass_rules == false`. If an
+own acknowledged request has already become `enqueued`, retain its proved
+original options and reread the current PR/queue binding; do not infer missing
+options from the terminal response alone. Before reusing a pre-existing
+request identified by a
+409, require the same exact properties from its pending status. Missing, true,
+or otherwise unproved bypass state blocks reuse; never infer false from an
+omitted field or from an older request's head/action alone. A final `enqueued`
+result is not proof of merge and does not update with later queue completion;
+do not treat it alone as fresh head/bypass proof. Async results expire after
+24 hours, so reacquire current request state when the result is no longer
+available. See the [asynchronous merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request-asynchronously) and [merge queue behavior](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
+
+In routine mode, a base-tip or merge-base change on the same target ref and
+unchanged head preserves the existing persistent `merge-async` SHA-bound
+enrollment across a merge-group rebuild only when there is no invalidated
+positive out-of-band evidence or the repository proves that every invalidated
+gate is covered by the required merge group or a non-bypassed completion hold.
+Otherwise cancel/re-enroll after affected evidence is reacquired; required
+queue checks cannot serialize an out-of-band test or review.
 The selected operation is `merge_queue`, and the binding must be
 `persistent-queue-merge-async-sha`; direct `match-head-commit` is not valid for
 that operation. A target-ref retarget cancels/re-enrolls the entry even if the
@@ -595,37 +629,45 @@ fields shown here:
 
 ```text
 PUT /repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async
-{"sha":"<HEAD_SHA>","merge_action":"merge_queue"}
+{"sha":"<HEAD_SHA>","merge_action":"merge_queue","bypass_rules":false}
 
 # The same request through GitHub CLI's API transport.
 gh api --include --method PUT \
   -H "X-GitHub-Api-Version: 2026-03-10" \
   repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async \
-  -f sha="<HEAD_SHA>" -f merge_action="merge_queue"
+  -f sha="<HEAD_SHA>" -f merge_action="merge_queue" -F bypass_rules=false
 ```
 
 Persist the request's status, response, and UUID. Poll
 `GET /repos/OWNER/REPO/pulls/<PR_NUMBER>/merge-async/<UUID>` and require every
 pending result to report `details.expected_head_sha == merge_expected_head`
-and `details.merge_action == "merge_queue"`. A `409` may identify an older
-request whose options differ; never adopt it from status alone. It can count
-only after its result proves the same expected head and queue action. A `200`
-already-merged or already-queued result likewise needs complete current PR,
-queue, and final-head evidence rather than an inferred binding.
+and `details.merge_action == "merge_queue"`, and literal
+`details.bypass_rules == false`. A `409` may identify an older request whose
+options differ; never adopt it from status alone. It can count only after its
+pending result proves the same expected head, queue action, and non-bypassed
+option. An `enqueued` result is terminal and does not later become a merged
+result; reacquire the current PR and queue state to establish completion.
 
 For a queue path, select `operation: merge_queue` with
 `head_binding: persistent-queue-merge-async-sha`; the planner rejects a
 binding paired with the wrong operation. Atomically enroll the exact reviewed
 feature head, then
 follow the resulting latest-base merge-group checks and reread queue state. In
-routine mode, preserve the exact-head enrollment across a same-target-ref
-base-tip/merge-base group rebuild, but cancel/re-enroll on a target-ref
-retarget. Reacquire required checks for the new current merge group, and use the
-dependency classifier for out-of-band evidence; a rebuilt merge group does not
-by itself invalidate an unrelated head/range result. The planner reports this
-as `retain_across_merge_group_rebuild`. A changed head invalidates and cancels
-the enrollment and all old-head evidence, and requires the applicable full
-pre-merge loop for the new head. Strict mode cancels/re-enrolls after its full
+routine mode, apply the positive-evidence dependency plan before retaining the
+exact-head enrollment across a same-target-ref base-tip/merge-base rebuild.
+Retain it only when no positive out-of-band gate was invalidated or all such
+gates are covered by the required merge group or a non-bypassed completion
+hold. Otherwise cancel/re-enroll after affected evidence is reacquired; a
+target-ref retarget also cancels/re-enrolls. Reacquire required checks for the
+new current merge group. A rebuilt merge group does not
+by itself invalidate an unrelated head/range result. The planner reports safe
+retention as `retain_across_merge_group_rebuild`, or otherwise asks to
+cancel/re-enroll after affected evidence is reacquired. A changed head
+invalidates every old-head positive/pass/clean result and cancels the
+enrollment, requiring the applicable full pre-merge loop for the new head.
+Applicable negative findings are not in the planner's positive evidence array;
+reread them independently and keep them blocking until typed resolution or an
+accepted later corrective artifact. Strict mode cancels/re-enrolls after its full
 base invalidation, and also requires the repository-proved non-bypassed hold
 or new-required-merge-group contract described above. Without that strict
 contract, strict queue merge is blocked. A later feature-head change must be

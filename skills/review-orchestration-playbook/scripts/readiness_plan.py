@@ -61,16 +61,17 @@ def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]
         "exact_base_ref",
         "merge_base_equals_reviewed_base",
     }
-    strict_queue_keys = {
+    queue_keys = {
         "all_invalidated_gates_on_required_merge_group",
         "non_bypassed_completion_hold",
+        "queue_bypass_rules",
     }
     operation = merge.get("operation") if isinstance(merge, dict) else None
     if operation not in ("direct", "merge_queue"):
         raise PlanInputError("merge.operation must be direct or merge_queue")
     keys = common_keys | (strict_keys if profile == "strict" else set())
-    if profile == "strict" and operation == "merge_queue":
-        keys |= strict_queue_keys
+    if operation == "merge_queue":
+        keys |= queue_keys
     _closed_object(merge, keys=keys, label="merge")
     if (
         not isinstance(merge["head_binding"], str)
@@ -104,15 +105,25 @@ def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]
         or merge["base_proof"] not in _PROOFS
     ):
         raise PlanInputError("merge.base_proof is unknown")
-    booleans = keys - {"operation", "head_binding", "base_proof"}
+    booleans = keys - {
+        "operation",
+        "head_binding",
+        "base_proof",
+        "queue_bypass_rules",
+    }
     for key in booleans:
         _boolean(merge[key], label=f"merge.{key}")
+    if merge["operation"] == "merge_queue":
+        if merge["queue_bypass_rules"] is not None:
+            _boolean(merge["queue_bypass_rules"], label="merge.queue_bypass_rules")
 
     reasons: list[str] = []
     if merge["head_binding"] == "none":
         reasons.append("exact_reviewed_head_not_server_bound")
     if merge["admin_bypass_requested"]:
         reasons.append("admin_bypass_forbidden")
+    if merge["operation"] == "merge_queue" and merge["queue_bypass_rules"] is not False:
+        reasons.append("queue_bypass_rules_not_proven_false")
 
     if profile == "strict":
         if not merge["complete_bypass_audit"]:
@@ -164,7 +175,8 @@ def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]
         ),
         "required_head_binding": (
             "PUT /repos/<owner>/<repo>/pulls/<number>/merge-async "
-            '{"sha":"<exact-reviewed-head>","merge_action":"merge_queue"}'
+            '{"sha":"<exact-reviewed-head>","merge_action":"merge_queue",'
+            '"bypass_rules":false}'
             if queue_binding
             else "--match-head-commit <exact-reviewed-head>"
         ),
@@ -246,12 +258,17 @@ def build_plan(payload: Any) -> dict[str, Any]:
         queue_enrollment_action = "blocked_missing_persistent_head_binding"
     elif "head" in changed:
         queue_enrollment_action = "cancel_and_reenroll_after_head_change"
-    elif "base_ref" in changed:
-        queue_enrollment_action = "cancel_and_reenroll_after_base_retarget"
     elif profile == "strict" and base_changed:
         queue_enrollment_action = "cancel_and_reenroll_after_strict_base_rerun"
+    elif "base_ref" in changed:
+        queue_enrollment_action = "cancel_and_reenroll_after_base_retarget"
+    elif root["merge"]["queue_bypass_rules"] is not False:
+        queue_enrollment_action = "blocked_queue_bypass_rules_enabled_or_unknown"
     elif base_changed:
-        queue_enrollment_action = "retain_across_merge_group_rebuild"
+        if not invalidated or root["merge"]["all_invalidated_gates_on_required_merge_group"] or root["merge"]["non_bypassed_completion_hold"]:
+            queue_enrollment_action = "retain_across_merge_group_rebuild"
+        else:
+            queue_enrollment_action = "cancel_and_reenroll_after_affected_evidence_revalidation"
     else:
         queue_enrollment_action = "retain_if_exact_head_binding_remains_current"
 

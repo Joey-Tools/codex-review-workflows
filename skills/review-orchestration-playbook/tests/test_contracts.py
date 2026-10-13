@@ -1044,7 +1044,10 @@ class RepositoryContractTest(unittest.TestCase):
             authority,
         )
         self.assertNotIn("invalidates all old-head evidence", normalized_skill)
-        self.assertIn("a changed head invalidates every head-bound result", _normalize(readiness))
+        self.assertIn(
+            "a changed head invalidates every head-bound positive/pass/clean result",
+            _normalize(readiness),
+        )
 
         for rerun_gate in (
             "local validation and tests",
@@ -1095,10 +1098,11 @@ class RepositoryContractTest(unittest.TestCase):
 
         for queue_anchor in (
             "put /repos/owner/repo/pulls/<pr_number>/merge-async",
-            '{"sha":"<head_sha>","merge_action":"merge_queue"}',
+            '{"sha":"<head_sha>","merge_action":"merge_queue","bypass_rules":false}',
             "get /repos/owner/repo/pulls/<pr_number>/merge-async/<uuid>",
             "details.expected_head_sha == merge_expected_head",
             'details.merge_action == "merge_queue"',
+            "details.bypass_rules == false",
             "persist the request's status, response, and uuid",
             "never fall back to an unbound auto-merge request",
         ):
@@ -1110,6 +1114,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("gh api --include --method put", queue_example)
         self.assertIn(' -f sha="<head_sha>"', queue_example)
         self.assertIn('-f merge_action="merge_queue"', queue_example)
+        self.assertIn("-f bypass_rules=false", queue_example)
         self.assertNotIn("gh pr merge", queue_example)
         self.assertIn("routine mode rereads required checks for the current merge group", probes)
         self.assertIn("strict mode requires a repository-proved", probes)

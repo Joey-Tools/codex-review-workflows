@@ -108,7 +108,9 @@ SHA binding. Do not request administrator or other bypass. Routine mode does
 not require an exact-base or atomic base-contraction proof; report its
 GitHub control-plane trust boundary and residual race. Strict mode retains the
 readiness reference's complete base proof. Preserve persistent queue head
-binding. If required strict freshness requires a base update, use a signed
+binding with `bypass_rules: false`; verify the exact head, queue action, and
+false bypass option before reusing a pending request. If required strict
+freshness requires a base update, use a signed
 merge and rerun evidence invalidated by the resulting new head, not rebase or
 force-push.
 

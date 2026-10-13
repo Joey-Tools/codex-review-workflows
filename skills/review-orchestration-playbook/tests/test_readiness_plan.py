@@ -74,12 +74,25 @@ def _strict_profile(payload: dict[str, object]) -> None:
         }
     )
     if payload["merge"]["operation"] == "merge_queue":  # type: ignore[index]
-        payload["merge"].update(  # type: ignore[union-attr]
-            {
-                "all_invalidated_gates_on_required_merge_group": False,
-                "non_bypassed_completion_hold": False,
-            }
-        )
+        _queue_profile(payload)
+
+
+def _queue_profile(
+    payload: dict[str, object],
+    *,
+    bypass_rules: bool | None = False,
+    required_group: bool = False,
+    completion_hold: bool = False,
+) -> None:
+    payload["merge"].update(  # type: ignore[union-attr]
+        {
+            "operation": "merge_queue",
+            "head_binding": "persistent-queue-merge-async-sha",
+            "all_invalidated_gates_on_required_merge_group": required_group,
+            "non_bypassed_completion_hold": completion_hold,
+            "queue_bypass_rules": bypass_rules,
+        }
+    )
 
 
 class ReadinessPlanTests(unittest.TestCase):
@@ -186,8 +199,11 @@ class ReadinessPlanTests(unittest.TestCase):
 
     def test_queue_binding_survives_routine_base_rebuild_but_strict_reenrolls(self) -> None:
         payload = _payload()
-        payload["merge"]["operation"] = "merge_queue"  # type: ignore[index]
-        payload["merge"]["head_binding"] = "persistent-queue-merge-async-sha"  # type: ignore[index]
+        _queue_profile(payload)
+        payload["evidence"] = [  # type: ignore[assignment]
+            item for item in payload["evidence"]
+            if item["id"] == "provider" or item["id"] == "head_check"
+        ]
         payload["changes"]["base_tip"] = True  # type: ignore[index]
 
         routine = build_plan(payload)
@@ -201,6 +217,7 @@ class ReadinessPlanTests(unittest.TestCase):
         )
         self.assertEqual(routine["merge_constraints"]["operation"], "merge_queue")
         self.assertIn("merge-async", routine["merge_constraints"]["required_head_binding"])
+        self.assertIn('"bypass_rules":false', routine["merge_constraints"]["required_head_binding"])
         self.assertEqual(
             routine["queue_enrollment_action"], "retain_across_merge_group_rebuild"
         )
@@ -222,6 +239,7 @@ class ReadinessPlanTests(unittest.TestCase):
         )
 
         _strict_profile(payload)
+        payload["merge"]["all_invalidated_gates_on_required_merge_group"] = True  # type: ignore[index]
         strict = build_plan(payload)
         self.assertEqual(
             strict["queue_enrollment_action"],
@@ -235,6 +253,101 @@ class ReadinessPlanTests(unittest.TestCase):
             "cancel_and_reenroll_after_head_change",
         )
 
+    def test_queue_rebuild_requires_non_bypassed_request_details(self) -> None:
+        for bypass_rules in (True, None):
+            with self.subTest(bypass_rules=bypass_rules):
+                payload = _payload()
+                _queue_profile(payload, bypass_rules=bypass_rules)
+                payload["changes"]["base_tip"] = True  # type: ignore[index]
+                result = build_plan(payload)
+                self.assertEqual(result["merge_constraints"]["constraint_status"], "blocked")
+                self.assertIn(
+                    "queue_bypass_rules_not_proven_false",
+                    result["merge_constraints"]["reasons"],
+                )
+                self.assertEqual(
+                    result["queue_enrollment_action"],
+                    "blocked_queue_bypass_rules_enabled_or_unknown",
+                )
+
+        payload = _payload()
+        _queue_profile(payload, bypass_rules=False)
+        payload["changes"]["base_tip"] = True  # type: ignore[index]
+        self.assertEqual(
+            build_plan(payload)["queue_enrollment_action"],
+            "cancel_and_reenroll_after_affected_evidence_revalidation",
+        )
+
+    def test_queue_rebuild_retains_only_when_invalidated_gates_are_covered(self) -> None:
+        for evidence in ("base_sensitive_test",):
+            for required_group, completion_hold in ((True, False), (False, True)):
+                with self.subTest(required_group=required_group, hold=completion_hold):
+                    payload = _payload()
+                    _queue_profile(
+                        payload,
+                        required_group=required_group,
+                        completion_hold=completion_hold,
+                    )
+                    payload["changes"]["base_tip"] = True  # type: ignore[index]
+                    self.assertIn(
+                        evidence,
+                        build_plan(payload)["invalidated_evidence"],
+                    )
+                    self.assertEqual(
+                        build_plan(payload)["queue_enrollment_action"],
+                        "retain_across_merge_group_rebuild",
+                    )
+
+        no_out_of_band = _payload()
+        _queue_profile(no_out_of_band)
+        no_out_of_band["evidence"] = [  # type: ignore[assignment]
+            item for item in no_out_of_band["evidence"] if item["id"] == "provider"
+        ]
+        no_out_of_band["changes"]["base_tip"] = True  # type: ignore[index]
+        self.assertEqual(
+            build_plan(no_out_of_band)["queue_enrollment_action"],
+            "retain_across_merge_group_rebuild",
+        )
+
+    def test_strict_queue_retarget_uses_full_strict_action_and_head_wins(self) -> None:
+        payload = _payload()
+        _queue_profile(payload, required_group=True)
+        _strict_profile(payload)
+        payload["merge"]["all_invalidated_gates_on_required_merge_group"] = True  # type: ignore[index]
+        payload["merge"]["complete_bypass_audit"] = True  # type: ignore[index]
+        payload["merge"]["actor_inventory_complete"] = True  # type: ignore[index]
+        payload["merge"]["base_proof"] = "strict_queue_full_gate_binding"  # type: ignore[index]
+        payload["changes"]["base_ref"] = True  # type: ignore[index]
+        strict_retarget = build_plan(payload)
+        self.assertEqual(strict_retarget["merge_constraints"]["constraint_status"], "satisfied")
+        self.assertEqual(
+            strict_retarget["queue_enrollment_action"],
+            "cancel_and_reenroll_after_strict_base_rerun",
+        )
+
+        payload["changes"]["head"] = True  # type: ignore[index]
+        self.assertEqual(
+            build_plan(payload)["queue_enrollment_action"],
+            "cancel_and_reenroll_after_head_change",
+        )
+
+    def test_head_change_invalidates_positive_results_not_applicable_findings(self) -> None:
+        payload = _payload()
+        payload["changes"]["head"] = True  # type: ignore[index]
+        result = build_plan(payload)
+        self.assertEqual(result["readiness_verdict"], "not-evaluated")
+        self.assertEqual(
+            set(result["invalidated_evidence"]),
+            {"base_sensitive_test", "head_check", "provider", "range_review"},
+        )
+
+        negative_in_positive_array = _payload()
+        negative_in_positive_array["evidence"].append(  # type: ignore[union-attr]
+            {"id": "unresolved-finding", "kind": "negative_provider_finding", "depends_on": ["head"]}
+        )
+        with self.assertRaises(PlanInputError):
+            build_plan(negative_in_positive_array)
+
     def test_direct_and_queue_operations_reject_wrong_or_missing_head_binding(self) -> None:
         for operation, wrong_binding in (
             ("direct", "persistent-queue-merge-async-sha"),
@@ -242,14 +355,19 @@ class ReadinessPlanTests(unittest.TestCase):
         ):
             with self.subTest(operation=operation, case="wrong"):
                 payload = _payload()
+                if operation == "merge_queue":
+                    _queue_profile(payload)
                 payload["merge"]["operation"] = operation  # type: ignore[index]
                 payload["merge"]["head_binding"] = wrong_binding  # type: ignore[index]
-                with self.assertRaises(PlanInputError):
+                with self.assertRaisesRegex(PlanInputError, "does not match"):
                     build_plan(payload)
 
             with self.subTest(operation=operation, case="missing"):
                 payload = _payload()
-                payload["merge"]["operation"] = operation  # type: ignore[index]
+                if operation == "merge_queue":
+                    _queue_profile(payload)
+                else:
+                    payload["merge"]["operation"] = operation  # type: ignore[index]
                 payload["merge"]["head_binding"] = "none"  # type: ignore[index]
                 constraints = build_plan(payload)["merge_constraints"]
                 self.assertEqual(constraints["constraint_status"], "blocked")
@@ -264,7 +382,10 @@ class ReadinessPlanTests(unittest.TestCase):
 
             with self.subTest(operation=operation, case="omitted"):
                 payload = _payload()
-                payload["merge"]["operation"] = operation  # type: ignore[index]
+                if operation == "merge_queue":
+                    _queue_profile(payload)
+                else:
+                    payload["merge"]["operation"] = operation  # type: ignore[index]
                 del payload["merge"]["head_binding"]  # type: ignore[index]
                 with self.assertRaises(PlanInputError):
                     build_plan(payload)

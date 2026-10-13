@@ -42,15 +42,14 @@ Initial-scope validation passed 10 planner tests and 52 contract tests with 2
 private-layout skips; it predates the current-head consistency repairs and is
 not their validation evidence.
 
-Current-head repairs: Python 3.10.19 `test_readiness_plan.py` passed 13 tests
+First successor-round repairs: Python 3.10.19 `test_readiness_plan.py` passed 13 tests
 in 0.064 seconds; `test_contracts.py` passed 52 tests with 2 private-layout
 skips in 5.043 seconds. Ruff, source compile, and whitespace checks passed.
-The parent independently checked both final logs and ran the actual direct
-and queue CLI with a same-target base-tip-only change. Both preserved only
-the head-only review, invalidated the base-sensitive test, and remained
-`planning_only: true` / `readiness_verdict: not-evaluated`; the queue plan
-retained its exact-head enrollment while requiring current merge-group checks.
-Skill and journal validation also passed.
+The parent independently checked both first-round logs and ran actual direct
+and queue CLI examples before successor review a6. Those examples and results
+predate the out-of-band queue coverage repair below and are not validation for
+the current successor candidate. Skill and journal validation passed for that
+earlier candidate.
 Final test log paths and SHA-256:
 
 - Planner log `/private/tmp/pr137-readiness-fixes.ME9JQc/planner-final.log`:
@@ -64,6 +63,42 @@ hypothetical base-tip-only change and verified native `gh 2.100.0` accepted
 are historical initial-scope evidence, not validation for the current-head
 repairs.
 
+Successor observation a6 repairs: a queue request must explicitly set and
+prove `bypass_rules: false` before reuse; an unproved/true flag blocks. Routine
+same-ref base changes retain an enrollment only when no positive out-of-band
+gate was invalidated or all such gates are covered by the required merge group
+or a non-bypassed hold; otherwise re-enroll after reacquisition. The planner's
+evidence array is restricted to positive/pass/clean artifacts, while applicable
+negative findings remain independent blockers. Strict retargets now use the
+full strict rerun action, with head change retaining precedence. No remote
+review, CI, or merge pass is claimed by this journal update.
+
+Worker validation before final parent documentation/test refinements: Python 3.10.19 `test_readiness_plan.py` passed 17
+tests in 0.066 seconds; `test_contracts.py` passed 52 tests with 2 expected
+private-layout skips in 4.008 seconds. Ruff, source compile, whitespace, and
+project-journal validation passed. Final log paths and SHA-256:
+
+- Planner `/private/tmp/pr137-readiness-fixes.ME9JQc/successor-planner-final.log`:
+  `b6cf55a0ae2ff72e1f18d89299bb4889f545372ba8ca3b968f2bd36fbd9cc6bb`.
+- Contracts `/private/tmp/pr137-readiness-fixes.ME9JQc/successor-contracts-final2.log`:
+  `3812d68e9bc91f46943fbcb4f3fbc9f5b12c2fdcea9e75df83d7fff2422b7e6b`.
+
+The parent then clarified own acknowledged async requests versus reuse of a
+pre-existing UUID, made the retention condition explicit in every queue
+execution clause, and strengthened wrong-binding/strict-retarget tests.
+Final actual parent Python 3.10.19 validation passed 17 planner tests in
+0.065 seconds and 52 contract tests in 4.582 seconds, with 2 expected skips;
+both bounded supervisors exited 0 with no incomplete output. Log SHA-256:
+
+- Planner `80c9ca59c0f637ee915445a8099a69842a9d7bfc7c17c9a4e2fe2570ed5a752f`.
+- Contracts `11e3ca4cc31b31f8a8a36ba50cb43a3b48a2e223880c4bf4b4e13a094470bdd0`.
+
+Actual direct plus three queue CLI cases retained the head-only positive
+artifact but invalidated the base-sensitive test. The unprotected case
+canceled/re-enrolled after revalidation, covered evidence retained the entry,
+and unknown bypass state blocked it. Every output stayed planning-only and
+`readiness_verdict: not-evaluated`, never full readiness or merge authority.
+
 ```text
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 --version
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_readiness_plan.py' -v
@@ -71,6 +106,7 @@ PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv
 ruff check skills/review-orchestration-playbook/scripts/readiness_plan.py skills/review-orchestration-playbook/tests/test_readiness_plan.py skills/review-orchestration-playbook/tests/test_contracts.py
 /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -c 'import pathlib,sys; [compile(pathlib.Path(p).read_bytes(),p,"exec") for p in sys.argv[1:]]' skills/review-orchestration-playbook/scripts/readiness_plan.py skills/review-orchestration-playbook/tests/test_readiness_plan.py skills/review-orchestration-playbook/tests/test_contracts.py
 git diff --check
+/Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .
 ```
 
 No current-head remote review, CI, or merge pass is claimed here.
