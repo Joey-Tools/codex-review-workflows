@@ -139,6 +139,20 @@ rather than returning retention, while keeping its invariant head artifact.
 This is planning-only evidence, not permission to merge or proof of current
 remote review/CI. Runtime security remains unchanged.
 
+The action-interface follow-up aligns the documented enum with reachable
+planner outputs, removing two unreachable blocked-action values and including
+`cancel_and_reenroll_after_merge_constraints_reacquired`. A behavior-based
+regression generates every documented action and compares the reachable set
+with the documentation, preventing another interface drift. No planner runtime
+implementation or security guard changed in this follow-up.
+
+Final parent Python 3.10.19 validation passed 22 planner tests in 0.053 seconds
+and 52 contracts in 3.657 seconds, with 2 expected skips and actual
+supervisor0/incomplete-null. Log SHA-256:
+
+- Planner `2dac33eabe9a02e13525b671a08d80bab52537f251790730a99af256ae8cb10a`.
+- Contracts `524317f930b73e9be4f92aeadbe1b71697c3468f05ca7d18bb4f4eae3946f639`.
+
 ```text
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 --version
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_readiness_plan.py' -v

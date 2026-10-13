@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -97,6 +98,34 @@ def _queue_profile(
 
 
 class ReadinessPlanTests(unittest.TestCase):
+    def test_documented_queue_actions_match_reachable_behavior(self) -> None:
+        reference = (SCRIPTS.parent / "references" / "pr-readiness.md").read_text()
+        action_contract = reference.split("Its `queue_enrollment_action` is one of", 1)[1].split("The caller must inspect", 1)[0]
+        documented = set(re.findall(r"`([^`]+)`", action_contract))
+        observed = {build_plan(_payload())["queue_enrollment_action"]}
+        for strict, change, minimal_evidence in (
+            (False, None, False),
+            (False, "base_tip", True),
+            (False, "base_ref", False),
+            (False, "head", False),
+            (True, "base_tip", False),
+            (False, "base_tip", False),
+            (True, None, False),
+        ):
+            with self.subTest(strict=strict, change=change, minimal=minimal_evidence):
+                payload = _payload()
+                _queue_profile(payload)
+                if strict:
+                    _strict_profile(payload)
+                if change:
+                    payload["changes"][change] = True  # type: ignore[index]
+                if minimal_evidence:
+                    payload["evidence"] = [{"id": "provider", "kind": "head_only_provider", "depends_on": ["head"]}]
+                action = build_plan(payload)["queue_enrollment_action"]
+                self.assertIn(action, documented)
+                observed.add(action)
+        self.assertEqual(documented, observed)
+
     def test_base_tip_change_rechecks_only_dependent_evidence_by_default(self) -> None:
         payload = _payload()
         payload["changes"]["base_tip"] = True  # type: ignore[index]

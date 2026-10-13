@@ -135,14 +135,14 @@ retarget or head change cancels the entry, and strict base changes
 cancel/re-enroll after full base revalidation. The queue request must prove
 `bypass_rules: false`; an enabled or unknown value never qualifies for
 retention. Its `queue_enrollment_action` is one of
-`not_applicable`, `blocked_missing_persistent_head_binding`,
+`not_applicable`,
 `retain_if_exact_head_binding_remains_current`,
 `retain_across_merge_group_rebuild`,
 `cancel_and_reenroll_after_base_retarget`,
 `cancel_and_reenroll_after_head_change`,
 `cancel_and_reenroll_after_strict_base_rerun`,
 `cancel_and_reenroll_after_affected_evidence_revalidation`, or
-`blocked_queue_bypass_rules_enabled_or_unknown`. The caller must inspect
+`cancel_and_reenroll_after_merge_constraints_reacquired`. The caller must inspect
 actual request state and verify the exact head binding. The planner never
 acquires evidence, establishes full readiness, authorizes a merge, or replaces
 the human-owned final gate. Candidate code cannot be used to approve this
