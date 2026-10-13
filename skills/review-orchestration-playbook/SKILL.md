@@ -103,8 +103,9 @@ stable reread. Omitted local lanes remain omitted.
 
 A merge requires its own authorization. Bind the reviewed head in the
 state-changing server request itself, using `--match-head-commit <head_sha>`
-for direct merge. Do not request administrator or other bypass. Routine mode
-does not require an exact-base or atomic base-contraction proof; report its
+for direct merge; queue enrollment uses the separate persistent `merge-async`
+SHA binding. Do not request administrator or other bypass. Routine mode does
+not require an exact-base or atomic base-contraction proof; report its
 GitHub control-plane trust boundary and residual race. Strict mode retains the
 readiness reference's complete base proof. Preserve persistent queue head
 binding. If required strict freshness requires a base update, use a signed

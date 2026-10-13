@@ -24,7 +24,11 @@ _PROOFS = frozenset(
         "expected_base_precondition",
         "repository_exact_base_guard",
         "monotonic_range_contraction",
+        "strict_queue_full_gate_binding",
     )
+)
+_HEAD_BINDINGS = frozenset(
+    ("match-head-commit", "persistent-queue-merge-async-sha", "none")
 )
 
 
@@ -45,7 +49,7 @@ def _boolean(value: Any, *, label: str) -> bool:
 
 
 def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]:
-    common_keys = {"head_binding", "admin_bypass_requested"}
+    common_keys = {"operation", "head_binding", "admin_bypass_requested"}
     strict_keys = {
         "base_proof",
         "strict_freshness",
@@ -57,21 +61,55 @@ def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]
         "exact_base_ref",
         "merge_base_equals_reviewed_base",
     }
+    strict_queue_keys = {
+        "all_invalidated_gates_on_required_merge_group",
+        "non_bypassed_completion_hold",
+    }
+    operation = merge.get("operation") if isinstance(merge, dict) else None
+    if operation not in ("direct", "merge_queue"):
+        raise PlanInputError("merge.operation must be direct or merge_queue")
     keys = common_keys | (strict_keys if profile == "strict" else set())
+    if profile == "strict" and operation == "merge_queue":
+        keys |= strict_queue_keys
     _closed_object(merge, keys=keys, label="merge")
-    if merge["head_binding"] not in ("match-head-commit", "none"):
-        raise PlanInputError("merge.head_binding must be match-head-commit or none")
+    if (
+        not isinstance(merge["head_binding"], str)
+        or merge["head_binding"] not in _HEAD_BINDINGS
+    ):
+        raise PlanInputError("merge.head_binding is unknown")
+    expected_binding = (
+        "persistent-queue-merge-async-sha"
+        if merge["operation"] == "merge_queue"
+        else "match-head-commit"
+    )
+    if merge["head_binding"] not in (expected_binding, "none"):
+        raise PlanInputError(
+            "merge.head_binding does not match merge.operation"
+        )
+    if profile == "strict" and merge["base_proof"] == "strict_queue_full_gate_binding":
+        if merge["operation"] != "merge_queue":
+            raise PlanInputError(
+                "strict_queue_full_gate_binding requires merge_queue operation"
+            )
+    elif (
+        profile == "strict"
+        and merge["operation"] == "merge_queue"
+        and merge["base_proof"] not in ("none", "strict_queue_full_gate_binding")
+    ):
+        raise PlanInputError(
+            "direct strict base proof cannot satisfy merge_queue operation"
+        )
     if profile == "strict" and (
         not isinstance(merge["base_proof"], str)
         or merge["base_proof"] not in _PROOFS
     ):
         raise PlanInputError("merge.base_proof is unknown")
-    booleans = keys - {"head_binding", "base_proof"}
+    booleans = keys - {"operation", "head_binding", "base_proof"}
     for key in booleans:
         _boolean(merge[key], label=f"merge.{key}")
 
     reasons: list[str] = []
-    if merge["head_binding"] != "match-head-commit":
+    if merge["head_binding"] == "none":
         reasons.append("exact_reviewed_head_not_server_bound")
     if merge["admin_bypass_requested"]:
         reasons.append("admin_bypass_forbidden")
@@ -99,15 +137,37 @@ def _merge_constraints(profile: str, merge: Mapping[str, Any]) -> dict[str, Any]
             for key in required:
                 if not merge[key]:
                     reasons.append(f"{key}_unproved")
+        elif proof == "strict_queue_full_gate_binding":
+            if not merge["actor_inventory_complete"]:
+                reasons.append("actor_inventory_complete_unproved")
+            if not (
+                merge["all_invalidated_gates_on_required_merge_group"]
+                or merge["non_bypassed_completion_hold"]
+            ):
+                reasons.append("strict_queue_gate_contract_unproved")
         else:
             reasons.append("strict_base_proof_missing")
 
+    queue_binding = merge["operation"] == "merge_queue"
     return {
         "constraint_status": "satisfied" if not reasons else "blocked",
+        "operation": merge["operation"],
         "profile": profile,
         "reasons": reasons,
         "residual_base_race": profile == "routine",
-        "required_head_binding": "--match-head-commit <exact-reviewed-head>",
+        "head_binding_type": (
+            "persistent_queue_merge_async_sha"
+            if queue_binding and merge["head_binding"] != "none"
+            else "direct_match_head_commit"
+            if not queue_binding and merge["head_binding"] == "match-head-commit"
+            else "missing"
+        ),
+        "required_head_binding": (
+            "PUT /repos/<owner>/<repo>/pulls/<number>/merge-async "
+            '{"sha":"<exact-reviewed-head>","merge_action":"merge_queue"}'
+            if queue_binding
+            else "--match-head-commit <exact-reviewed-head>"
+        ),
         "admin_bypass_allowed": False,
     }
 
@@ -178,6 +238,23 @@ def build_plan(payload: Any) -> dict[str, Any]:
             preserved.append(identity)
 
     merge = _merge_constraints(profile, root["merge"])
+    queue_binding = root["merge"]["operation"] == "merge_queue"
+    base_changed = bool(changed & {"base_ref", "base_tip", "merge_base"})
+    if not queue_binding:
+        queue_enrollment_action = "not_applicable"
+    elif root["merge"]["head_binding"] == "none":
+        queue_enrollment_action = "blocked_missing_persistent_head_binding"
+    elif "head" in changed:
+        queue_enrollment_action = "cancel_and_reenroll_after_head_change"
+    elif "base_ref" in changed:
+        queue_enrollment_action = "cancel_and_reenroll_after_base_retarget"
+    elif profile == "strict" and base_changed:
+        queue_enrollment_action = "cancel_and_reenroll_after_strict_base_rerun"
+    elif base_changed:
+        queue_enrollment_action = "retain_across_merge_group_rebuild"
+    else:
+        queue_enrollment_action = "retain_if_exact_head_binding_remains_current"
+
     global_invalidations = []
     if changed:
         global_invalidations.extend(
@@ -185,6 +262,8 @@ def build_plan(payload: Any) -> dict[str, Any]:
         )
     if changed & {"base_ref", "base_tip", "merge_base"}:
         global_invalidations.append("merge_policy_snapshot")
+    if queue_binding and changed:
+        global_invalidations.append("current_merge_group_checks")
 
     return {
         "planning_only": True,
@@ -194,6 +273,7 @@ def build_plan(payload: Any) -> dict[str, Any]:
         "preserved_evidence": sorted(preserved),
         "global_invalidations": global_invalidations,
         "merge_constraints": merge,
+        "queue_enrollment_action": queue_enrollment_action,
     }
 
 

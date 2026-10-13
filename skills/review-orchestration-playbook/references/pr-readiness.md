@@ -99,18 +99,40 @@ authority.
 The classifier accepts one closed JSON object with `profile`, four boolean
 `changes` (`head`, `base_ref`, `base_tip`, `merge_base`), an `evidence` array
 whose records give an `id`, `kind`, and exact dependency list, and a closed
-`merge` constraint record. Routine `merge` input contains only
-`head_binding` and `admin_bypass_requested`; strict input additionally requires
-the complete strict-base and bypass-audit fields. Unknown fields, dependency
-names, kinds, or missing values fail closed. Evidence dependencies are
+`merge` constraint record. It separately names `operation: direct | merge_queue`
+and `head_binding`; direct accepts only `match-head-commit` or `none`, while
+`merge_queue` accepts only `persistent-queue-merge-async-sha` or `none`.
+Mismatched operation/binding pairs fail closed. Routine `merge` input also
+requires `admin_bypass_requested`; strict input additionally requires the
+complete strict-base and bypass-audit fields. Strict queue input additionally
+requires `all_invalidated_gates_on_required_merge_group` and
+`non_bypassed_completion_hold`. Strict queue proof is named
+`strict_queue_full_gate_binding`, is accepted only with the `merge_queue`
+operation, and requires complete actor inventory plus either proof that every
+invalidated gate is bound to the required merge group or a non-bypassed hold
+until all are reacquired. Direct strict proof types cannot satisfy a queue
+operation. Unknown fields, dependency names, kinds, or missing values fail
+closed. Evidence dependencies are
 classified by the readiness owner from producer semantics, not self-declared
 by the evidence subject; missing or ambiguous classification blocks reuse.
 Invoke it with parent-owned evidence classification, for
 example `python skills/review-orchestration-playbook/scripts/readiness_plan.py
---input <readiness-plan.json>`. The output is a revalidation and merge-profile
-plan only. It never acquires evidence, establishes full readiness, authorizes
-a merge, or replaces the human-owned final gate. Candidate code cannot be used
-to approve this playbook's own migration.
+--input <readiness-plan.json>`. The output is a revalidation, merge-profile,
+and queue-enrollment action plan only. For queue operations, routine base-tip
+or merge-base changes on the same target ref retain the existing exact-head
+enrollment across merge-group rebuilds; a target-ref retarget or head change
+cancels it, and strict base changes cancel/re-enroll after full base
+revalidation. Its `queue_enrollment_action` is one of
+`not_applicable`, `blocked_missing_persistent_head_binding`,
+`retain_if_exact_head_binding_remains_current`,
+`retain_across_merge_group_rebuild`,
+`cancel_and_reenroll_after_base_retarget`,
+`cancel_and_reenroll_after_head_change`, or
+`cancel_and_reenroll_after_strict_base_rerun`. The caller must inspect actual
+request state and verify the exact head binding. The planner never acquires
+evidence, establishes full readiness, authorizes a merge, or replaces the
+human-owned final gate. Candidate code cannot be used to approve this
+playbook's own migration.
 
 When the unique merge base and head did not change, the active `range_origin`
 record remains the correct range provenance. Retaining it does not by itself
@@ -191,11 +213,15 @@ GitHub Codex result may remain valid as latest-head-only evidence, but it never
 makes the PR ready while the local provenance gate or new-base lanes are
 blocked.
 
-Whether or not the merge base changed, a changed `base_ref_oid` also applies
-the complete readiness invalidation above. The range-origin transition
-answers which range may be rerun; it never authorizes reuse of reviews,
-validations, CI, conversations, readiness decisions, or final-reread evidence
-from the earlier base tip.
+A changed `base_ref_oid` always requires a fresh scope and final reread. In
+routine mode, use the dependency plan to revalidate only evidence affected by
+the changed target tip/ref; evidence with unknown dependency classification
+cannot be reused. Unaffected reviews, validations, CI, conversations, and
+other readiness evidence may remain countable when parent-owned dependency
+classification proves them invariant. In strict mode, apply complete
+base-bound readiness invalidation, except a separately reread head-only
+provider result. The range-origin transition answers which local range may be
+rerun; it never independently authorizes evidence reuse.
 
 ## Lifecycle Gate
 
@@ -261,13 +287,24 @@ freshness setting.
 
 When a merge queue owns freshness, follow the queue's merge-group and check
 semantics instead of updating the feature branch unnecessarily. In routine
-mode, a target-base change requires new current merge-group checks and a new
-enrollment; use the dependency classifier for out-of-band evidence, preserving
-unaffected gates only when their parent-owned dependency classification proves
-they are invariant. Strict mode invalidates its complete base-bound evidence
-set and requires a new enrollment, unless a repository-proved, non-bypassed
-required merge-group gate prevents completion until every invalidated gate has
-been reacquired for that exact base tip. When no merge queue owns freshness
+mode, a base-tip or merge-base change on the same target ref and unchanged
+head preserves the existing persistent `merge-async` SHA-bound enrollment
+across a merge-group rebuild.
+The selected operation is `merge_queue`, and the binding must be
+`persistent-queue-merge-async-sha`; direct `match-head-commit` is not valid for
+that operation. A target-ref retarget cancels/re-enrolls the entry even if the
+feature head is unchanged. Reacquire
+required checks for the current merge group and use the dependency classifier
+for out-of-band evidence, retaining unaffected gates only when their
+parent-owned dependency classification proves they are invariant. Do not
+cancel/re-enroll merely because the merge group rebuilt. A head change always
+invalidates and cancels the enrollment. Strict mode invalidates its complete
+base-bound evidence set and cancels/re-enrolls after required gates are
+reacquired. The strict queue path also requires a repository-proved,
+non-bypassed required merge-group gate that prevents completion until every
+invalidated gate has been reacquired for the exact base tip, or a proved
+contract that puts every such gate on the rebuilt required merge group;
+otherwise strict queue merge is blocked. When no merge queue owns freshness
 and strict freshness blocks the authorized PR workflow, merge the current base
 branch into the feature branch with a signed merge commit. Do not rebase,
 force-push, or rewrite the branch into linear history merely to satisfy
@@ -513,6 +550,14 @@ Strict mode's base decision is fail closed:
 | An observed `baseRefName` retarget, even to the same OID or another `head_sha` ancestor | Full invalidation; contraction unavailable |
 | Any rule, actor, endpoint, or transactional-enforcement proof is missing or ambiguous | Blocked |
 
+For a strict merge queue, `base_proof: strict_queue_full_gate_binding` is the
+only queue-specific proof type. It requires complete bypass and actor
+inventories, no configured bypass, and either proof that all applicable
+invalidated gates are required on the rebuilt merge group or a non-bypassed
+hold until they are reacquired. It is not a direct expected-base, exact-base,
+or monotonic proof and cannot be used for a direct merge. A direct-only proof
+cannot satisfy a queue operation.
+
 Routine mode requires the exact reviewed head and ordinary readiness gates
 described above; the strict-only blockers in this table do not apply to it.
 
@@ -537,8 +582,11 @@ gh pr merge <PR_NUMBER> --repo OWNER/REPO --squash \
 
 An equivalent direct-merge client is acceptable only when the same mutation
 carries the exact reviewed head, such as the synchronous pull-request merge
-API's `sha` field, and one of the two protected base properties above also
-applies. Never emulate either condition with a second read in the client.
+API's `sha` field. Routine mode does not require either strict protected-base
+property; it accepts the documented GitHub control-plane trust boundary and
+residual base race above. Strict-base-proof mode additionally requires one of
+the two protected base properties above. Never emulate either condition with
+a second read in the client.
 
 The queue path needs a persistent expected-head binding, not merely an atomic
 request to enable auto-merge. After every pre-enrollment gate is current and
@@ -565,17 +613,23 @@ only after its result proves the same expected head and queue action. A `200`
 already-merged or already-queued result likewise needs complete current PR,
 queue, and final-head evidence rather than an inferred binding.
 
-For a queue path, atomically enroll the exact reviewed feature head, then
+For a queue path, select `operation: merge_queue` with
+`head_binding: persistent-queue-merge-async-sha`; the planner rejects a
+binding paired with the wrong operation. Atomically enroll the exact reviewed
+feature head, then
 follow the resulting latest-base merge-group checks and reread queue state. In
-routine mode, reacquire required checks for the current merge group and use the
+routine mode, preserve the exact-head enrollment across a same-target-ref
+base-tip/merge-base group rebuild, but cancel/re-enroll on a target-ref
+retarget. Reacquire required checks for the new current merge group, and use the
 dependency classifier for out-of-band evidence; a rebuilt merge group does not
-by itself invalidate an unrelated head/range result. A changed head invalidates
+by itself invalidate an unrelated head/range result. The planner reports this
+as `retain_across_merge_group_rebuild`. A changed head invalidates and cancels
 the enrollment and all old-head evidence, and requires the applicable full
-pre-merge loop for the new head. Strict mode retains the repository-proved,
-non-bypassed hold that blocks completion after a base change until every
-invalidated gate is reacquired, or a proved contract that puts every such gate
-on the new required merge group. Without that strict contract, strict queue
-merge is blocked. A later feature-head change must be observed as cancellation
+pre-merge loop for the new head. Strict mode cancels/re-enrolls after its full
+base invalidation, and also requires the repository-proved non-bypassed hold
+or new-required-merge-group contract described above. Without that strict
+contract, strict queue merge is blocked. A later feature-head change must be
+observed as cancellation
 of the bound asynchronous merge. An ancestry-proven unresolved provider finding
 that remains applicable to the new head continues to block until typed resolution or an
 accepted later corrective artifact. An
@@ -598,12 +652,14 @@ conversation, lifecycle, merge-policy, and final-reread gate before
 constructing a new conditionally bound operation. A signed merge of the
 current base into the feature branch under the strict-freshness rule is not an
 exception: it intentionally creates a new head and requires that complete
-rerun. If the target ref or base tip changes again before the direct merge and
-the parent observes it, start the full invalidation loop again. An unobserved
-change may reach the mutation only under one of the two protected base
-properties above; otherwise the mutation is blocked. When the change leaves
-the feature branch behind, strict freshness additionally blocks and the
-signed-merge/full-rerun rule applies.
+rerun. If the target ref or base tip changes again before direct merge and the
+parent observes it, restart scope/final reread and apply profile-specific
+invalidation: routine revalidates affected evidence; strict reruns its complete
+base-bound evidence set. An unobserved base change may reach a routine direct
+merge under the documented control-plane trust boundary and residual race.
+Strict direct merge remains blocked without one of the two protected base
+properties above. When the change leaves the feature branch behind, strict
+freshness additionally blocks and the signed-merge/full-rerun rule applies.
 
 After a direct merge or queue completion, verify merged lifecycle and resulting
 default-branch state, and require the PR's final feature head to remain exactly
