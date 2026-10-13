@@ -104,7 +104,9 @@ whose records give an `id`, `kind`, and exact dependency list, and a closed
 `merge` constraint record. It separately names `operation: direct | merge_queue`
 and `head_binding`; direct accepts only `match-head-commit` or `none`, while
 `merge_queue` accepts only `persistent-queue-merge-async-sha` or `none`.
-Mismatched operation/binding pairs fail closed. Routine `merge` input also
+Repeated JSON object keys are rejected recursively for stdin and file input;
+there is no last-key-wins fallback. Mismatched operation/binding pairs fail
+closed. Routine `merge` input also
 requires `admin_bypass_requested`; every queue input additionally requires
 `all_invalidated_gates_on_required_merge_group`,
 `non_bypassed_completion_hold`, and `queue_bypass_rules` (the observed request
@@ -114,9 +116,14 @@ queue proof is named
 `strict_queue_full_gate_binding`, is accepted only with the `merge_queue`
 operation, and requires complete actor inventory plus either proof that every
 invalidated gate is bound to the required merge group or a non-bypassed hold
-until all are reacquired. Direct strict proof types cannot satisfy a queue
-operation. Unknown fields, dependency names, kinds, or missing values fail
-closed. Evidence dependencies are
+until all are reacquired. This coverage includes every `global_invalidations`
+entry as well as every invalidated evidence record; ordinary merge-group
+checks alone do not prove coverage of global scope, final-reread, readiness,
+or merge-policy gates. The input boolean
+`all_invalidated_gates_on_required_merge_group` is parent-owned proof of that
+complete coverage, not a statement about only the evidence array. Direct strict
+proof types cannot satisfy a queue operation. Unknown fields, dependency
+names, kinds, repeated keys, or missing values fail closed. Evidence dependencies are
 classified by the readiness owner from producer semantics, not self-declared
 by the evidence subject; missing or ambiguous classification blocks reuse.
 Invoke it with parent-owned evidence classification, for
@@ -127,11 +134,16 @@ pass, or clean artifacts only; negative findings and unresolved conversations
 stay in their independent blocking gate and are never eligible for planner
 invalidation or reuse. For queue operations, routine mode preserves the
 exact-head enrollment across a base-tip or merge-base change on the same target
-ref, or an independent merge-group synthetic-SHA change, only when no positive
-out-of-band artifact was invalidated or every invalidated
-gate is covered by the required merge group or a non-bypassed completion hold.
-Otherwise cancel/re-enroll after affected evidence is reacquired. A target-ref
-retarget or head change cancels the entry, and strict base changes
+ref, or an independent merge-group synthetic-SHA change, only when every
+invalidated evidence gate and every global invalidation is covered by the
+required merge group or a non-bypassed completion hold. Global gates include
+the fresh scope/final reread and readiness decision on every observed change,
+plus merge-policy snapshot for base changes and current merge-group checks for
+queue changes. Thus an empty or head-only evidence array does not permit queue
+retention after a base or merge-group change by itself. If any global or
+evidence gate is uncovered, cancel/re-enroll and reacquire the affected gate;
+the planner distinguishes global-only invalidation from affected evidence.
+A target-ref retarget or head change cancels the entry, and strict base changes
 cancel/re-enroll after full base revalidation. The queue request must prove
 `bypass_rules: false`; an enabled or unknown value never qualifies for
 retention. Its `queue_enrollment_action` is one of
@@ -141,7 +153,8 @@ retention. Its `queue_enrollment_action` is one of
 `cancel_and_reenroll_after_base_retarget`,
 `cancel_and_reenroll_after_head_change`,
 `cancel_and_reenroll_after_strict_base_rerun`,
-`cancel_and_reenroll_after_affected_evidence_revalidation`, or
+`cancel_and_reenroll_after_affected_evidence_revalidation`,
+`cancel_and_reenroll_after_global_gate_revalidation`, or
 `cancel_and_reenroll_after_merge_constraints_reacquired`. The caller must inspect
 actual request state and verify the exact head binding. The planner never
 acquires evidence, establishes full readiness, authorizes a merge, or replaces
@@ -602,10 +615,10 @@ Strict mode's base decision is fail closed:
 For a strict merge queue, `base_proof: strict_queue_full_gate_binding` is the
 only queue-specific proof type. It requires complete bypass and actor
 inventories, no configured bypass, and either proof that all applicable
-invalidated gates are required on the rebuilt merge group or a non-bypassed
-hold until they are reacquired. It is not a direct expected-base, exact-base,
-or monotonic proof and cannot be used for a direct merge. A direct-only proof
-cannot satisfy a queue operation.
+invalidated evidence gates and global invalidations are required on the rebuilt
+merge group or a non-bypassed hold until they are reacquired. It is not a
+direct expected-base, exact-base, or monotonic proof and cannot be used for a
+direct merge. A direct-only proof cannot satisfy a queue operation.
 
 Routine mode requires the exact reviewed head and ordinary readiness gates
 described above; the strict-only blockers in this table do not apply to it.
@@ -680,9 +693,13 @@ feature head, then
 follow the resulting latest-base merge-group checks and reread queue state. In
 routine mode, apply the positive-evidence dependency plan before retaining the
 exact-head enrollment across a same-target-ref base-tip/merge-base rebuild.
-Retain it only when no positive out-of-band gate was invalidated or all such
-gates are covered by the required merge group or a non-bypassed completion
-hold. Otherwise cancel/re-enroll after affected evidence is reacquired; a
+Retain it only when every invalidated evidence gate and global invalidation is
+covered by the required merge group or a non-bypassed completion hold. Global
+invalidations include scope, final reread, and readiness on every observed
+change, plus the merge-policy snapshot after a base change and current
+merge-group checks after a queue change. An empty or head-only evidence list
+does not allow retention through these global invalidations. Otherwise
+cancel/re-enroll after affected evidence and global gates are reacquired; a
 target-ref retarget also cancels/re-enrolls. Reacquire required checks for the
 new current merge group. A rebuilt merge group does not
 by itself invalidate an unrelated head/range result. The planner reports safe

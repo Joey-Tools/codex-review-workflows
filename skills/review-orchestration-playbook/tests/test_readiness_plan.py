@@ -6,6 +6,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -124,6 +125,10 @@ class ReadinessPlanTests(unittest.TestCase):
                 action = build_plan(payload)["queue_enrollment_action"]
                 self.assertIn(action, documented)
                 observed.add(action)
+        covered_queue = _payload()
+        _queue_profile(covered_queue, required_group=True)
+        covered_queue["changes"]["base_tip"] = True  # type: ignore[index]
+        observed.add(build_plan(covered_queue)["queue_enrollment_action"])
         self.assertEqual(documented, observed)
 
     def test_base_tip_change_rechecks_only_dependent_evidence_by_default(self) -> None:
@@ -229,7 +234,7 @@ class ReadinessPlanTests(unittest.TestCase):
 
     def test_queue_binding_survives_routine_base_rebuild_but_strict_reenrolls(self) -> None:
         payload = _payload()
-        _queue_profile(payload)
+        _queue_profile(payload, required_group=True)
         payload["evidence"] = [  # type: ignore[assignment]
             item for item in payload["evidence"]
             if item["id"] == "provider" or item["id"] == "head_check"
@@ -401,8 +406,61 @@ class ReadinessPlanTests(unittest.TestCase):
         no_out_of_band["changes"]["base_tip"] = True  # type: ignore[index]
         self.assertEqual(
             build_plan(no_out_of_band)["queue_enrollment_action"],
-            "retain_across_merge_group_rebuild",
+            "cancel_and_reenroll_after_global_gate_revalidation",
         )
+
+    def test_global_gates_block_uncovered_empty_or_head_only_queue_retention(self) -> None:
+        for dimension in ("base_tip", "merge_base", "merge_group"):
+            for evidence in (
+                [],
+                [{"id": "provider", "kind": "head_only_provider", "depends_on": ["head"]}],
+            ):
+                with self.subTest(dimension=dimension, evidence=evidence):
+                    payload = _payload()
+                    _queue_profile(payload)
+                    payload["evidence"] = copy.deepcopy(evidence)
+                    payload["changes"][dimension] = True  # type: ignore[index]
+
+                    result = build_plan(payload)
+
+                    self.assertEqual(result["invalidated_evidence"], {})
+                    self.assertTrue(result["global_invalidations"])
+                    self.assertEqual(
+                        result["queue_enrollment_action"],
+                        "cancel_and_reenroll_after_global_gate_revalidation",
+                    )
+
+        for dimension in ("base_tip", "merge_base", "merge_group"):
+            for required_group, completion_hold in ((True, False), (False, True)):
+                with self.subTest(
+                    dimension=dimension,
+                    required_group=required_group,
+                    completion_hold=completion_hold,
+                ):
+                    payload = _payload()
+                    _queue_profile(
+                        payload,
+                        required_group=required_group,
+                        completion_hold=completion_hold,
+                    )
+                    payload["evidence"] = [
+                        {"id": "provider", "kind": "head_only_provider", "depends_on": ["head"]}
+                    ]
+                    payload["changes"][dimension] = True  # type: ignore[index]
+
+                    result = build_plan(payload)
+
+                    self.assertTrue(result["global_invalidations"])
+                    self.assertEqual(
+                        result["queue_enrollment_action"],
+                        "retain_across_merge_group_rebuild",
+                    )
+
+        direct = _payload()
+        direct["changes"]["base_tip"] = True  # type: ignore[index]
+        result = build_plan(direct)
+        self.assertIn("pr_scope_and_final_reread", result["global_invalidations"])
+        self.assertEqual(result["queue_enrollment_action"], "not_applicable")
 
     def test_strict_queue_retarget_uses_full_strict_action_and_head_wins(self) -> None:
         payload = _payload()
@@ -462,7 +520,7 @@ class ReadinessPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             no_group_plan["queue_enrollment_action"],
-            "retain_across_merge_group_rebuild",
+            "cancel_and_reenroll_after_global_gate_revalidation",
         )
 
     def test_merge_group_sensitive_queue_gates_need_coverage_or_hold(self) -> None:
@@ -777,6 +835,81 @@ class ReadinessPlanTests(unittest.TestCase):
         )
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("changes must contain exactly", rejected.stderr)
+
+    def test_json_cli_rejects_duplicate_keys_from_stdin_and_file(self) -> None:
+        command = [sys.executable, "-B", str(SCRIPTS / "readiness_plan.py")]
+        payload = _payload()
+        _queue_profile(payload)
+        valid = json.dumps(payload, separators=(",", ":"))
+        duplicate_inputs = {
+            "root_key": valid.replace(
+                '"profile":"routine"',
+                '"profile":"routine","profile":"routine"',
+                1,
+            ),
+            "evidence_duplicate_id": valid.replace(
+                '"id":"provider"', '"id":"provider","id":"provider"', 1
+            ),
+            "evidence_duplicate_dependencies": valid.replace(
+                '"depends_on":["head"]',
+                '"depends_on":["head"],"depends_on":["head"]',
+                1,
+            ),
+            "nested_change_true_then_false": valid.replace(
+                '"head":false', '"head":true,"head":false', 1
+            ),
+            "nested_change_false_then_true": valid.replace(
+                '"head":false', '"head":false,"head":true', 1
+            ),
+            "bypass_false_then_true": valid.replace(
+                '"queue_bypass_rules":false',
+                '"queue_bypass_rules":false,"queue_bypass_rules":true',
+                1,
+            ),
+            "bypass_true_then_false": valid.replace(
+                '"queue_bypass_rules":false',
+                '"queue_bypass_rules":true,"queue_bypass_rules":false',
+                1,
+            ),
+        }
+        self.assertTrue(all(text != valid for text in duplicate_inputs.values()))
+
+        with tempfile.TemporaryDirectory(prefix="readiness-plan-duplicate-") as temporary:
+            input_path = pathlib.Path(temporary) / "input.json"
+            for input_kind in ("stdin", "file"):
+                valid_command = command
+                if input_kind == "file":
+                    input_path.write_text(valid, encoding="utf-8")
+                    valid_command = [*command, "--input", str(input_path)]
+                valid_result = subprocess.run(
+                    valid_command,
+                    input=valid if input_kind == "stdin" else None,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(valid_result.returncode, 0, valid_result.stderr)
+                self.assertTrue(json.loads(valid_result.stdout)["planning_only"])
+
+                for label, duplicate_text in duplicate_inputs.items():
+                    with self.subTest(input_kind=input_kind, duplicate=label):
+                        if input_kind == "file":
+                            input_path.write_text(duplicate_text, encoding="utf-8")
+                            duplicate_command = [*command, "--input", str(input_path)]
+                            stdin_text = None
+                        else:
+                            duplicate_command = command
+                            stdin_text = duplicate_text
+                        rejected = subprocess.run(
+                            duplicate_command,
+                            input=stdin_text,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(rejected.returncode, 2)
+                        self.assertEqual(rejected.stdout, "")
+                        self.assertIn("duplicate JSON object key", rejected.stderr)
 
 
 if __name__ == "__main__":
