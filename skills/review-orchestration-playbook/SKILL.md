@@ -42,6 +42,9 @@ evidence. An observed base change requires a fresh scope and final reread;
 revalidate only evidence whose recorded dependencies include the changed base
 dimension. The routine merge profile binds the exact reviewed head in the
 server mutation and accepts the documented GitHub control-plane trust boundary.
+For merge queues, separately track the current merge-group synthetic SHA; a
+rebuild invalidates group-bound evidence and current group checks even when the
+feature head and base coordinates stay unchanged.
 
 Read [Shared Scope](references/review-lane-contracts.md#frozen-range) for
 scope, independence and outcomes, and

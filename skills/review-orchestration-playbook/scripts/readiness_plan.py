@@ -13,9 +13,11 @@ from collections.abc import Mapping
 from typing import Any
 
 
-_CHANGE_KEYS = frozenset(("head", "base_ref", "base_tip", "merge_base"))
+_CHANGE_KEYS = frozenset(
+    ("head", "base_ref", "base_tip", "merge_base", "merge_group")
+)
 _DEPENDENCIES = frozenset(
-    ("head", "base_ref", "base_tip", "merge_base", "local_range")
+    ("head", "base_ref", "base_tip", "merge_base", "merge_group", "local_range")
 )
 _EVIDENCE_KINDS = frozenset(("readiness", "head_only_provider"))
 _PROOFS = frozenset(
@@ -251,7 +253,13 @@ def build_plan(payload: Any) -> dict[str, Any]:
 
     merge = _merge_constraints(profile, root["merge"])
     queue_binding = root["merge"]["operation"] == "merge_queue"
+    if not queue_binding and (
+        "merge_group" in changed
+        or any("merge_group" in item["depends_on"] for item in evidence)
+    ):
+        raise PlanInputError("merge_group changes and evidence require merge_queue operation")
     base_changed = bool(changed & {"base_ref", "base_tip", "merge_base"})
+    merge_group_changed = "merge_group" in changed
     if not queue_binding:
         queue_enrollment_action = "not_applicable"
     elif root["merge"]["head_binding"] == "none":
@@ -264,7 +272,7 @@ def build_plan(payload: Any) -> dict[str, Any]:
         queue_enrollment_action = "cancel_and_reenroll_after_base_retarget"
     elif root["merge"]["queue_bypass_rules"] is not False:
         queue_enrollment_action = "blocked_queue_bypass_rules_enabled_or_unknown"
-    elif base_changed:
+    elif base_changed or merge_group_changed:
         if not invalidated or root["merge"]["all_invalidated_gates_on_required_merge_group"] or root["merge"]["non_bypassed_completion_hold"]:
             queue_enrollment_action = "retain_across_merge_group_rebuild"
         else:

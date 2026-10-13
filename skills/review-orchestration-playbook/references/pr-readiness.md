@@ -98,8 +98,8 @@ resolution or an accepted later corrective artifact; it is not an item in the
 planner's positive evidence array. A retained head-only provider result still
 requires the complete fresh provider reread described by its authority.
 
-The classifier accepts one closed JSON object with `profile`, four boolean
-`changes` (`head`, `base_ref`, `base_tip`, `merge_base`), an `evidence` array
+The classifier accepts one closed JSON object with `profile`, five boolean
+`changes` (`head`, `base_ref`, `base_tip`, `merge_base`, `merge_group`), an `evidence` array
 whose records give an `id`, `kind`, and exact dependency list, and a closed
 `merge` constraint record. It separately names `operation: direct | merge_queue`
 and `head_binding`; direct accepts only `match-head-commit` or `none`, while
@@ -125,9 +125,10 @@ example `python skills/review-orchestration-playbook/scripts/readiness_plan.py
 and queue-enrollment action plan only. The evidence array contains positive,
 pass, or clean artifacts only; negative findings and unresolved conversations
 stay in their independent blocking gate and are never eligible for planner
-invalidation or reuse. For queue operations, routine base-tip or merge-base
-changes on the same target ref retain the existing exact-head enrollment only
-when no positive out-of-band artifact was invalidated or every invalidated
+invalidation or reuse. For queue operations, routine mode preserves the
+exact-head enrollment across a base-tip or merge-base change on the same target
+ref, or an independent merge-group synthetic-SHA change, only when no positive
+out-of-band artifact was invalidated or every invalidated
 gate is covered by the required merge group or a non-bypassed completion hold.
 Otherwise cancel/re-enroll after affected evidence is reacquired. A target-ref
 retarget or head change cancels the entry, and strict base changes
@@ -316,6 +317,20 @@ result is not proof of merge and does not update with later queue completion;
 do not treat it alone as fresh head/bypass proof. Async results expire after
 24 hours, so reacquire current request state when the result is no longer
 available. See the [asynchronous merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request-asynchronously) and [merge queue behavior](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
+
+Treat a changed merge-group synthetic SHA as an independent change even when
+the PR head, target ref/tip, and merge base are unchanged. Set
+`changes.merge_group: true`; invalidate every artifact that declares the
+`merge_group` dependency and reacquire current merge-group checks. Queue
+reordering, removal of another queued PR, or another rebuild can produce a new
+synthetic SHA ([GitHub documents queue reordering rebuilds in-progress merge
+groups](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue#jumping-to-the-top-of-the-queue)).
+If the change invalidates out-of-band group-sensitive evidence,
+cancel/re-enroll after reacquisition unless every affected gate is protected
+by the required merge group or a non-bypassed completion hold. The same rule
+applies in routine and strict queue profiles; strict base changes still use
+the full strict rerun path. This dimension is queue-only and must be false for
+direct merge plans.
 
 In routine mode, a base-tip or merge-base change on the same target ref and
 unchanged head preserves the existing persistent `merge-async` SHA-bound

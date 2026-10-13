@@ -22,6 +22,7 @@ def _payload() -> dict[str, object]:
             "base_ref": False,
             "base_tip": False,
             "merge_base": False,
+            "merge_group": False,
         },
         "evidence": [
             {
@@ -330,6 +331,117 @@ class ReadinessPlanTests(unittest.TestCase):
             build_plan(payload)["queue_enrollment_action"],
             "cancel_and_reenroll_after_head_change",
         )
+
+    def test_merge_group_change_invalidates_group_evidence_without_base_change(self) -> None:
+        payload = _payload()
+        _queue_profile(payload)
+        payload["evidence"].append(  # type: ignore[union-attr]
+            {
+                "id": "old-merge-group-check",
+                "kind": "readiness",
+                "depends_on": ["merge_group"],
+            }
+        )
+        payload["changes"]["merge_group"] = True  # type: ignore[index]
+
+        result = build_plan(payload)
+
+        self.assertEqual(
+            result["invalidated_evidence"],
+            {"old-merge-group-check": ["merge_group"]},
+        )
+        self.assertIn("provider", result["preserved_evidence"])
+        self.assertIn("head_check", result["preserved_evidence"])
+        self.assertIn("current_merge_group_checks", result["global_invalidations"])
+        self.assertEqual(
+            result["queue_enrollment_action"],
+            "cancel_and_reenroll_after_affected_evidence_revalidation",
+        )
+
+        no_group_sensitive = _payload()
+        _queue_profile(no_group_sensitive)
+        no_group_sensitive["changes"]["merge_group"] = True  # type: ignore[index]
+        no_group_plan = build_plan(no_group_sensitive)
+        self.assertEqual(no_group_plan["invalidated_evidence"], {})
+        self.assertIn(
+            "current_merge_group_checks", no_group_plan["global_invalidations"]
+        )
+        self.assertEqual(
+            no_group_plan["queue_enrollment_action"],
+            "retain_across_merge_group_rebuild",
+        )
+
+    def test_merge_group_sensitive_queue_gates_need_coverage_or_hold(self) -> None:
+        for required_group, completion_hold in ((True, False), (False, True)):
+            with self.subTest(required_group=required_group, hold=completion_hold):
+                payload = _payload()
+                _queue_profile(
+                    payload,
+                    required_group=required_group,
+                    completion_hold=completion_hold,
+                )
+                payload["evidence"].append(  # type: ignore[union-attr]
+                    {
+                        "id": "group-bound-validation",
+                        "kind": "readiness",
+                        "depends_on": ["merge_group"],
+                    }
+                )
+                payload["changes"]["merge_group"] = True  # type: ignore[index]
+
+                result = build_plan(payload)
+
+                self.assertEqual(
+                    result["queue_enrollment_action"],
+                    "retain_across_merge_group_rebuild",
+                )
+
+        strict = _payload()
+        _queue_profile(strict)
+        _strict_profile(strict)
+        strict["merge"]["complete_bypass_audit"] = True  # type: ignore[index]
+        strict["merge"]["actor_inventory_complete"] = True  # type: ignore[index]
+        strict["merge"]["base_proof"] = "strict_queue_full_gate_binding"  # type: ignore[index]
+        strict["evidence"].append(  # type: ignore[union-attr]
+            {
+                "id": "group-bound-validation",
+                "kind": "readiness",
+                "depends_on": ["merge_group"],
+            }
+        )
+        strict["changes"]["merge_group"] = True  # type: ignore[index]
+        unheld = build_plan(strict)
+        self.assertEqual(unheld["merge_constraints"]["constraint_status"], "blocked")
+        self.assertEqual(
+            unheld["queue_enrollment_action"],
+            "cancel_and_reenroll_after_affected_evidence_revalidation",
+        )
+        strict["merge"]["non_bypassed_completion_hold"] = True  # type: ignore[index]
+        strict_result = build_plan(strict)
+        self.assertEqual(
+            strict_result["merge_constraints"]["constraint_status"], "satisfied"
+        )
+        self.assertEqual(
+            strict_result["queue_enrollment_action"],
+            "retain_across_merge_group_rebuild",
+        )
+
+    def test_merge_group_change_is_queue_specific(self) -> None:
+        payload = _payload()
+        payload["changes"]["merge_group"] = True  # type: ignore[index]
+        with self.assertRaises(PlanInputError):
+            build_plan(payload)
+
+        evidence_only = _payload()
+        evidence_only["evidence"].append(  # type: ignore[union-attr]
+            {
+                "id": "group-bound-validation",
+                "kind": "readiness",
+                "depends_on": ["merge_group"],
+            }
+        )
+        with self.assertRaises(PlanInputError):
+            build_plan(evidence_only)
 
     def test_head_change_invalidates_positive_results_not_applicable_findings(self) -> None:
         payload = _payload()

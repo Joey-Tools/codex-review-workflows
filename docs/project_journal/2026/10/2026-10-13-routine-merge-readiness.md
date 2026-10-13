@@ -19,7 +19,7 @@ documented GitHub control-plane trust boundary, without demanding strict
 atomic base proof or a complete bypass/actor inventory. Strict base proof
 remains explicit opt-in or mandatory under a stronger user/project policy.
 A read-only planner applies parent-owned evidence
-dependencies to observed base changes; head-bound provider evidence remains
+dependencies to observed base and queue merge-group changes; head-bound provider evidence remains
 invalidated on head change. Read-only protection, ruleset, bypass-list, and
 effective-permission inspection is authorized within the selected repository
 and PR scope; unreadable state remains unknown. The planner is not a readiness
@@ -98,6 +98,26 @@ artifact but invalidated the base-sensitive test. The unprotected case
 canceled/re-enrolled after revalidation, covered evidence retained the entry,
 and unknown bypass state blocked it. Every output stayed planning-only and
 `readiness_verdict: not-evaluated`, never full readiness or merge authority.
+
+Third repair adds the independent `merge_group` dimension: queue reordering or
+removal can change the synthetic SHA while all four PR/base coordinates stay
+unchanged. Group-dependent artifacts and current group checks are invalidated;
+unprotected out-of-band artifacts require cancellation/reacquisition, while a
+required group gate or non-bypassed hold permits retention. Direct plans reject
+queue-only group changes/dependencies. This does not alter runtime closure or
+provider clean authority.
+
+Final parent Python 3.10.19 validation passed 20 planner tests in 0.056 seconds
+and 52 contracts in 3.528 seconds with 2 expected private-layout skips; both
+supervisors exited 0 with incomplete-null. SHA-256:
+
+- Planner `0b5cb16e7b9440680d76a742aed17e5b45a66e166ebf6eb8620e9365f64d1299`.
+- Contracts `13e01b52b8057fb5101de8abfe144296b069435f39d957accfe8ce37f63cb3e7`.
+
+The parent also ran actual direct, group-only/uncovered, and group-only/held
+CLI cases. They respectively kept the direct path, canceled/reacquired group
+artifacts, and retained a held queue entry; head-only provider evidence stayed
+invariant. All outputs remained planning-only, not readiness approval.
 
 ```text
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 --version
