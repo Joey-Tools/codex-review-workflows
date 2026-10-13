@@ -160,16 +160,17 @@ Require type-preserving equality with the initial closed scope and selection.
 A changed head restarts the head-bound lane; a changed base ref/tip, merge base,
 or synthetic subject invalidates a synthetic-merge basis.
 
-An observed `baseRefName` change, even with the same OID, or a changed
-`baseRefOid` invalidates all previously counted local reviews, local validation
-and tests, CI/status results, conversation decisions, readiness decisions, and
-the final reread, even when the head and unique merge base remain unchanged. A
+An observed base-ref/tip change always restarts the scope and final reread.
+Routine mode uses the [readiness dependency classifier](../scripts/readiness_plan.py)
+to invalidate base-sensitive evidence while retaining unaffected head/range
+evidence; evidence with unknown or incomplete dependencies cannot be reused.
+Strict-base-proof mode invalidates its complete base-bound evidence set. A
 trustworthy terminal artifact, reaction, or feature-head-only producer result
-is the only exception: retain it only after this complete repeat proves its
-exact head is still current and no applicable provider finding remains
-unresolved. It supplies no base, merge-base, or target-ref coverage. A
-synthetic-merge producer basis is base-sensitive and must be reacquired for the
-new exact scope and check subject.
+is retained only after this complete repeat proves its exact head is still
+current and no applicable provider finding remains unresolved. It supplies no
+base, merge-base, or target-ref coverage. A synthetic-merge producer basis is
+base-sensitive and must be reacquired for the new exact scope and check
+subject. This probe layer never selects or rewrites the range.
 
 ## Request The Review
 
@@ -243,15 +244,15 @@ comment-mutation epoch.
 
 A base-only retarget, including one whose new ref has the same OID, or
 target-base-tip advance on the same head does not authorize or require another
-request. Reuse qualifying head-bound provider
-evidence only after the exact-current-head and complete unresolved-finding
-reread above. Rerun every invalidated local review, validation/test, CI/status,
-conversation, readiness, and final-reread gate; when the merge base changed,
-first require the parent-owned `range_origin` gate in
-[pr-readiness.md](pr-readiness.md) to authorize the exact local PR-wide range.
-Reconcile a related merge/status check when its contract is base-sensitive.
-This probe layer never selects or rewrites that range. Never claim the provider
-inspected the changed base tip or retargeted base.
+request. Reuse qualifying head-bound provider evidence only after the
+exact-current-head and complete unresolved-finding reread above. In routine
+mode, use the [readiness dependency classifier](../scripts/readiness_plan.py)
+to select affected evidence; strict mode retains its complete base-bound
+invalidation. When the merge base changed, first require the parent-owned
+`range_origin` gate in [pr-readiness.md](pr-readiness.md) to authorize the exact
+local PR-wide range. Reconcile merge/status checks bound to the changed base or
+merge group. This probe layer never selects or rewrites the range. Never claim
+the provider inspected the changed base tip or retargeted base.
 
 ## Discover Related Checks Dynamically
 
@@ -330,11 +331,14 @@ subject and current base/merge bindings above. Ordinary readiness still
 validates base and merge base locally. A generic successful check or
 service-start marker cannot use this basis.
 
-Before an authorized merge, acquire complete applicable branch-protection or
-ruleset evidence for the exact base branch. A direct merge's base binding is
-proved only by a documented server-side expected-base mutation precondition or
-a repository-proved exact-base guard that rejects every
-`baseRefOid != merge_expected_base` mutation without bypass. The strict setting
+Before an authorized merge, acquire current applicable branch-protection or
+ruleset and required-check evidence for the exact base branch. Routine merge
+uses an exact-head server precondition and trusts GitHub and authorized
+repository collaborators/administrators as the control plane; it does not
+require a complete bypass/actor inventory or claim an atomic base lock. Never
+request `--admin` or another bypass. A concurrent base change after final
+reread remains a residual race. Strict-base-proof mode instead requires the
+complete exact-base or monotonic proof below. The strict setting
 for **Require branches to be up to date before merging** is useful when a
 branch is behind, but it is not an exact-base comparison: a different base tip
 that is already an ancestor of the unchanged feature head may still satisfy
@@ -342,7 +346,7 @@ strict freshness. Required checks plus strict, `mergeStateStatus`, a
 mergeability snapshot, or another `baseRefOid` read therefore do not by
 themselves protect the later mutation.
 
-The only direct-merge alternative is a complete parent proof of monotonic range
+Strict mode's direct-merge alternative is a complete parent proof of monotonic range
 contraction. Require all of these from the complete applicable protection and
 ruleset snapshot: the frozen `merge_expected_base_ref` equals the selected
 repository plus `baseRefName`, where repository equality means canonical
@@ -366,15 +370,15 @@ proof excludes it. These are consumer-side proof requirements only; this
 playbook does not define a producer implementation or require a nonexistent
 server-side retarget hold.
 
-A configured merge queue owns only latest-base merge-group freshness by
-default; it does not reacquire
-out-of-band local review or conversation gates. Before enrollment, require a
-repository-proved, non-bypassed merge-group hold that prevents completion after
-any target-base change until every invalidated gate is reacquired for the new
-exact base tip.
-If no such hold exists, the queue path is blocked. A narrowly equivalent
-contract may instead prove that every invalidated gate is itself a required,
-non-bypassed check on the rebuilt merge group. See
+A configured merge queue owns latest-base merge-group freshness by default; it
+does not reacquire out-of-band local review or conversation gates. Routine
+mode rereads required checks for the current merge group and applies the
+dependency classifier to other evidence. Strict mode requires a
+repository-proved, non-bypassed merge-group hold that blocks completion after
+any target-base change until every invalidated gate is reacquired, or a proved
+contract that makes every invalidated gate a required, non-bypassed check on
+the rebuilt merge group. Without that strict contract, strict queue merge is
+blocked. See
 [pr-readiness.md](pr-readiness.md).
 
 ## Reconcile Only Recoverable States

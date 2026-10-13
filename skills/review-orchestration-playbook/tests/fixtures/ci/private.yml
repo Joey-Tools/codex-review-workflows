@@ -70,6 +70,7 @@ jobs:
           - test_named_claude_preflight.py
           - test_named_lane.py
           - test_providers.py
+          - test_readiness_plan.py
           - test_review_result.py
           - test_review_workspace.py
           - test_state.py

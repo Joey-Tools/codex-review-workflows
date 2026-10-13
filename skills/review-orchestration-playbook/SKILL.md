@@ -38,8 +38,13 @@ it with a PR-derived range. Compare the complete Git DAG, including merge
 commits and side history, not a linear or first-parent projection.
 For whole-PR coverage, bind the selected PR's exact current head, target ref,
 base tip and unique merge base. A new head invalidates old-head positive
-evidence; an observed target-ref or base-tip change invalidates readiness
-even when the head and merge base are unchanged.
+evidence. An observed base change requires a fresh scope and final reread;
+revalidate only evidence whose recorded dependencies include the changed base
+dimension. The routine merge profile binds the exact reviewed head in the
+server mutation and accepts the documented GitHub control-plane trust boundary.
+For merge queues, separately track the current merge-group synthetic SHA; a
+rebuild invalidates group-bound evidence and current group checks even when the
+feature head and base coordinates stay unchanged.
 
 Read [Shared Scope](references/review-lane-contracts.md#frozen-range) for
 scope, independence and outcomes, and
@@ -93,18 +98,30 @@ status-only. Never reconcile code, test or policy failures as infrastructure.
 ## Drive PR Readiness
 
 Read [PR Readiness](references/pr-readiness.md) before claiming merge-ready
-or executing an authorized merge. Handle applicable findings, add proportionate
-tests for fixes, freeze any new head, and repeat every invalidated required
-lane. Acquire complete CI and conversation evidence, repository merge policy
-and a final stable reread. Omitted local lanes remain omitted.
+or executing an authorized merge. The routine profile is the default; strict
+base proof is opt-in. Handle applicable findings, add proportionate tests for
+fixes, freeze any new head, and repeat every invalidated required lane. Acquire
+complete CI and conversation evidence, repository merge policy and a final
+stable reread. Omitted local lanes remain omitted.
 
 A merge requires its own authorization. Bind the reviewed head in the
 state-changing server request itself, using `--match-head-commit <head_sha>`
-for direct merge. Apply the readiness reference's exact-base or proven
-monotonic-contraction rule and persistent queue binding; a second client read
-or long-lived auto-merge request is not an atomic substitute. If strict
-freshness requires a base update, use a signed merge and the full invalidation
-loop, not rebase or force-push. Missing proof blocks the mutation.
+for direct merge; queue enrollment uses the separate persistent `merge-async`
+SHA binding. Do not request administrator or other bypass. Routine mode does
+not require an exact-base or atomic base-contraction proof; report its
+GitHub control-plane trust boundary and residual race. Strict mode retains the
+readiness reference's complete base proof. Preserve persistent queue head
+binding with `bypass_rules: false`; verify the exact head, queue action, and
+false bypass option before reusing a pending request. If required strict
+freshness requires a base update, use a signed
+merge and rerun evidence invalidated by the resulting new head, not rebase or
+force-push.
+
+Within the authorized repository/PR scope, read-only inspection of branch
+protection, rulesets, bypass lists, and effective permissions needs no extra
+verbal confirmation. An unavailable read is unknown, not a pass. This does not
+authorize policy changes, bypass use, auth switching, workflow dispatch/rerun,
+or other external writes; follow the environment's execution permissions.
 
 ## Preserve Authorization Boundaries
 
