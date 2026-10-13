@@ -119,6 +119,26 @@ CLI cases. They respectively kept the direct path, canceled/reacquired group
 artifacts, and retained a held queue entry; head-only provider evidence stayed
 invariant. All outputs remained planning-only, not readiness approval.
 
+Fourth repair preserves the explicit HTTP 200 already-queued boundary: an
+unchanged head or generic queue reread does not prove request options. Only the
+same still-current owned enrollment with its exact submitted head/action,
+false bypass option and acknowledged UUID/scope can be reused; canceled or
+replaced entries do not carry that proof forward. Every active queue entry
+with blocked merge constraints is canceled pending reacquisition, even when
+all five change flags are false. Existing head/base-specific cancellation
+precedence and the direct-path action are preserved.
+
+Final parent Python 3.10.19 validation passed 21 planner tests in 0.056 seconds
+and 52 contracts in 3.443 seconds with 2 expected skips, supervisor0 and
+incomplete-null. Planner log SHA-256
+`5ff5d78376b4e12f828a6c4e7f15cf456e9ed6eb698959274c4b935d2b3fbe4e`;
+contracts log
+`a9a3470ed05180f8d8262dc155ab68d6fdba6282a0f6b809bfe0abe1a703b3a6`.
+The actual unchanged-coordinate strict/blocked CLI case canceled an entry
+rather than returning retention, while keeping its invariant head artifact.
+This is planning-only evidence, not permission to merge or proof of current
+remote review/CI. Runtime security remains unchanged.
+
 ```text
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 --version
 PYTHONPATH=/private/tmp/readiness-plan-python-deps /Users/hoteng/.local/share/uv/python/cpython-3.10-macos-aarch64-none/bin/python3.10 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_readiness_plan.py' -v

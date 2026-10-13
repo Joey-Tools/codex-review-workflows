@@ -268,7 +268,7 @@ class ReadinessPlanTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     result["queue_enrollment_action"],
-                    "blocked_queue_bypass_rules_enabled_or_unknown",
+                    "cancel_and_reenroll_after_merge_constraints_reacquired",
                 )
 
         payload = _payload()
@@ -278,6 +278,71 @@ class ReadinessPlanTests(unittest.TestCase):
             build_plan(payload)["queue_enrollment_action"],
             "cancel_and_reenroll_after_affected_evidence_revalidation",
         )
+
+    def test_queue_retention_requires_satisfied_merge_constraints(self) -> None:
+        unchanged = _payload()
+        _queue_profile(unchanged)
+        self.assertEqual(
+            build_plan(unchanged)["queue_enrollment_action"],
+            "retain_if_exact_head_binding_remains_current",
+        )
+
+        for bypass_rules in (True, None):
+            with self.subTest(routine_bypass_rules=bypass_rules):
+                blocked = _payload()
+                _queue_profile(blocked, bypass_rules=bypass_rules)
+                result = build_plan(blocked)
+                self.assertEqual(result["merge_constraints"]["constraint_status"], "blocked")
+                self.assertEqual(
+                    result["queue_enrollment_action"],
+                    "cancel_and_reenroll_after_merge_constraints_reacquired",
+                )
+
+        missing_head_binding = _payload()
+        _queue_profile(missing_head_binding)
+        missing_head_binding["merge"]["head_binding"] = "none"  # type: ignore[index]
+        result = build_plan(missing_head_binding)
+        self.assertEqual(result["merge_constraints"]["constraint_status"], "blocked")
+        self.assertEqual(
+            result["queue_enrollment_action"],
+            "cancel_and_reenroll_after_merge_constraints_reacquired",
+        )
+
+        strict_missing_proof = _payload()
+        _queue_profile(strict_missing_proof)
+        _strict_profile(strict_missing_proof)
+        result = build_plan(strict_missing_proof)
+        self.assertEqual(result["merge_constraints"]["constraint_status"], "blocked")
+        self.assertIn("complete_bypass_audit_missing", result["merge_constraints"]["reasons"])
+        self.assertIn("strict_base_proof_missing", result["merge_constraints"]["reasons"])
+        self.assertEqual(
+            result["queue_enrollment_action"],
+            "cancel_and_reenroll_after_merge_constraints_reacquired",
+        )
+
+        strict_with_held_gate_but_bypass = _payload()
+        _queue_profile(strict_with_held_gate_but_bypass, completion_hold=True)
+        _strict_profile(strict_with_held_gate_but_bypass)
+        strict_with_held_gate_but_bypass["merge"]["complete_bypass_audit"] = True  # type: ignore[index]
+        strict_with_held_gate_but_bypass["merge"]["actor_inventory_complete"] = True  # type: ignore[index]
+        strict_with_held_gate_but_bypass["merge"]["base_proof"] = "strict_queue_full_gate_binding"  # type: ignore[index]
+        strict_with_held_gate_but_bypass["merge"]["non_bypassed_completion_hold"] = True  # type: ignore[index]
+        strict_with_held_gate_but_bypass["merge"]["configured_bypass"] = True  # type: ignore[index]
+        strict_with_held_gate_but_bypass["evidence"].append(  # type: ignore[union-attr]
+            {"id": "group-gate", "kind": "readiness", "depends_on": ["merge_group"]}
+        )
+        strict_with_held_gate_but_bypass["changes"]["merge_group"] = True  # type: ignore[index]
+        result = build_plan(strict_with_held_gate_but_bypass)
+        self.assertEqual(result["merge_constraints"]["constraint_status"], "blocked")
+        self.assertIn("configured_bypass_present", result["merge_constraints"]["reasons"])
+        self.assertEqual(
+            result["queue_enrollment_action"],
+            "cancel_and_reenroll_after_merge_constraints_reacquired",
+        )
+
+        direct = _payload()
+        _strict_profile(direct)
+        self.assertEqual(build_plan(direct)["queue_enrollment_action"], "not_applicable")
 
     def test_queue_rebuild_retains_only_when_invalidated_gates_are_covered(self) -> None:
         for evidence in ("base_sensitive_test",):
@@ -489,7 +554,7 @@ class ReadinessPlanTests(unittest.TestCase):
                 if operation == "merge_queue":
                     self.assertEqual(
                         build_plan(payload)["queue_enrollment_action"],
-                        "blocked_missing_persistent_head_binding",
+                        "cancel_and_reenroll_after_merge_constraints_reacquired",
                     )
 
             with self.subTest(operation=operation, case="omitted"):

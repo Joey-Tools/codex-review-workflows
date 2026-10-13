@@ -663,6 +663,16 @@ pending result proves the same expected head, queue action, and non-bypassed
 option. An `enqueued` result is terminal and does not later become a merged
 result; reacquire the current PR and queue state to establish completion.
 
+An HTTP 200 response indicating that a request is already queued is not, by
+itself, proof of the queued request's options or head binding. Reuse it only
+when the task retained its own exact submitted request and acknowledged UUID/
+scope for the same still-current queue enrollment, including the reviewed
+head, `merge_queue` action, and literal `bypass_rules: false`. A prior request
+from an enrollment that was canceled or replaced is not proof of the current
+entry. A generic PR queue read, an `enqueued` status, or an unbound 200 response
+cannot supply missing request details; otherwise block or cancel the
+enrollment and reacquire a properly bound request.
+
 For a queue path, select `operation: merge_queue` with
 `head_binding: persistent-queue-merge-async-sha`; the planner rejects a
 binding paired with the wrong operation. Atomically enroll the exact reviewed
@@ -677,9 +687,14 @@ target-ref retarget also cancels/re-enrolls. Reacquire required checks for the
 new current merge group. A rebuilt merge group does not
 by itself invalidate an unrelated head/range result. The planner reports safe
 retention as `retain_across_merge_group_rebuild`, or otherwise asks to
-cancel/re-enroll after affected evidence is reacquired. A changed head
-invalidates every old-head positive/pass/clean result and cancels the
-enrollment, requiring the applicable full pre-merge loop for the new head.
+cancel/re-enroll after affected evidence is reacquired. Every planner retention
+action also requires `merge_constraints.constraint_status == "satisfied"`; if
+constraints are blocked, cancel any active enrollment and do not re-enroll until
+the required proof is reacquired. A covered merge-group gate or non-bypassed
+hold does not satisfy an unrelated missing strict audit or base proof; never
+infer a hold that was not established. A changed head invalidates every
+old-head positive/pass/clean result and cancels the enrollment, requiring the
+applicable full pre-merge loop for the new head.
 Applicable negative findings are not in the planner's positive evidence array;
 reread them independently and keep them blocking until typed resolution or an
 accepted later corrective artifact. Strict mode cancels/re-enrolls after its full

@@ -279,6 +279,12 @@ def build_plan(payload: Any) -> dict[str, Any]:
             queue_enrollment_action = "cancel_and_reenroll_after_affected_evidence_revalidation"
     else:
         queue_enrollment_action = "retain_if_exact_head_binding_remains_current"
+    if (
+        queue_binding
+        and merge["constraint_status"] != "satisfied"
+        and not queue_enrollment_action.startswith("cancel_")
+    ):
+        queue_enrollment_action = "cancel_and_reenroll_after_merge_constraints_reacquired"
 
     global_invalidations = []
     if changed:

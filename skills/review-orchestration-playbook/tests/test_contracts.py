@@ -1104,6 +1104,9 @@ class RepositoryContractTest(unittest.TestCase):
             'details.merge_action == "merge_queue"',
             "details.bypass_rules == false",
             "persist the request's status, response, and uuid",
+            "http 200 response indicating that a request is already queued",
+            "same still-current queue enrollment",
+            "if constraints are blocked, cancel any active enrollment",
             "never fall back to an unbound auto-merge request",
         ):
             self.assertIn(queue_anchor.lower(), normalized_execution)
