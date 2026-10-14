@@ -20,6 +20,7 @@ superseded_by:
 ## Current State
 - Reconcile the original task with the current canonical source, preserving remote-first routing, routine readiness, recovery, and source inventory changes.
 - The original Terra/Luna retry implementation is superseded and is not part of the runtime policy.
+- Copilot model evidence must preserve the exact provider-native ID across session, message, and usage records and at the final attempt gate; punctuation aliases do not verify the pinned model.
 - Historical parsing and explicit negative fixtures may retain legacy model names; no default execution selects a pre-GPT-6 model.
 
 ## Evidence

@@ -30521,6 +30521,85 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-mini"))
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-codex"))
 
+    def test_copilot_opus_5_5_requires_exact_model_identity(self) -> None:
+        requested = "claude-opus-5.5"
+        models = (
+            requested,
+            "claude-opus-5-5",
+            "claudeopus55",
+            "claude_opus_5_5",
+            "claude-opus-55",
+            "CLAUDE-OPUS-5.5",
+            " claude-opus-5.5",
+        )
+        for index, effective in enumerate(models, start=1):
+            with self.subTest(effective_model=effective):
+                attempt = providers._record_attempt(
+                    review=self.review,
+                    index=index,
+                    runtime="copilot",
+                    model=requested,
+                    completed=Completed(
+                        argv=("copilot",), returncode=0, stdout=b"", stderr=b""
+                    ),
+                    final_text="No findings.",
+                    effective_model=effective,
+                    requested_effort="high",
+                    effective_effort="high",
+                    require_verified_model=True,
+                )
+                if effective == requested:
+                    self.assertEqual(attempt.category, "success")
+                    self.assertEqual(attempt.final_text, "No findings.")
+                else:
+                    self.assertEqual(attempt.category, "model-mismatch")
+                    self.assertEqual(attempt.reason, "effective-model-mismatch")
+                    self.assertIsNone(attempt.final_text)
+
+        failed = providers._record_attempt(
+            review=self.review,
+            index=len(models) + 1,
+            runtime="copilot",
+            model=requested,
+            completed=Completed(
+                argv=("copilot",),
+                returncode=1,
+                stdout=b"",
+                stderr=b"Model is not available for your account",
+            ),
+            final_text=None,
+            effective_model="claude-opus-5-5",
+            requested_effort="high",
+            effective_effort=None,
+        )
+        self.assertEqual(failed.category, "model-mismatch")
+        self.assertIsNone(failed.final_text)
+
+    def test_copilot_rejects_separator_aliases_between_model_records(self) -> None:
+        native = "claude-opus-5.5"
+        alias = "claude-opus-5-5"
+        for session, message, usage in (
+            (alias, native, native),
+            (native, alias, native),
+            (native, native, alias),
+        ):
+            with self.subTest(session=session, message=message, usage=usage):
+                objects = (
+                    {"type": "session.start", "data": {"selectedModel": session}},
+                    {"type": "assistant.turn_start", "data": {"turnId": "turn-1"}},
+                    {
+                        "type": "assistant.message",
+                        "data": {"content": "No findings.", "model": message},
+                    },
+                    {"type": "assistant.usage", "data": {"model": usage}},
+                    {"type": "assistant.turn_end", "data": {"turnId": "turn-1"}},
+                )
+                stdout = "\n".join(json.dumps(item) for item in objects).encode()
+                self.assertEqual(
+                    providers._parse_copilot_output(stdout, requested_model=native),
+                    (None, None),
+                )
+
     def test_entitlement_is_fallback_eligible(self) -> None:
         self.assertEqual(
             providers.classify_failure("", "Model is not available for your account"),
