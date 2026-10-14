@@ -1,30 +1,28 @@
 ---
 id: 20260924-mpt001
-title: Model Profile Terra Migration
-status: active
+title: Runtime Model Profile Alignment
+status: completed
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-14
 branch: codex/daily-skill-friction-20260924-codex-review-workflows-model-profile-terra
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/119
 supersedes: []
 superseded_by:
 ---
 
-# Model Profile Terra Migration
+# Runtime Model Profile Alignment
 
 ## Summary
-- Move the installed reviewer profile to `gpt-5.6-terra` with Codex `ultra` mode.
-- Move Codex CLI/app-server review execution to Terra first, Luna fallback, and `max` reasoning; use Opus 5 with `max` for Claude Code and Copilot.
+- Pin low-level Codex CLI/app-server execution to `gpt-6.1-sol / high` without automatic model fallback.
+- Pin Claude Code to `claude-opus-5-5 / high` and authorized Copilot CLI to `claude-opus-5.5 / high`.
+- Preserve the canonical reviewer role and peer CLI adapter at `gpt-6.1-sol / medium`.
 
 ## Current State
-- Runtime constants, reviewer configuration, stream contracts, and supervisor ledgers are aligned with the new profile policy.
-- Claude and Copilot retry slots stay within the Opus 5 family: `claude-opus-5` is primary and `claude-opus-5.0` is the closed wire alias; the stream validator accepts both current identities.
-- Runtime model matching canonicalizes only the exact dotted Opus 5 alias, keeping lookalike model IDs rejected.
-- Targeted provider, app-server, stream, lane, contract, and execution tests pass; two supervisor/CLI cases remain unverified because the macOS sandbox denied their phase helper with `Operation not permitted`, outside model-policy coverage.
-
-## Next Steps
-- Land the validated local change and synchronize the private overlay through its normal release path.
+- Reconcile the original task with the current canonical source, preserving remote-first routing, routine readiness, recovery, and source inventory changes.
+- The original Terra/Luna retry implementation is superseded and is not part of the runtime policy.
+- Historical parsing and explicit negative fixtures may retain legacy model names; no default execution selects a pre-GPT-6 model.
 
 ## Evidence
-- Worktree: `codex/daily-skill-friction-20260924-codex-review-workflows-model-profile-terra`
-- Skill validation: `codex_skill_validate.py` reports `Skill is valid!`.
+- Reviewer/routing baseline: canonical PR #127.
+- Routine-readiness baseline: canonical PRs #137 and #138.
+- Private generated copies follow canonical source promotion rather than manual edits.

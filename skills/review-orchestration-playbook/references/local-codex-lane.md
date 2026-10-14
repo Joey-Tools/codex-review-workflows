@@ -36,7 +36,7 @@ One requested lane has one parent-owned lane record:
   evidence, plus the Git-argv observation level the adapter actually exposes;
 - terminal result and cleanup status.
 
-Retries, switching adapters, or Codex Ultra's internal delegation do not increment the lane count. Never describe internal workers as a double or triple review.
+Retries, switching adapters, or internal delegation do not increment the lane count. Never describe internal workers as a double or triple review.
 
 ## Peer Adapters
 
@@ -412,8 +412,8 @@ The normalized direct-argv shape is:
   -c shell_environment_policy.exclude=["CODEX_HOME"]
   -c shell_environment_policy.ignore_default_excludes=false
   -s read-only
-  -m gpt-5.6-terra
-  -c model_reasoning_effort="max"
+  -m gpt-6.1-sol
+  -c model_reasoning_effort="medium"
   -C <absolute-parent-owned-neutral-launch-directory>
   --skip-git-repo-check
   --json
@@ -558,16 +558,18 @@ failure.
 
 ## Reviewer Profile
 
-The intended Codex CLI/app-server runtime profile is:
+The intended installed profile is:
 
-- primary model: `gpt-5.6-terra`;
-- explicit fallback model: `gpt-5.6-luna`;
-- reasoning effort: `max`;
+- model: `gpt-6.1-sol`;
+- reasoning: model default (currently `medium`, pinned to avoid inherited overrides);
 - context: fresh;
 - access: read-only;
 - output: findings only.
 
-`ultra` is a Codex profile/mode that may use internal delegation. It is not documented here as an OpenAI API `reasoning.effort` enum value. Regardless of implementation, one Ultra invocation remains one logical lane.
+Another model or reasoning override requires explicit user opt-in. A user may
+authorize GPT-6 Luna up to Max for local review as well as work; do not infer
+reviewer consent from worker-only authorization. Record the exact selected
+profile and authorization. No internal delegation adds a review lane.
 
 Record requested values, effective values, and the evidence basis. Prefer
 `runtime-attested` evidence when available. Otherwise, a qualifying
@@ -579,30 +581,38 @@ unobservable field is `unknown`, which makes the lane inconclusive.
 
 Do not query the network or enumerate model catalogs for every review. The installed skill and role are the normal source of the intended profile.
 
-Check current official OpenAI model guidance only when the parent session's
-effective model family or Codex mode is clearly stronger than the configured
-reviewer. This is the sole latest-model-lookup trigger. If it does not hold, do
-not perform a network lookup or enumerate a model catalog; this reduces
-latency, tokens, and unnecessary external reads.
+The parent session's effective model family or Codex mode never authorizes an
+automatic upgrade. Use the selected user-authorized profile, not a latest/strongest
+resolver. Consult current official model guidance only when the user requests
+model discovery or a policy migration needs capability verification.
 
 A runtime rejection, silent downgrade, or effective-profile mismatch is a
 local capability and conformance problem, not evidence that a newer model
 exists. Diagnose it from local runtime capability/receipt evidence and try the
-peer adapter at the exact same configured reviewer-subagent model and
-`ultra` mode. It never triggers latest-model discovery.
+peer adapter at the exact same selected model and reasoning. It never
+triggers latest-model discovery.
+
+## Low-Level Runtime Profiles
+
+The low-level `isolated_review` Codex CLI and independent app-server helpers
+pin `gpt-6.1-sol` at `high` reasoning and do not select a fallback model.
+An explicit runtime rejection remains blocked or inconclusive. These helpers
+do not change the named local reviewer role or its peer CLI adapter, which
+retain the model-default `medium` profile described above.
+
+The low-level Claude Code helper pins `claude-opus-5-5` at `high`; an
+explicitly authorized Copilot CLI helper pins `claude-opus-5.5` at `high`.
+These CLI settings do not select the model used by native GitHub reviewers.
 
 ## Fallback Order
 
 When the first adapter cannot realize the intended profile:
 
-1. For the `reviewer` subagent, try the peer adapter with the exact same
-   `gpt-5.6-terra` model and `ultra` mode.
-2. For the Codex CLI/app-server runtime, try `gpt-5.6-luna` with `max`
-   reasoning only when the primary Terra launch is explicitly rejected by the
-   runtime's fallback contract.
-3. If neither configured profile can run, keep the lane blocked or
+1. Try the peer adapter with the exact same model and reasoning.
+2. If neither adapter can realize that exact profile, keep the lane blocked or
    inconclusive according to the local evidence; do not silently lower the
    mode or change the model family.
+3. A lower mode or different model family requires explicit user confirmation.
 
 A transient adapter or service failure is retryable. A CLI adapter that cannot
 prove a file-backed credential source or construct and validate its temporary

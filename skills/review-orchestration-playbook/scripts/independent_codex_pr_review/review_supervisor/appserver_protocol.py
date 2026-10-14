@@ -365,7 +365,6 @@ class AppServerRemoteError(AppServerProtocolError):
         self.remote_code = remote_code
         self.remote_message = remote_message
         self.remote_data = remote_data
-        self.auth_refresh_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -378,7 +377,7 @@ class ModelFallbackAuthorization:
     ]
     denial_record_sha256: str
     denied_model: str = MODEL
-    selected_model: str = EXPLICIT_FALLBACK_MODEL
+    selected_model: str | None = EXPLICIT_FALLBACK_MODEL
 
     def __post_init__(self) -> None:
         if not isinstance(self.denial_category, str) or self.denial_category not in {
@@ -396,13 +395,18 @@ class ModelFallbackAuthorization:
                 "fallback denial record digest is invalid",
                 code="model-policy",
             )
+        if EXPLICIT_FALLBACK_MODEL is None:
+            raise AppServerProtocolError(
+                "model fallback is disabled",
+                code="model-policy",
+            )
         if self.denied_model != MODEL or self.selected_model != EXPLICIT_FALLBACK_MODEL:
             raise AppServerProtocolError(
                 "fallback model transition is not policy-authorized",
                 code="model-policy",
             )
 
-    def to_json(self) -> dict[str, str]:
+    def to_json(self) -> dict[str, str | None]:
         return {
             "denial_category": self.denial_category,
             "denial_record_sha256": self.denial_record_sha256,
@@ -503,22 +507,14 @@ class AppServerSessionConfig:
                 "review attempts must use the pinned CLI version",
                 code="model-policy",
             )
-        if self.expected_model == MODEL:
-            if self.fallback_authorization is not None:
-                raise AppServerProtocolError(
-                    "a primary-model attempt cannot carry fallback authorization",
-                    code="model-policy",
-                )
-        elif (
-            self.expected_model != EXPLICIT_FALLBACK_MODEL
-            or not isinstance(
-                self.fallback_authorization,
-                ModelFallbackAuthorization,
-            )
-            or self.fallback_authorization.selected_model != self.expected_model
-        ):
+        if self.expected_model != MODEL:
             raise AppServerProtocolError(
-                "non-primary model requires explicit proven-denial authorization",
+                "review attempts must use the pinned primary model",
+                code="model-policy",
+            )
+        if self.fallback_authorization is not None:
+            raise AppServerProtocolError(
+                "model fallback is disabled",
                 code="model-policy",
             )
 
@@ -1666,16 +1662,8 @@ class AppServerProtocol:
                 ),
                 "instruction_sources": list(thread_response["instructionSources"]),
                 "model": thread_response["model"],
-                "model_attempt": (
-                    "explicit_fallback"
-                    if self.config.fallback_authorization is not None
-                    else "primary"
-                ),
-                "model_fallback_authorization": (
-                    self.config.fallback_authorization.to_json()
-                    if self.config.fallback_authorization is not None
-                    else None
-                ),
+                "model_attempt": "primary",
+                "model_fallback_authorization": None,
                 "model_provider": thread_response["modelProvider"],
                 "reasoning_effort": thread_response["reasoningEffort"],
                 "runtime_workspace_roots": list(

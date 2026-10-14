@@ -9,12 +9,18 @@ This file defines shared scope, independence, counting, outcomes, and rerun rule
 | Named single | One clean logical local Codex lane. |
 | Named double | Named single plus one clean actual Claude Code lane. |
 | Named triple | Named double plus a passing current-head GitHub Codex lane. |
-| `skill-repo-codex-gate` | One clean logical local Codex lane plus a passing current-head GitHub Codex lane. This is an unnamed repository default, not a named shape. |
+| Unnamed PR-bound delivery with an eligible remote provider | Passing current-head repository-configured GitHub Codex or native GitHub Copilot review. No local review by default; explicit local/named lanes remain mandatory. |
+
+Use [Default Review Routing](default-review-routing.md#default-review-routing) before selecting lanes. Without an
+eligible remote provider, apply the linked session-choice gate rather than
+silently starting local review. Local-only delivery requires one local Codex
+lane. Remote pending/inconclusive is not permission for a local-only pass.
+Claude requires explicit user opt-in; unnamed delivery never adds double/triple.
 
 Count logical independent judgments. Do not count:
 
 - retries or adapter switches;
-- Ultra's internal delegation;
+- a reviewer's internal delegation;
 - preparation, validation, admission, CI, or PR-readiness gates;
 - a Claude simulation, another Codex process, or GitHub Copilot in place of actual Claude Code;
 - service-start checks without a review result.
@@ -566,10 +572,7 @@ deviation.
 Read [local-codex-lane.md](local-codex-lane.md).
 
 - A zero-inherited-context `reviewer` subagent and a fresh non-resumed Codex CLI review are peer adapters.
-- The intended installed `reviewer` subagent profile is `gpt-5.6-terra` with
-  Codex mode `ultra`.
-- The Codex CLI/app-server runtime uses `gpt-5.6-terra` first,
-  `gpt-5.6-luna` as its explicit fallback, and `max` reasoning effort.
+- The default installed profile is `gpt-6.1-sol` at model-default reasoning (currently `medium`).
 - Record requested and effective adapter, model, and mode.
 - Record `self_policy_migration`, plus the instruction-surface status and
   receipt for the selected adapter.
@@ -587,13 +590,14 @@ Read [local-codex-lane.md](local-codex-lane.md).
   unsafe copy/validation blocks
   that adapter; selecting the peer subagent at the same requested profile
   remains the same logical lane.
-- A latest-model network lookup is allowed only when the parent session's
-  effective model family or Codex mode is clearly stronger than this configured
-  reviewer. Runtime rejection, downgrade, or mismatch triggers only local
-  capability diagnosis and the peer adapter at the exact same profile.
+- Do not perform automatic latest-model discovery or upgrade because the parent
+  is stronger. Another model or reasoning override requires explicit user
+  opt-in; an explicitly reviewer-inclusive GPT-6 Luna authorization may cover
+  up to Max. Runtime rejection, downgrade, or mismatch triggers only local
+  capability diagnosis and the peer adapter at the exact same selected profile.
 - Switch to that exact-profile peer adapter first. Lowering the mode or changing
   the model family requires explicit user confirmation.
-- One invocation remains one logical lane even when Ultra delegates internally.
+- One invocation remains one logical lane even with internal delegation.
 
 Both peer adapters use the same effective-profile rule. An exact
 `runtime-attested` match may support clean. When authoritative runtime fields are
@@ -618,6 +622,8 @@ attempt inconclusive even when its terminal text is `No findings.`.
 
 Read [canonical-claude-lane.md](canonical-claude-lane.md).
 
+- Launch only with explicit user opt-in. Default to Opus 5.5 at `high`
+  effort; another model or effort requires explicit selection.
 - Start one actual supported Claude Code process in its own independently prepared workspace.
 - Give it the same frozen range and an independent prompt; never give it Codex findings.
 - During self-policy migration, give it the complete candidate-Markdown subject

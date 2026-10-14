@@ -60,6 +60,56 @@ comparisons, but use canonical repository identity plus exact `baseRefName` as
 the target-ref identity. Keep the exact `baseRefOid` as another independent
 readiness binding rather than collapsing it into the unique merge base.
 
+## Probe Remote Review Availability
+
+This read-only probe selects a route; it does not request a review or establish
+a current-head pass. Use only GETs and existing provider results; never send a
+dummy review request as an availability probe. All evidence interpretation,
+newer-negative precedence, quota-reset handling, and session choice belong to
+[Remote Review Availability](default-review-routing.md#remote-review-availability)
+and [Session Review Choice](default-review-routing.md#session-review-choice).
+
+Inspect the selected PR first, then a bounded set of recently active PRs from
+the same repository. The [List pull requests endpoint](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests)
+supports update-time sorting, and [GitHub CLI `gh api`](https://cli.github.com/manual/gh_api)
+documents the explicit GET query form below. One REST page has no age cutoff:
+
+```bash
+gh api -X GET repos/<owner>/<repo>/pulls \
+  -f state=all -f sort=updated -f direction=desc -F per_page=10 \
+  --jq '.[] | {number, url: .html_url, updated_at, head_sha: .head.sha, base_ref: .base.ref}'
+```
+
+Deduplicate the selected PR against this list. Check explicit provider
+enablement declarations for the target repository and read-only evidence from
+existing Codex or native Copilot results in the selected PR and up to these ten
+recent candidates. For result collections, use the exact-repository GET
+resources in [Fetch Complete Provider Evidence](#fetch-complete-provider-evidence),
+but enforce a finite task-local budget instead of enabling unbounded
+pagination. Prefer pages containing the newest available records; if ordering
+or pagination metadata prevents reaching that edge within budget, record the
+coverage gap. Preserve the exact repository, PR and head, authenticated
+host/login, provider and actor identities, result state, evidence and
+acquisition times, source endpoint and record ID/URL, candidate query, pages
+inspected, response bytes, elapsed time, and stop reason. Do not infer Codex
+account settings from ordinary-user GitHub APIs or invent private endpoints or
+credentials. Do not use third-party App-installation endpoints requiring an
+App JWT as ordinary-user capability probes.
+
+The command above documents GET syntax and candidate scope only; it is not a
+response-size or elapsed-time enforcement wrapper. `--jq` filters rendered
+fields, and terminal/tool display truncation limits only what is shown; neither
+bounds response bytes transferred, read, or written to disk. Before acquisition,
+set adjustable task-local candidate, page, aggregate-byte, and elapsed-time
+ceilings, then enforce them during the reads themselves. For example, a run may
+start with the selected PR plus at most ten recent candidates, at most two
+pages per result collection per PR, 256 KiB aggregate response bytes per PR,
+1 MiB aggregate response bytes for the whole probe, and 60 seconds total
+elapsed time. Tune these ceilings to the task; they are not universal
+constants. Stop when a ceiling is reached, do not escalate automatically to
+full history, and report the inspected scope. An incomplete newest-edge or
+response capture cannot establish absence of newer evidence.
+
 ## Fetch Complete Provider Evidence
 
 Fetch every page; do not rely on `gh pr view` summaries for authority.
@@ -110,16 +160,17 @@ Require type-preserving equality with the initial closed scope and selection.
 A changed head restarts the head-bound lane; a changed base ref/tip, merge base,
 or synthetic subject invalidates a synthetic-merge basis.
 
-An observed `baseRefName` change, even with the same OID, or a changed
-`baseRefOid` invalidates all previously counted local reviews, local validation
-and tests, CI/status results, conversation decisions, readiness decisions, and
-the final reread, even when the head and unique merge base remain unchanged. A
+An observed base-ref/tip change always restarts the scope and final reread.
+Routine mode uses the [readiness dependency classifier](../scripts/readiness_plan.py)
+to invalidate base-sensitive evidence while retaining unaffected head/range
+evidence; evidence with unknown or incomplete dependencies cannot be reused.
+Strict-base-proof mode invalidates its complete base-bound evidence set. A
 trustworthy terminal artifact, reaction, or feature-head-only producer result
-is the only exception: retain it only after this complete repeat proves its
-exact head is still current and no applicable provider finding remains
-unresolved. It supplies no base, merge-base, or target-ref coverage. A
-synthetic-merge producer basis is base-sensitive and must be reacquired for the
-new exact scope and check subject.
+is retained only after this complete repeat proves its exact head is still
+current and no applicable provider finding remains unresolved. It supplies no
+base, merge-base, or target-ref coverage. A synthetic-merge producer basis is
+base-sensitive and must be reacquired for the new exact scope and check
+subject. This probe layer never selects or rewrites the range.
 
 ## Request The Review
 
@@ -128,6 +179,39 @@ Post the exact body:
 ```text
 @codex review
 ```
+
+### Read-Only Request Preflight
+
+Before a first request or any proposed transport retry, revalidate the exact
+repository/PR/head and enumerate the complete visible exact-request set under
+one parent mutation owner. Combine that read with the retained transport
+outcome; absence from GitHub alone is not proof of non-delivery.
+
+Scope stability is a prerequisite, not retained transport evidence. Prove the
+canonical repository identity, exact PR and feature head unchanged across the
+complete initial/final acquisition before binding any visible request or using
+transport evidence. A visible request cannot supply that proof. A changed scope
+stops the old decision even when a request is present; freeze the new scope and
+acquire its own request set and epoch ledger without transferring old request
+identities or delivery evidence. An unreadable or unproved scope is inconclusive,
+not unchanged. The scope column makes the rows mutually exclusive.
+
+| Scope | Visible exact request | Retained transport evidence | Decision |
+| --- | --- | --- | --- |
+| Changed | Any | Any | Stop this decision and freeze the new scope; never transfer the old request identity. |
+| Unverified | Any | Any | Acquisition is inconclusive; do not POST or bind a request. |
+| Unchanged | Present | Any | Bind and observe the existing request; do not POST. |
+| Unchanged | Absent | Independently proved not sent | The unused write budget permits the same logical request, after scope and authorization revalidation. |
+| Unchanged | Absent | Possibly sent or unknown | Read-only observation; do not POST. |
+| Unchanged | Incomplete or unreadable | Any | Acquisition is inconclusive; do not POST. |
+
+A transport proof of `not sent` must establish failure before any request byte
+could reach GitHub (for example, a local auth/preparation failure before the
+HTTP action was invoked). For a first request, the single owner's retained
+epoch ledger must show that no create-comment HTTP action was invoked; an empty
+GET alone is still insufficient. A timeout, EOF, lost response, or empty successful GET
+does not establish that property. This preflight is a decision step, not a new
+idempotency contract, second logical review, or extra mutation authorization.
 
 Define one comment-mutation epoch by the canonical repository identity, exact PR, and feature
 head. In each epoch, permit at most one possibly delivered create-comment
@@ -160,15 +244,15 @@ comment-mutation epoch.
 
 A base-only retarget, including one whose new ref has the same OID, or
 target-base-tip advance on the same head does not authorize or require another
-request. Reuse qualifying head-bound provider
-evidence only after the exact-current-head and complete unresolved-finding
-reread above. Rerun every invalidated local review, validation/test, CI/status,
-conversation, readiness, and final-reread gate; when the merge base changed,
-first require the parent-owned `range_origin` gate in
-[pr-readiness.md](pr-readiness.md) to authorize the exact local PR-wide range.
-Reconcile a related merge/status check when its contract is base-sensitive.
-This probe layer never selects or rewrites that range. Never claim the provider
-inspected the changed base tip or retargeted base.
+request. Reuse qualifying head-bound provider evidence only after the
+exact-current-head and complete unresolved-finding reread above. In routine
+mode, use the [readiness dependency classifier](../scripts/readiness_plan.py)
+to select affected evidence; strict mode retains its complete base-bound
+invalidation. When the merge base changed, first require the parent-owned
+`range_origin` gate in [pr-readiness.md](pr-readiness.md) to authorize the exact
+local PR-wide range. Reconcile merge/status checks bound to the changed base or
+merge group. This probe layer never selects or rewrites the range. Never claim
+the provider inspected the changed base tip or retargeted base.
 
 ## Discover Related Checks Dynamically
 
@@ -247,11 +331,14 @@ subject and current base/merge bindings above. Ordinary readiness still
 validates base and merge base locally. A generic successful check or
 service-start marker cannot use this basis.
 
-Before an authorized merge, acquire complete applicable branch-protection or
-ruleset evidence for the exact base branch. A direct merge's base binding is
-proved only by a documented server-side expected-base mutation precondition or
-a repository-proved exact-base guard that rejects every
-`baseRefOid != merge_expected_base` mutation without bypass. The strict setting
+Before an authorized merge, acquire current applicable branch-protection or
+ruleset and required-check evidence for the exact base branch. Routine merge
+uses an exact-head server precondition and trusts GitHub and authorized
+repository collaborators/administrators as the control plane; it does not
+require a complete bypass/actor inventory or claim an atomic base lock. Never
+request `--admin` or another bypass. A concurrent base change after final
+reread remains a residual race. Strict-base-proof mode instead requires the
+complete exact-base or monotonic proof below. The strict setting
 for **Require branches to be up to date before merging** is useful when a
 branch is behind, but it is not an exact-base comparison: a different base tip
 that is already an ancestor of the unchanged feature head may still satisfy
@@ -259,7 +346,7 @@ strict freshness. Required checks plus strict, `mergeStateStatus`, a
 mergeability snapshot, or another `baseRefOid` read therefore do not by
 themselves protect the later mutation.
 
-The only direct-merge alternative is a complete parent proof of monotonic range
+Strict mode's direct-merge alternative is a complete parent proof of monotonic range
 contraction. Require all of these from the complete applicable protection and
 ruleset snapshot: the frozen `merge_expected_base_ref` equals the selected
 repository plus `baseRefName`, where repository equality means canonical
@@ -283,15 +370,15 @@ proof excludes it. These are consumer-side proof requirements only; this
 playbook does not define a producer implementation or require a nonexistent
 server-side retarget hold.
 
-A configured merge queue owns only latest-base merge-group freshness by
-default; it does not reacquire
-out-of-band local review or conversation gates. Before enrollment, require a
-repository-proved, non-bypassed merge-group hold that prevents completion after
-any target-base change until every invalidated gate is reacquired for the new
-exact base tip.
-If no such hold exists, the queue path is blocked. A narrowly equivalent
-contract may instead prove that every invalidated gate is itself a required,
-non-bypassed check on the rebuilt merge group. See
+A configured merge queue owns latest-base merge-group freshness by default; it
+does not reacquire out-of-band local review or conversation gates. Routine
+mode rereads required checks for the current merge group and applies the
+dependency classifier to other evidence. Strict mode requires a
+repository-proved, non-bypassed merge-group hold that blocks completion after
+any target-base change until every invalidated gate is reacquired, or a proved
+contract that makes every invalidated gate a required, non-bypassed check on
+the rebuilt merge group. Without that strict contract, strict queue merge is
+blocked. See
 [pr-readiness.md](pr-readiness.md).
 
 ## Reconcile Only Recoverable States

@@ -27,8 +27,10 @@ same meaning. The two local Codex adapters are peer transports for one logical
 lane; using both does not create extra consent or another reviewer.
 
 A generic request for a full workflow or merge readiness authorizes the Codex
-processors required by applicable repository policy. It does not silently opt
-into Claude Code, GitHub Copilot, or another external reviewer. A separately
+processors required by applicable repository policy and, when the remote-first
+route selects it, native GitHub Copilot PR code review under the user's routing
+policy. This is scoped to the selected PR, not Copilot CLI or implementation.
+It does not silently opt into Claude Code, Copilot CLI, or another external reviewer. A separately
 requested provider diagnostic remains supplemental and does not satisfy a
 named lane unless the playbook says so.
 
@@ -78,6 +80,10 @@ uses committed tracked content from an independent clean workspace.
 - GitHub Codex operates only on the selected existing `github.com` PR. GitHub
   Enterprise and other hosts are unsupported unless a later explicit contract
   adds them.
+- Native GitHub Copilot PR review is authorized by the remote-first delivery
+  route for the exact selected supported repository/PR. It does not satisfy a
+  named Claude lane or authorize Copilot CLI, cloud-agent implementation,
+  arbitrary model/effort selection, or another repository.
 - GitHub-owned PR/review APIs and OpenAI Codex services are trusted
   destinations for the exact same-PR data above. This standing boundary never
   includes secrets from untracked files or unrelated repositories.

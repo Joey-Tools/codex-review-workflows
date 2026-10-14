@@ -14,8 +14,10 @@ import review_supervisor.supervisor as supervisor_module
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     MAX_EVIDENCE_PRIMARY_BYTES,
+    MODEL,
     NAMED_LANE_ELIGIBLE,
     PROCESS_ENVELOPE_BYTES,
+    REASONING_EFFORT,
     RELEASED_TTL_SECONDS,
     SCHEMA_VERSION,
 )
@@ -420,8 +422,8 @@ def _write_attempt(
         "admission_status": "completed",
         "failure_stage": None,
         "review_range": f"{'1' * 40}..{'2' * 40}",
-        "requested_model": "gpt-5.6-terra",
-        "requested_reasoning_effort": "max",
+        "requested_model": MODEL,
+        "requested_reasoning_effort": REASONING_EFFORT,
         "observed_runtime": {},
         "final_seal": None,
         "final_fifo_path": str(attempt / "final.fifo"),
@@ -452,11 +454,10 @@ def _terminal_observed_runtime() -> dict[str, object]:
             "session_source": "exec",
         },
         "model": {
-            "model": "gpt-5.6-terra",
+            "model": MODEL,
             "model_attempt": "primary",
-            "model_fallback_authorization": None,
             "model_provider": "openai",
-            "reasoning_effort": "max",
+            "reasoning_effort": REASONING_EFFORT,
         },
         "containment": {
             "leader_reaped": True,
@@ -477,8 +478,8 @@ def _terminal_observed_runtime() -> dict[str, object]:
         "evidence_bundle_sha256": "a" * 64,
         "model_input_length": 128,
         "model_input_sha256": "b" * 64,
-        "requested_model": "gpt-5.6-terra",
-        "requested_reasoning_effort": "max",
+        "requested_model": MODEL,
+        "requested_reasoning_effort": REASONING_EFFORT,
         "transport": "app-server-stdio",
     }
 
@@ -487,7 +488,6 @@ def _write_authorized_attempt(
     retention: pathlib.Path,
     *,
     suffix: str,
-    legacy_model: bool = False,
 ) -> pathlib.Path:
     attempt = _write_attempt(
         retention,
@@ -570,8 +570,6 @@ def _write_authorized_attempt(
             "observed_runtime": _terminal_observed_runtime(),
         }
     )
-    if legacy_model:
-        state["observed_runtime"]["model"].pop("model_fallback_authorization")
     _write_exact_state(attempt, state)
     state, _, digest = read_attempt_state(attempt)
     with acquire_retention_lease(retention, deadline=time.monotonic() + 5) as lease:
@@ -754,10 +752,7 @@ class FinalAuthorizationTests(unittest.TestCase):
                 "length": len(content),
                 "sha256": sha256_bytes(content),
             }
-            supervisor = {
-                "pid": 999_999_999,
-                "start_identity": "fixture-supervisor",
-            }
+            supervisor = {"pid": 1234, "start_identity": "fixture-supervisor"}
             leader = {
                 "pid": 5678,
                 "pgid": 5678,
@@ -874,21 +869,6 @@ class FinalAuthorizationTests(unittest.TestCase):
             self.assertIs(result["named_lane_eligible"], False)
             self.assertEqual(result["final_message"], "No findings.")
 
-    def test_final_result_accepts_a_legacy_primary_model_attestation(self) -> None:
-        with owned_temporary_directory("final-legacy-model-attestation-") as root:
-            retention = root / "retention"
-            retention.mkdir(mode=0o700)
-            attempt = _write_authorized_attempt(
-                retention,
-                suffix="8" * 32,
-                legacy_model=True,
-            )
-            result = final_result(
-                retention_root=retention,
-                attempt_dir=attempt,
-            )
-            self.assertEqual(result["final_message"], "No findings.")
-
     def test_terminal_auth_refresh_closure_must_match_process_history(self) -> None:
         with owned_temporary_directory("final-auth-refresh-binding-") as root:
             retention = root / "retention"
@@ -946,62 +926,6 @@ class FinalAuthorizationTests(unittest.TestCase):
                     "session_id": refresh_leader["pid"],
                 }
             )
-            self.assertEqual(
-                _validate_terminal_lifecycle(attempt, state),
-                state["handoff_token"],
-            )
-
-            primary_leader = {
-                "pid": 4566,
-                "pgid": 4566,
-                "start_identity": "fixture-primary-reviewer",
-            }
-            primary_binding = {
-                "session_id": primary_leader["pid"],
-                "profile_sha256": "6" * 64,
-            }
-            final_leader = state["leader"]
-            final_binding = state["runtime_process_binding"]
-            state["model_fallback_authorization"] = {
-                "denial_category": "model_entitlement",
-                "denial_record_sha256": "a" * 64,
-                "denied_model": "gpt-5.6-terra",
-                "selected_model": "gpt-5.6-luna",
-            }
-            state["requested_model"] = "gpt-5.6-luna"
-            state["observed_runtime"]["model"].update(
-                {
-                    "model": "gpt-5.6-luna",
-                    "model_attempt": "explicit_fallback",
-                    "model_fallback_authorization": state[
-                        "model_fallback_authorization"
-                    ],
-                }
-            )
-            state["observed_runtime"]["requested_model"] = "gpt-5.6-luna"
-            state["process_history"] = [
-                {
-                    "stage": "reviewer",
-                    "leader": primary_leader,
-                    "runtime_binding": primary_binding,
-                    "exit_code": 1,
-                    "closure": "proven-by-owner",
-                },
-                {
-                    "stage": "auth-refresh",
-                    "leader": refresh_leader,
-                    "runtime_binding": refresh_binding,
-                    "exit_code": 0,
-                    "closure": "proven-by-owner",
-                },
-                {
-                    "stage": "reviewer",
-                    "leader": final_leader,
-                    "runtime_binding": final_binding,
-                    "exit_code": 0,
-                    "closure": "proven-by-owner",
-                },
-            ]
             self.assertEqual(
                 _validate_terminal_lifecycle(attempt, state),
                 state["handoff_token"],

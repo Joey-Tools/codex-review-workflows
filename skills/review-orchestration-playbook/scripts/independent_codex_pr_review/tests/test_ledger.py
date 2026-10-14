@@ -11,8 +11,10 @@ from unittest import mock
 import review_supervisor.ledger as ledger_module
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    MODEL,
     NAMED_LANE_ELIGIBLE,
     PROCESS_ENVELOPE_BYTES,
+    REASONING_EFFORT,
     SCHEMA_VERSION,
 )
 from review_supervisor.errors import SupervisorError
@@ -892,6 +894,8 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                 )
             self.assertEqual(state["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT)
             self.assertIs(state["named_lane_eligible"], NAMED_LANE_ELIGIBLE)
+            self.assertEqual(state["requested_model"], MODEL)
+            self.assertEqual(state["requested_reasoning_effort"], REASONING_EFFORT)
             self.assertTrue(
                 directory_identities_match(
                     Identity(**state["retention_root_binding"]["identity"]),

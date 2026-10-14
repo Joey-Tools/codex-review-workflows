@@ -1591,6 +1591,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.skill = _read(SKILL_ROOT / "SKILL.md")
+        cls.producer = _read(REFERENCES / "github-codex-producer-and-recovery.md")
         cls.probes = _read(REFERENCES / "github-pr-probes.md")
         cls.authority = _read(REFERENCES / "github-codex-evidence-authority.md")
         cls.contracts = _read(REFERENCES / "review-lane-contracts.md")
@@ -4688,7 +4689,9 @@ class GitHubRecoveryContractTest(unittest.TestCase):
             self.assertIn(anchor, combined)
 
     def test_merge_status_basis_binds_subject_scope_and_contract_clean(self) -> None:
-        combined = _normalize(self.skill + "\n" + self.probes + "\n" + self.authority)
+        combined = _normalize(
+            "\n".join((self.skill, self.probes, self.authority, self.producer))
+        )
         for anchor in (
             "feature head",
             "current base",
@@ -4771,6 +4774,104 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         )
         self.assertIn("never extends to comment creation", combined)
         self.assertNotIn("before every repetition", combined)
+
+    def test_request_preflight_preserves_non_delivery_proof_boundary(self) -> None:
+        preflight = self.probes.split("### Read-Only Request Preflight", 1)[1].split(
+            "Define one comment-mutation epoch", 1
+        )[0]
+        rows = [
+            tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+            for line in preflight.splitlines()
+            if line.startswith("| ")
+        ]
+        self.assertEqual(
+            rows[2:],
+            [
+                (
+                    "Changed",
+                    "Any",
+                    "Any",
+                    "Stop this decision and freeze the new scope; never transfer the old request identity.",
+                ),
+                (
+                    "Unverified",
+                    "Any",
+                    "Any",
+                    "Acquisition is inconclusive; do not POST or bind a request.",
+                ),
+                (
+                    "Unchanged",
+                    "Present",
+                    "Any",
+                    "Bind and observe the existing request; do not POST.",
+                ),
+                (
+                    "Unchanged",
+                    "Absent",
+                    "Independently proved not sent",
+                    "The unused write budget permits the same logical request, after scope and authorization revalidation.",
+                ),
+                (
+                    "Unchanged",
+                    "Absent",
+                    "Possibly sent or unknown",
+                    "Read-only observation; do not POST.",
+                ),
+                (
+                    "Unchanged",
+                    "Incomplete or unreadable",
+                    "Any",
+                    "Acquisition is inconclusive; do not POST.",
+                ),
+            ],
+        )
+        normalized = _normalize(preflight)
+        for anchor in (
+            "complete visible exact-request set",
+            "one parent mutation owner",
+            "absence from github alone is not proof of non-delivery",
+            "failure before any request byte could reach github",
+            "timeout, eof, lost response, or empty successful get",
+            "does not establish that property",
+            "not a new idempotency contract, second logical review, or extra mutation authorization",
+        ):
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, normalized)
+
+    def test_request_preflight_scope_rows_are_exclusive_and_complete(self) -> None:
+        preflight = self.probes.split("### Read-Only Request Preflight", 1)[1].split(
+            "Define one comment-mutation epoch", 1
+        )[0]
+        rows = [
+            tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+            for line in preflight.splitlines()
+            if line.startswith("| ")
+        ][2:]
+        for row in rows:
+            self.assertEqual(len(row), 4)
+        for scope in ("Changed", "Unverified", "Unchanged"):
+            for visible in ("Present", "Absent", "Incomplete or unreadable"):
+                for transport in (
+                    "Independently proved not sent",
+                    "Possibly sent or unknown",
+                ):
+                    state = (scope, visible, transport)
+                    matches = [
+                        row
+                        for row in rows
+                        if all(
+                            expected == "Any" or expected == actual
+                            for expected, actual in zip(row[:3], state, strict=True)
+                        )
+                    ]
+                    with self.subTest(
+                        scope=scope, visible=visible, transport=transport
+                    ):
+                        self.assertEqual(len(matches), 1)
+                        if scope == "Changed":
+                            self.assertIn("never transfer", matches[0][3])
+                        elif scope == "Unverified":
+                            self.assertIn("do not POST or bind", matches[0][3])
 
     def test_retry_schedule_cannot_repeat_comment_creation(self) -> None:
         request = self.probes.split("## Request The Review", 1)[1].split(
@@ -4855,13 +4956,13 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         self.assertIn("commit that change as a new head", normalized)
 
         combined = _normalize(
-            self.skill + "\n" + self.authority + "\n" + self.readiness
+            "\n".join((self.skill, self.authority, self.readiness, self.producer))
         )
         self.assertIn("only applicable unresolved provider findings block", combined)
         self.assertIn("requires fresh review", combined)
         self.assertIn(
-            "a typed thread resolution or trustworthy same-head provider correction alone does not require a commit",
-            combined,
+            "do not manufacture an empty commit for a resolution-only state change",
+            _normalize(self.readiness),
         )
         self.assertNotIn(
             "provider findings block until fixed and resolved on a new reviewed head",

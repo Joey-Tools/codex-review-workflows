@@ -47,7 +47,7 @@ The parent stores preparation and validation receipts outside the model-visible 
 Populate this block from parent-owned evidence:
 
 ```text
-review_kind: <named-single | named-double-codex | named-double-claude | named-triple-codex | named-triple-claude | skill-repo-codex-gate>
+review_kind: <local-default | explicitly-requested-local | named-single | named-double-codex | named-double-claude | named-triple-codex | named-triple-claude>
 self_policy_migration: <true | false>
 self_policy_migration_parent_prompt_match: <exact-boolean | invalid>
 workspace: <absolute validated lane-private path>

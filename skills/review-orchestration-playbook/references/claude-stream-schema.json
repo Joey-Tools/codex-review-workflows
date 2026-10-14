@@ -618,18 +618,10 @@
     }
   },
   "model_identity": {
-    "claude-opus-5": {
-      "init_model": "claude-opus-5",
+    "claude-opus-5-5": {
+      "init_model": "claude-opus-5-5",
       "accepted_model_usage_keys": [
-        "claude-opus-5",
-        "claude-opus-5.0"
-      ]
-    },
-    "claude-opus-5.0": {
-      "init_model": "claude-opus-5.0",
-      "accepted_model_usage_keys": [
-        "claude-opus-5",
-        "claude-opus-5.0"
+        "claude-opus-5-5"
       ]
     },
     "claude-opus-4-8": {
@@ -908,10 +900,10 @@
   "contract_cases": [
     {
       "name": "primary_exact",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5"
+        "claude-opus-4-8"
       ],
       "optional_terminal_values": {},
       "extra_terminal_fields": [],
@@ -919,10 +911,10 @@
     },
     {
       "name": "reviewed_terminal_alias",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5.0"
+        "claude-opus-4.8"
       ],
       "optional_terminal_values": {},
       "extra_terminal_fields": [],
@@ -930,10 +922,10 @@
     },
     {
       "name": "reviewed_auxiliary_model",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5",
+        "claude-opus-4-8",
         "claude-haiku-4-5-20251001"
       ],
       "optional_terminal_values": {
@@ -945,7 +937,7 @@
     },
     {
       "name": "silent_model_fallback",
-      "requested_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
       "init_model": "claude-opus-4-7",
       "model_usage_keys": [
         "claude-opus-4-7"
@@ -956,10 +948,10 @@
     },
     {
       "name": "mixed_primary_model_substitution",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5",
+        "claude-opus-4-8",
         "claude-opus-4-7"
       ],
       "optional_terminal_values": {},
@@ -968,10 +960,10 @@
     },
     {
       "name": "unknown_model_usage_key",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5",
+        "claude-opus-4-8",
         "claude-haiku-future"
       ],
       "optional_terminal_values": {},
@@ -980,10 +972,10 @@
     },
     {
       "name": "mixed_primary_and_unknown_model_evidence",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5",
+        "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-unknown-future"
       ],
@@ -993,10 +985,10 @@
     },
     {
       "name": "truncated_stop_reason",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5"
+        "claude-opus-4-8"
       ],
       "optional_terminal_values": {
         "stop_reason": "max_tokens"
@@ -1006,10 +998,10 @@
     },
     {
       "name": "unexpected_structured_output",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5"
+        "claude-opus-4-8"
       ],
       "optional_terminal_values": {
         "structured_output": {
@@ -1021,10 +1013,10 @@
     },
     {
       "name": "invalid_optional_metric",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5"
+        "claude-opus-4-8"
       ],
       "optional_terminal_values": {
         "duration_ms": -1
@@ -1034,10 +1026,10 @@
     },
     {
       "name": "unknown_error_field",
-      "requested_model": "claude-opus-5",
-      "init_model": "claude-opus-5",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
       "model_usage_keys": [
-        "claude-opus-5"
+        "claude-opus-4-8"
       ],
       "optional_terminal_values": {},
       "extra_terminal_fields": [

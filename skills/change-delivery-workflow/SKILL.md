@@ -1,6 +1,6 @@
 ---
 name: change-delivery-workflow
-description: "Run a local delivery gate for non-trivial repo changes: implement, build, test, update docs, form the landing commit, review its frozen exact head, then accept it. Use when wrapping up local work, probing local gate readiness, or starting a full workflow before PR readiness."
+description: "Run the implementation-to-commit gate for non-trivial repo changes: implement, build, test, update docs, freeze the landing head, and hand review selection to review-orchestration-playbook. Use for local delivery or before PR readiness; an eligible remote PR reviewer avoids duplicate local review unless explicitly requested."
 ---
 
 # Change Delivery Workflow
@@ -8,7 +8,7 @@ description: "Run a local delivery gate for non-trivial repo changes: implement,
 ## Overview
 
 This skill owns the local
-`plan -> code -> test -> docs -> landing commit -> review -> accept exact head`
+`plan -> code -> test -> docs -> landing commit -> selected review -> accept exact head`
 gate. It does not define reviewer adapters, workspace isolation, GitHub evidence,
 CI recovery, or PR readiness. Hand those tasks to the authoritative active
 `$review-orchestration-playbook` with a frozen committed range.
@@ -16,6 +16,16 @@ CI recovery, or PR readiness. Hand those tasks to the authoritative active
 A request for a full workflow or merge-ready result continues into that
 playbook after the local gate. A request for only the local/pre-commit gate
 stops after the checked commit and does not push.
+
+Local build, tests, and documentation are always proportionate to the change;
+local review is not universally mandatory before a PR. For PR-bound delivery,
+delegate review selection to the playbook before launching a reviewer: an
+eligible GitHub Codex or native GitHub Copilot review uses the remote-only
+default unless local review was explicitly requested. Apply any session choice
+through the playbook, not an independent delivery fallback rule. Every required
+lane under the effective route must complete at the frozen head before final
+acceptance; preparing a tested commit for authorized PR creation is not a claim
+that review is already clean.
 
 ## Workflow
 
@@ -43,12 +53,12 @@ stops after the checked commit and does not push.
 5. Form the landing shape, freeze, and hand off review.
 - Complete every intended squash, amend, or other landing transformation before the final frozen review. The resulting signed and attributed commit must be the exact head intended for the next push or PR handoff.
 - Ensure the landing candidate is represented by committed Git objects and record an immutable `base_sha..head_sha`; do not hand a live working tree or prebuilt diff to formal review.
-- Load the authoritative active `$review-orchestration-playbook` and give it the repository plus frozen endpoints. That playbook alone selects the fresh local Codex adapter, prepares and validates the independent clean workspace, constructs the review prompt, and interprets the result.
-- If review finds an issue, fix it in a new checkpoint commit and return to validation and documentation. Complete any desired landing transformation, freeze that new exact head, and repeat the required local review.
+- Load the authoritative active `$review-orchestration-playbook` and give it the repository, delivery destination, explicit review requests, and frozen endpoints. That playbook alone selects the required local or remote lanes, adapters, workspace, prompt, and evidence contract. Do not add a local lane when its remote-only route omits one.
+- If review finds an issue, fix it in a new checkpoint commit and return to validation and documentation. Complete any desired landing transformation, freeze that new exact head, and repeat every required review lane.
 
 6. Accept the reviewed landing head.
-- Only accept the exact `head_sha` for which implementation, validation, documentation, and the requested local review are clean. Do not create another commit after that review and still describe the new head as reviewed.
-- Any post-review operation that creates a new commit or changes the head—including squash, amend, a base-refresh merge commit, or a documentation, attribution, or metadata-only commit—invalidates the prior exact-head result. Rerun the full local validation and documentation checks, freeze the new range, and repeat every requested local review lane before accepting or handing off that head.
+- Only accept the exact `head_sha` for which implementation, validation, documentation, and the selected required review lanes are clean. Do not create another commit after that review and still describe the new head as reviewed.
+- Any post-review operation that creates a new commit or changes the head—including squash, amend, a base-refresh merge commit, or a documentation, attribution, or metadata-only commit—invalidates the prior exact-head result. Rerun the full local validation and documentation checks, freeze the new range, and repeat every requested local review lane and required remote lane before accepting that head. Omitted local lanes stay omitted; do not turn this invalidation rule into a new local-review requirement.
 - Keep the reviewed landing commit focused and follow repository signing and attribution policy.
 - Do not push a local-gate-only task without separate authorization.
 - When PR readiness was requested and its target authorization preflight passes, continue with `$review-orchestration-playbook` for push/PR operations, CI and comment repair, the requested review shape, and the terminal readiness or merge outcome.

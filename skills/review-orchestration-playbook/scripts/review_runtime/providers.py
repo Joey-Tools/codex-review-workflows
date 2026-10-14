@@ -161,15 +161,13 @@ def __getattr__(name: str) -> Any:
 _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
 
 
-CODEX_MODELS = ("gpt-5.6-terra", "gpt-5.6-luna")
-CODEX_REASONING_EFFORT = "max"
-# Keep the closed retry chain within the Opus 5 family. The first ID is the
-# requested default; the dotted form is the same-family wire alias used only
-# for a separately recorded retry.
-CLAUDE_MODELS = ("claude-opus-5", "claude-opus-5.0")
-COPILOT_MODELS = ("claude-opus-5", "claude-opus-5.0")
-CLAUDE_REASONING_EFFORT = "max"
-COPILOT_REASONING_EFFORT = "max"
+CODEX_MODELS = ("gpt-6.1-sol",)
+CODEX_REASONING_EFFORT = "high"
+CLAUDE_MODELS = ("claude-opus-5-5",)
+# Copilot CLI uses the dotted ID documented by its command reference.
+COPILOT_MODELS = ("claude-opus-5.5",)
+CLAUDE_REASONING_EFFORT = "high"
+COPILOT_REASONING_EFFORT = "high"
 CLAUDE_LINUX_PROMPT_GUIDANCE = b"""
 Linux/WSL2 runtime tool boundary:
 - The sandbox working directory is `/workspace`.
@@ -20329,10 +20327,7 @@ def _claude_supported_failure_category(
 
 
 def _normalize_model(value: str) -> str:
-    if value.lower() in {"claude-opus-5", "claude-opus-5.0"}:
-        return "claude-opus-5"
-    normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
-    return normalized
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
 def _model_matches(requested: str, effective: str) -> bool:

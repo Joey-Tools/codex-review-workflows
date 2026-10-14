@@ -69,11 +69,12 @@ evidence; raw provider ancestry claims never substitute for this parent proof.
 An observed target `baseRefName` change or advance of the target base tip does
 not by itself invalidate head-bound provider evidence. If the head and unique
 merge base are unchanged, the frozen local range endpoints are unchanged too,
-but the new exact target-ref identity or `baseRefOid`
-invalidates every prior local PR-wide review, local validation and test result,
-CI/status result, conversation/readiness decision, and final reread. Reacquire
-all of them before counting readiness again; unchanged range provenance does
-not preserve those earlier results. Retain the head-bound provider result only
+but the new exact target-ref identity or `baseRefOid` requires a fresh scope
+check and final reread. In routine mode, revalidate prior evidence according to
+its declared dependencies using the classifier in [pr-readiness.md](pr-readiness.md);
+strict mode retains full base-bound invalidation. Unchanged range provenance
+alone does not preserve evidence declared dependent on the changed base. Retain
+the head-bound provider result only
 after a complete final reread confirms its exact head is still current and no
 applicable provider finding remains unresolved. Do not claim that a provider
 comment, review, reaction, or ordinary check proves the base. The retained
@@ -83,11 +84,12 @@ base-sensitive instead: any change to its frozen base ref, base tip, unique
 merge base, feature head, or check-subject SHA invalidates it and requires a
 new producer result for the recomputed current scope.
 
-This observed-change invalidation rule is unchanged by the narrow atomic-window
-alternative in [pr-readiness.md](pr-readiness.md): only an unobserved movement
-of the same frozen target ref during the direct merge's atomic window may use a
-parent-proved monotonic range contraction. Authorized PR-retarget actors belong
-to that proof's trusted external control plane, not provider evidence.
+The routine profile accepts the trusted GitHub/repository control plane and
+reports the residual race between final reread and direct merge. Only the
+opt-in strict-base-proof profile uses the atomic-window monotonic-contraction
+alternative in [pr-readiness.md](pr-readiness.md). Authorized PR-retarget
+actors belong to that strict proof's external control plane, not provider
+evidence.
 
 After a merge-base change on an unchanged head, the parent may reuse the
 head-bound GitHub result after a complete final reread confirms the same head
@@ -96,8 +98,10 @@ local and readiness gate against the new merge base only after the parent-owned
 `range_origin` provenance gate in [pr-readiness.md](pr-readiness.md) authorizes
 that local PR-wide range. This authority neither selects nor rewrites a local
 range: missing or unknown origin may block local readiness while the
-trustworthy head-only GitHub result remains reusable. Reconcile any
-base-sensitive merge/status check. Do not post another `@codex review` merely
+trustworthy head-only GitHub result remains reusable. In routine mode, rerun
+only other evidence classified as dependent on the changed dimension; strict
+mode keeps the complete base-bound rerun. Reconcile any base-sensitive
+merge/status check. Do not post another `@codex review` merely
 because the base changed, and never describe the reused provider artifact as a
 review of the new base. The raw provider artifact may remain in the audit
 inventory, but old `finding_page_receipt`, `finding_range_receipt`, and
@@ -542,11 +546,27 @@ The same consumer resource's `required_report_schema` and `report_fixtures`
 are the executable, closed, basis-discriminated report contract. They reject
 cross-variant field combinations rather than relying on YAML examples alone.
 
+The version-1 record/report envelope contains an additive, explicitly named
+`clean_issue_v2` / `clean-issue-v2` branch for the observed official team-settings
+disclosure. It reuses only v1 presentation and commit binding and requires its
+own exact closed disclosure lines; disclosure-free or legacy disclosure carriers
+remain v1. Unknown URLs, missing or extra nonblank prose, and mixed disclosures
+remain malformed. A consumer release must pin the resource bytes and implement
+both named branches before accepting v2; old consumers fail closed rather than
+silently reinterpreting their v1 branch. This is not a generic prose parser.
+
 The resource is deliberately a consumer contract. It does not define, validate,
 or authorize a GitHub Action, status producer, workflow name, check conclusion,
 or ruleset. Those producer integrations belong to their separately reviewed
 workstream and can supply a preferred basis only through the association rules
 above.
+
+Before considering a comment transport retry, apply the
+[read-only request preflight](github-pr-probes.md#read-only-request-preflight).
+An existing exact request is reused; only independent proof that the HTTP
+request was not sent preserves the unused write budget. An absent or delayed
+GET result cannot prove non-delivery. Every possibly sent attempt still consumes
+the epoch budget.
 
 ## Terminal Results
 
@@ -909,7 +929,7 @@ evidence:
   url: https://github.com/...
   channel: issue-comment | review
   grammar: github-codex-terminal-carriers-v1
-  grammar_branch: clean-issue-v1 | clean-review-v1
+  grammar_branch: clean-issue-v1 | clean-issue-v2 | clean-review-v1
   grammar_status: accepted
   artifact_commit: 40-lowercase-hex
   server_time: RFC3339
@@ -922,8 +942,9 @@ For `basis: terminal-clean`, `artifact_commit` is required, non-null, and equal
 to the envelope `head_sha`; `head_binding` is exactly `explicit-commit`.
 `artifact_commit: null` and `head_binding: stable-request-epoch` are
 structurally invalid for terminal clean. The clean channel and grammar branch
-are a closed pair: `issue-comment` requires `clean-issue-v1`, while `review`
-requires `clean-review-v1`; crossing those pairs is malformed evidence.
+are a closed pair: `issue-comment` requires `clean-issue-v1` or `clean-issue-v2`,
+while `review` requires `clean-review-v1`; crossing those pairs is malformed
+evidence.
 
 This evidence object cannot self-prove complete final state: terminal-clean
 pass also requires the independent `complete_pr_snapshot` to select this exact
