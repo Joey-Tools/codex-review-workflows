@@ -63,6 +63,9 @@ sessions, not the number of internal workers a high-reasoning model may use.
 
 ## Development
 
+Manual CI diagnostics use the repository-specific [CI rerun contract](docs/ci-reruns.md).
+It declares repeat safety for one exact workflow, not automatic retry or review approval.
+
 The helper requires Python 3.10 or later; CI pins the minimum supported runtime.
 From the repository root, run:
 

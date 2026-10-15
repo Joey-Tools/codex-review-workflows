@@ -1,0 +1,17 @@
+{
+  "schema": "joey-tools-ci-rerun-v1",
+  "repository": "Joey-Tools/codex-review-workflows",
+  "workflow_path": ".github/workflows/ci.yml",
+  "workflow_sha256": "0d02875eadf880a18b36cbe22f0c1cf2bd88bb3ca418d583a44a01fccb944042",
+  "operation": "existing-run-rerun-failed-jobs",
+  "repeat_safety": "reentrant",
+  "authority": "manual-diagnostic-only",
+  "maximum_run_attempt": 2,
+  "job_timeout_minutes": {
+    "platform_tests": 60,
+    "broker_reproducibility": 15,
+    "independent_supervisor_tests": 15,
+    "readonly_install_supervisor_tests": 20,
+    "test": 5
+  }
+}
