@@ -31,15 +31,15 @@ safe canonical repository path must be a nonempty relative POSIX path with at
 least one component; reject `.`, NUL, backslash, absolute paths, dot
 components, and noncanonical spellings.
 
-This probe layer owns acquisition, not interpretation. Preserve every complete
-raw REST and GraphQL page used by a finding decision so the parent can freeze a
-current-scope `finding_page_receipt`. Independently provide the exact full-DAG
-range input for the parent's `finding_range_receipt`; only then may the parent
-freeze the `finding_carrier_snapshot` selected from the complete observation
-under the evidence authority's precedence and supersession rules. Freeze and
-pass all three inputs before report validation and again for the final reread.
-The evidence authority alone defines carrier validity, applicability, thread
-resolution, terminal selection, and report classification.
+This probe layer owns acquisition, not interpretation. Preserve complete raw
+REST and GraphQL pages and independently prove full-DAG applicability; the
+agent applies the evidence authority's semantic interpretation, finding
+precedence, and final reread. It need not encode that judgment into a closed
+carrier/report schema. When an explicitly selected deterministic consumer
+requires `finding_page_receipt`, `finding_range_receipt`, and
+`finding_carrier_snapshot`, freeze those separate inputs under the
+[machine evidence v1 profile](github-codex-machine-evidence-v1.md) before its
+report validation. Do not present a semantic decision as machine acceptance.
 
 ## Select The Exact PR
 
@@ -147,9 +147,11 @@ identity and the PR number type-preservingly, while preserving the exact raw
 records and their repository spelling. Normalize other IDs only for comparison.
 Never synthesize `thread_resolved` on REST comments.
 
-Derive the parent-owned `finding_range_receipt` independently from the exact
-range's complete reachable DAG rather than treating ancestry embedded in a
-carrier or snapshot as sole authority. Preserve merge commits and every
+Prove finding applicability independently from the exact range's complete
+reachable DAG rather than treating ancestry embedded in provider content as
+authority. A deterministic consumer's parent-owned `finding_range_receipt`
+records that same independently acquired fact; the ordinary semantic route
+does not require its closed schema. Preserve merge commits and every
 in-range side-history commit; do not acquire a `--first-parent`,
 `--ancestry-path`, single-parent, or linear-history projection as a substitute.
 

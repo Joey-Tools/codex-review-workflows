@@ -898,7 +898,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
         readiness = _read("references/pr-readiness.md")
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         probes = _read("references/github-pr-probes.md")
         normalized_skill = _normalize(skill)
         normalized_readiness = _normalize(readiness)
@@ -995,7 +995,7 @@ class RepositoryContractTest(unittest.TestCase):
         skill = _read("SKILL.md")
         readiness = _read("references/pr-readiness.md")
         normalized_skill = _normalize(skill)
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
         freshness_contract = readiness.split(
             "## Branch Freshness Is Not Linear History", 1
         )[1].split("### Head-Only Provider Responsibility Boundary", 1)[0]
@@ -1064,7 +1064,7 @@ class RepositoryContractTest(unittest.TestCase):
         skill = _normalize(_read("SKILL.md"))
         readiness = _normalize(_read("references/pr-readiness.md"))
         probes = _normalize(_read("references/github-pr-probes.md"))
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
 
         self.assertIn("routine profile is the default", skill)
         self.assertIn("strict base proof is opt-in", skill)
@@ -1135,7 +1135,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "For a direct merge", 1
             )[0]
         )
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
 
         for required_proof in (
             "the frozen `merge_expected_base_ref` equals the final-reread repository plus `baserefname`",
@@ -1642,7 +1642,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Do not execute candidate control code to approve itself", skill)
 
     def test_github_lane_passes_on_current_head_clean_without_findings(self) -> None:
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         contracts = _read("references/review-lane-contracts.md")
         normalized = _normalize(authority)
         for anchor in (
@@ -1675,9 +1675,6 @@ class RepositoryContractTest(unittest.TestCase):
             normalized,
         )
         self.assertIn(
-            "service-start markers and unknown prose do not pass", _normalize(_read("SKILL.md"))
-        )
-        self.assertIn(
             "latest head plus no unresolved provider finding passes",
             _normalize(contracts),
         )
@@ -1686,7 +1683,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_github_lane_prefers_associated_status_and_keeps_small_reaction_fallback(
         self,
     ) -> None:
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         probes = _read("references/github-pr-probes.md")
         normalized = _normalize(authority)
         self.assertIn("trustworthy repository merge/status check", normalized)
