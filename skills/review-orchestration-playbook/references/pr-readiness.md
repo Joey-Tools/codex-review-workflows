@@ -34,10 +34,16 @@ authenticated open PR for the exact intended head repository and branch.
 Multiple candidates require caller selection. Other PRs are read-only
 coordination evidence.
 
-When authenticated selection proves that no supported PR exists, emit the
-GitHub lane authority's closed `not-applicable` no-PR variant with null PR/head
-fields. Do not fabricate a PR-readiness report or enter provider recovery; a
-local standalone range may still be reviewed under its own authorization.
+When authenticated selection proves that no supported PR exists, report
+`not-applicable` under the authority's
+[semantic no-PR definition](github-codex-evidence-authority.md#no-supported-pr).
+State the proved absence and leave PR/head absent, or null when the caller's
+structured format has those fields. This is not merge-ready or a pending
+provider review. Only an explicitly selected deterministic consumer requires
+the closed null-PR/head machine variant. Failed, incomplete, or ambiguous
+selection does not prove absence. Do not fabricate a PR-readiness report or
+enter provider recovery; a local standalone range may still be reviewed under
+its own authorization.
 
 A review request alone does not authorize creating a branch, commit, push, PR,
 or changing PR metadata. Obtain the authorization required by repository and
@@ -385,7 +391,11 @@ or an accepted later corrective artifact satisfies
 [github-codex-evidence-authority.md](github-codex-evidence-authority.md).
 The old raw finding carrier may be evaluated again, but its old acquisition,
 ancestry, and thread inputs are not reusable. The parent must reacquire the
-complete current-scope provider observation and freeze a new
+complete current-scope provider observation, rederive applicability for the
+new full-DAG range, and apply semantic finding precedence and typed resolution
+to that fresh evidence. Record those facts and source identities directly for
+the semantic route. When an explicitly selected deterministic consumer requires
+its machine representation, freeze a new
 `finding_page_receipt`, independently freeze a new `finding_range_receipt`
 over the complete `merge_base..new_head` reachable DAG, and apply the evidence
 authority's precedence and supersession rules before freezing the selected
@@ -501,10 +511,13 @@ following without reusing stale summaries:
   artifact's exact dependency dimensions; range-bound evidence must match the
   active `base_sha..head_sha`, and base-sensitive evidence must match the
   current declared base scope;
-- newly frozen parent-owned `finding_page_receipt`, `finding_range_receipt`,
-  and `finding_carrier_snapshot` inputs for the complete current-scope provider
-  observation, full-DAG range, authority-selected carrier, and unresolved
-  provider findings;
+- fresh complete current-scope provider observation, independently proved
+  full-DAG applicability, and actual findings/typed resolution state under the
+  semantic authority; record source identities and the reasoned decision
+  without requiring a closed prose grammar. Only when an explicitly selected
+  deterministic consumer requires them, also supply newly frozen parent-owned
+  `finding_page_receipt`, `finding_range_receipt`, and `finding_carrier_snapshot`
+  inputs for those same facts under the machine profile;
 - required check rollup, related merge/status evidence, mergeability, and
   merge-queue state;
 - every review and conversation thread relevant to readiness; and

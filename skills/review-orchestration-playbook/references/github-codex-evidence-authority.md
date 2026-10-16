@@ -167,6 +167,20 @@ the final reread. Record uncertainty explicitly. No special YAML shape,
 agent's own interpretation. Do not claim unperformed probes or a verified
 producer contract from prose alone.
 
+### No Supported PR
+
+When a complete authenticated selection proves that no supported PR exists,
+report `not-applicable` and explain that absence. There is no selected PR or
+head: leave them absent in prose, or null if the caller's structured format
+has PR/head fields. Do not manufacture identifiers, a clean review, a
+merge-ready result, a request, or a pending provider/recovery loop. A separately
+authorized standalone local range remains a separate task, not an invented PR.
+Failed or incomplete acquisition and ambiguous selection are not absence;
+report the uncertainty instead of `not-applicable`. This definition does not
+require opting into the machine report schema.
+
+### Explicit Machine Consumers
+
 The optional [machine evidence v1 reference](github-codex-machine-evidence-v1.md)
 and [carrier resource](github-codex-terminal-carriers-v1.json) remain versioned
 deterministic interfaces for consumers explicitly using them. Their exact

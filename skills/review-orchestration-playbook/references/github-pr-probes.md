@@ -147,9 +147,11 @@ identity and the PR number type-preservingly, while preserving the exact raw
 records and their repository spelling. Normalize other IDs only for comparison.
 Never synthesize `thread_resolved` on REST comments.
 
-Derive the parent-owned `finding_range_receipt` independently from the exact
-range's complete reachable DAG rather than treating ancestry embedded in a
-carrier or snapshot as sole authority. Preserve merge commits and every
+Prove finding applicability independently from the exact range's complete
+reachable DAG rather than treating ancestry embedded in provider content as
+authority. A deterministic consumer's parent-owned `finding_range_receipt`
+records that same independently acquired fact; the ordinary semantic route
+does not require its closed schema. Preserve merge commits and every
 in-range side-history commit; do not acquire a `--first-parent`,
 `--ancestry-path`, single-parent, or linear-history projection as a substitute.
 

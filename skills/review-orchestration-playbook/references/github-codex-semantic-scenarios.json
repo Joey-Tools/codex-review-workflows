@@ -231,6 +231,63 @@
       },
       "expected_outcome": "pass",
       "rationale": "A lagging aggregate does not override a later independently head-bound complete result."
+    },
+    {
+      "id": "authenticated-no-supported-pr",
+      "provider_body": "",
+      "context": {
+        "authenticated_selection_complete": true,
+        "supported_pr_found": false,
+        "selected_pr": null,
+        "current_sha": null
+      },
+      "expected_outcome": "not-applicable",
+      "rationale": "Proved absence is terminal without a selected PR/head, review request, readiness result, or recovery loop; no machine report opt-in is needed."
+    },
+    {
+      "id": "failed-selection-does-not-prove-no-pr",
+      "provider_body": "",
+      "context": {
+        "authenticated_selection_complete": false,
+        "selection_error": "unreadable response",
+        "selected_pr": null,
+        "current_sha": null
+      },
+      "expected_outcome": "inconclusive",
+      "rationale": "An incomplete or failed lookup does not prove the absence of a supported PR."
+    },
+    {
+      "id": "semantic-clean-needs-facts-not-machine-receipts",
+      "provider_body": "The review is finished; I have no actionable suggestions for this revision.",
+      "context": {
+        "actor": "chatgpt-codex-connector[bot]/Bot",
+        "reviewed_sha": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "current_sha": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "page_complete": true,
+        "final_reread_confirms_current_body_and_no_later_activity": true,
+        "semantic_route": true,
+        "deterministic_consumer_selected": false,
+        "machine_receipts": null,
+        "other_pr_readiness_gates_passed": true
+      },
+      "expected_outcome": "pass",
+      "rationale": "The semantic evidence can complete the lane and participate in readiness without manufacturing the three machine-profile receipts. All independent readiness facts still have to hold."
+    },
+    {
+      "id": "semantic-route-still-rejects-incomplete-acquisition",
+      "provider_body": "The review is finished; I have no actionable suggestions for this revision.",
+      "context": {
+        "actor": "chatgpt-codex-connector[bot]/Bot",
+        "reviewed_sha": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "current_sha": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "page_complete": false,
+        "final_reread_confirms_current_body_and_no_later_activity": false,
+        "semantic_route": true,
+        "deterministic_consumer_selected": false,
+        "machine_receipts": null
+      },
+      "expected_outcome": "inconclusive",
+      "rationale": "Making machine schemas optional does not waive complete source acquisition or the final reread."
     }
   ]
 }
