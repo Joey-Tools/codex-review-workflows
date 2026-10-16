@@ -31,15 +31,15 @@ safe canonical repository path must be a nonempty relative POSIX path with at
 least one component; reject `.`, NUL, backslash, absolute paths, dot
 components, and noncanonical spellings.
 
-This probe layer owns acquisition, not interpretation. Preserve every complete
-raw REST and GraphQL page used by a finding decision so the parent can freeze a
-current-scope `finding_page_receipt`. Independently provide the exact full-DAG
-range input for the parent's `finding_range_receipt`; only then may the parent
-freeze the `finding_carrier_snapshot` selected from the complete observation
-under the evidence authority's precedence and supersession rules. Freeze and
-pass all three inputs before report validation and again for the final reread.
-The evidence authority alone defines carrier validity, applicability, thread
-resolution, terminal selection, and report classification.
+This probe layer owns acquisition, not interpretation. Preserve complete raw
+REST and GraphQL pages and independently prove full-DAG applicability; the
+agent applies the evidence authority's semantic interpretation, finding
+precedence, and final reread. It need not encode that judgment into a closed
+carrier/report schema. When an explicitly selected deterministic consumer
+requires `finding_page_receipt`, `finding_range_receipt`, and
+`finding_carrier_snapshot`, freeze those separate inputs under the
+[machine evidence v1 profile](github-codex-machine-evidence-v1.md) before its
+report validation. Do not present a semantic decision as machine acceptance.
 
 ## Select The Exact PR
 

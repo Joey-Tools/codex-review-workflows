@@ -15,7 +15,8 @@ import urllib.parse
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GRAMMAR_PATH = SKILL_ROOT / "references/github-codex-terminal-carriers-v1.json"
-AUTHORITY_PATH = SKILL_ROOT / "references/github-codex-evidence-authority.md"
+# This reference classifier covers the pinned machine profile, not agent prose.
+AUTHORITY_PATH = SKILL_ROOT / "references/github-codex-machine-evidence-v1.md"
 FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 MARKER = re.compile(r"\*\*Reviewed commit:\*\* `([0-9a-f]{10}|[0-9a-f]{40})`\Z")
 FINDING = re.compile(r"- \[P[0-3]\] (.{1,240}) — (https://[^\s]+)\Z")

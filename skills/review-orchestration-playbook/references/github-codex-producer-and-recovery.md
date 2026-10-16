@@ -4,7 +4,7 @@ Read this reference before evaluating a producer/status pass basis or any author
 
 ## Run The GitHub Lane
 
-Before any GitHub-lane action, read [github-codex-evidence-authority.md](github-codex-evidence-authority.md). It is the field-level authority for producer identity, complete pagination, lifecycle, terminal selection, unresolved findings, fallback reactions, and machine-readable reporting.
+Before any GitHub-lane action, read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) for agent interpretation, identity, complete acquisition, finding precedence, and final reread. When implementing or validating deterministic receipts, also read [machine evidence v1](github-codex-machine-evidence-v1.md); its schemas apply to that machine profile, not to the agent's prose judgment.
 
 Use the authority's [repository and exact-field rules](github-codex-evidence-authority.md#repository-identity-and-exact-fields)
 and the versioned [machine contract](github-codex-terminal-carriers-v1.json)
@@ -33,7 +33,7 @@ The intended current policy is:
   exactly cover every canonical closure entry, bind parser/source digests and
   complete discovered references, and project one full-entry edge per
   reference; bind its receipt digest into the stable snapshot basis. Apply the
-  authority's closed selector and job-identity semantics: external reusable
+  machine profile's closed selector and job-identity semantics: external reusable
   workflows from workflow/reusable-workflow sources and external actions from
   workflow/reusable-workflow/action sources use canonical target
   repository/path selectors ending in the target's full commit SHA; an action
@@ -69,7 +69,7 @@ The intended current policy is:
   check or service-start marker never qualifies.
 - Otherwise, a trustworthy provider terminal clean comment or review on the latest head, together with no unresolved provider finding in the PR, passes the lane.
 - A complete provider `+1` reaction basis is a fallback when no stronger terminal artifact is available.
-- Only applicable unresolved provider findings block. They require an
+- Only applicable unresolved provider findings block. A machine-profile report requires an
   independent parent-owned `finding_page_receipt`, `finding_range_receipt`, and
   `finding_carrier_snapshot`; report, carrier, and embedded page or ancestry
   fields cannot prove one another. The page receipt freezes complete
