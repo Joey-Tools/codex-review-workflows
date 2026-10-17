@@ -492,9 +492,15 @@ If resolving a finding changes code, that commit creates a new head and the
 full invalidation and fresh-review rules apply. Do not manufacture an empty
 commit for a resolution-only state change.
 
-Retry only GitHub states whose typed evidence or documented repository
-contract supplies a machine-decidable retryable pending or infrastructure
-reason, using [github-pr-probes.md](github-pr-probes.md). A stable malformed
+### Authoritative Automatic Recovery
+
+The restrictions in this subsection apply to authoritative automatic provider
+recovery, not to an authorized
+[ordinary diagnostic rerun](github-codex-producer-and-recovery.md#ordinary-diagnostic-reruns).
+For authoritative automatic recovery, retry only GitHub states whose typed
+evidence or documented repository contract supplies a machine-decidable
+retryable pending or infrastructure reason, using
+[github-pr-probes.md](github-pr-probes.md). A stable malformed
 snapshot, scope contradiction, or other non-retryable inconclusive state stops
 recovery and is reported immediately. An explicit applicable unresolved
 provider finding, failed test, or policy failure is never an automatic
