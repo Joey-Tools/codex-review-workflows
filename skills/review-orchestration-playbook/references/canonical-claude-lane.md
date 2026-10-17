@@ -4,7 +4,7 @@ A named double or triple adds one actual Claude Code process. It is independent 
 
 Launch only after explicit user opt-in. An unambiguous named double/triple
 request supplies that opt-in; an unnamed workflow never does. The default is
-Opus 5.5 (`claude-opus-5-5`) at model-default effort (currently `medium`).
+Opus 5.5 (`claude-opus-5-5`) at `high` effort.
 Another model or effort requires explicit selection.
 
 ## Required Inputs
@@ -101,7 +101,7 @@ defined. The guard constructs this exact ordered argument profile:
 --print
 --input-format text
 --model <guard-validated-model>
---effort medium
+--effort high
 --permission-mode dontAsk
 --output-format stream-json
 --verbose

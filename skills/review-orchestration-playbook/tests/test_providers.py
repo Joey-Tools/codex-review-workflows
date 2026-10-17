@@ -30521,6 +30521,85 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-mini"))
         self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-codex"))
 
+    def test_copilot_opus_5_5_requires_exact_model_identity(self) -> None:
+        requested = "claude-opus-5.5"
+        models = (
+            requested,
+            "claude-opus-5-5",
+            "claudeopus55",
+            "claude_opus_5_5",
+            "claude-opus-55",
+            "CLAUDE-OPUS-5.5",
+            " claude-opus-5.5",
+        )
+        for index, effective in enumerate(models, start=1):
+            with self.subTest(effective_model=effective):
+                attempt = providers._record_attempt(
+                    review=self.review,
+                    index=index,
+                    runtime="copilot",
+                    model=requested,
+                    completed=Completed(
+                        argv=("copilot",), returncode=0, stdout=b"", stderr=b""
+                    ),
+                    final_text="No findings.",
+                    effective_model=effective,
+                    requested_effort="high",
+                    effective_effort="high",
+                    require_verified_model=True,
+                )
+                if effective == requested:
+                    self.assertEqual(attempt.category, "success")
+                    self.assertEqual(attempt.final_text, "No findings.")
+                else:
+                    self.assertEqual(attempt.category, "model-mismatch")
+                    self.assertEqual(attempt.reason, "effective-model-mismatch")
+                    self.assertIsNone(attempt.final_text)
+
+        failed = providers._record_attempt(
+            review=self.review,
+            index=len(models) + 1,
+            runtime="copilot",
+            model=requested,
+            completed=Completed(
+                argv=("copilot",),
+                returncode=1,
+                stdout=b"",
+                stderr=b"Model is not available for your account",
+            ),
+            final_text=None,
+            effective_model="claude-opus-5-5",
+            requested_effort="high",
+            effective_effort=None,
+        )
+        self.assertEqual(failed.category, "model-mismatch")
+        self.assertIsNone(failed.final_text)
+
+    def test_copilot_rejects_separator_aliases_between_model_records(self) -> None:
+        native = "claude-opus-5.5"
+        alias = "claude-opus-5-5"
+        for session, message, usage in (
+            (alias, native, native),
+            (native, alias, native),
+            (native, native, alias),
+        ):
+            with self.subTest(session=session, message=message, usage=usage):
+                objects = (
+                    {"type": "session.start", "data": {"selectedModel": session}},
+                    {"type": "assistant.turn_start", "data": {"turnId": "turn-1"}},
+                    {
+                        "type": "assistant.message",
+                        "data": {"content": "No findings.", "model": message},
+                    },
+                    {"type": "assistant.usage", "data": {"model": usage}},
+                    {"type": "assistant.turn_end", "data": {"turnId": "turn-1"}},
+                )
+                stdout = "\n".join(json.dumps(item) for item in objects).encode()
+                self.assertEqual(
+                    providers._parse_copilot_output(stdout, requested_model=native),
+                    (None, None),
+                )
+
     def test_entitlement_is_fallback_eligible(self) -> None:
         self.assertEqual(
             providers.classify_failure("", "Model is not available for your account"),
@@ -33003,7 +33082,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
-    def test_codex_default_is_61_medium_without_automatic_model_fallback(
+    def test_codex_default_is_61_high_without_automatic_model_fallback(
         self,
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
@@ -33017,7 +33096,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 1)
         self.assertEqual(outcome.attempts, (first,))
         self.assertEqual(providers.CODEX_MODELS, ("gpt-6.1-sol",))
-        self.assertEqual(providers.CODEX_REASONING_EFFORT, "medium")
+        self.assertEqual(providers.CODEX_REASONING_EFFORT, "high")
         codex_attempt.assert_called_once()
         self.assertEqual(codex_attempt.call_args.kwargs["model"], "gpt-6.1-sol")
         self.assertEqual(
@@ -33891,7 +33970,9 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         self.assertEqual(outcome.returncode, 0)
         self.assertEqual(providers.CLAUDE_MODELS, ("claude-opus-5-5",))
-        self.assertEqual(providers.CLAUDE_REASONING_EFFORT, "medium")
+        self.assertEqual(providers.CLAUDE_REASONING_EFFORT, "high")
+        self.assertEqual(providers.COPILOT_MODELS, ("claude-opus-5.5",))
+        self.assertEqual(providers.COPILOT_REASONING_EFFORT, "high")
         claude_attempt.assert_called_once()
         self.assertEqual(
             claude_attempt.call_args.kwargs["model"],
@@ -33901,8 +33982,7 @@ class ProviderPolicyTest(unittest.TestCase):
             [(item.runtime, item.requested_model) for item in outcome.attempts],
             [
                 ("claude", "claude-opus-5-5"),
-                ("copilot", "claude-opus-4.8"),
-                ("copilot", "claude-opus-4.7"),
+                ("copilot", "claude-opus-5.5"),
             ],
         )
         self.assertEqual(
@@ -37668,7 +37748,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "type": "turn_context",
                     "payload": {
                         "model": "gpt-6.1-sol",
-                        "effort": "medium",
+                        "effort": "high",
                         "approval_policy": "never",
                         "sandbox_policy": {"type": "read-only"},
                         "permission_profile": {
@@ -37749,7 +37829,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         argv = run_command.call_args.args[0]
         self.assertIn("gpt-6.1-sol", argv)
-        self.assertIn('model_reasoning_effort="medium"', argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
         configs = [argv[index + 1] for index, value in enumerate(argv) if value == "-c"]
         self.assertIn('approval_policy="never"', configs)
         self.assertIn('default_permissions="isolated_review"', configs)
@@ -37807,7 +37887,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("-o", argv)
         self.assertEqual(attempt.final_text, "No findings.")
         self.assertEqual(attempt.effective_model, "gpt-6.1-sol")
-        self.assertEqual(attempt.effective_effort, "medium")
+        self.assertEqual(attempt.effective_effort, "high")
         self.assertEqual(attempt.category, "success")
         self.assertEqual(
             run_command.call_args.kwargs["timeout_seconds"],
@@ -43279,7 +43359,7 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=contextlib.nullcontext(43210),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_command_pins_model_and_medium_with_local_login_safe_mode(
+    def test_claude_command_pins_model_and_high_with_local_login_safe_mode(
         self,
         run_command: mock.Mock,
         _proxy: mock.Mock,
@@ -43363,7 +43443,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         argv = run_command.call_args_list[2].args[0]
         self.assertIn("claude-opus-5-5", argv)
-        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         self.assertNotIn("--prompt-suggestions", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
@@ -52924,7 +53004,7 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "run")
-    def test_copilot_command_pins_opus_and_max(
+    def test_copilot_command_pins_opus_5_5_and_high(
         self,
         run_command: mock.Mock,
         _resolve: mock.Mock,
@@ -52934,7 +53014,7 @@ class ProviderPolicyTest(unittest.TestCase):
             for item in (
                 {
                     "type": "session.start",
-                    "data": {"selectedModel": "claude-opus-4.8"},
+                    "data": {"selectedModel": "claude-opus-5.5"},
                 },
                 {
                     "type": "assistant.turn_start",
@@ -52945,7 +53025,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "data": {
                         "messageId": "message-1",
                         "content": "No findings.",
-                        "model": "claude-opus-4.8",
+                        "model": "claude-opus-5.5",
                         "toolRequests": [],
                     },
                 },
@@ -52972,7 +53052,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         providers._copilot_attempt(
             review=self.review,
-            model="claude-opus-4.8",
+            model="claude-opus-5.5",
             index=1,
             env={"GH_TOKEN": "secret"},
         )
@@ -52982,8 +53062,8 @@ class ProviderPolicyTest(unittest.TestCase):
             argv[argv.index("--prompt") + 1],
             "Review this diff.\n",
         )
-        self.assertIn("claude-opus-4.8", argv)
-        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "max")
+        self.assertIn("claude-opus-5.5", argv)
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "high")
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
         self.assertIn("--available-tools=view,glob,grep", argv)
         self.assertIn("--disable-builtin-mcps", argv)

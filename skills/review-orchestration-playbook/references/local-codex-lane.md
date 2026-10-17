@@ -592,6 +592,18 @@ exists. Diagnose it from local runtime capability/receipt evidence and try the
 peer adapter at the exact same selected model and reasoning. It never
 triggers latest-model discovery.
 
+## Low-Level Runtime Profiles
+
+The low-level `isolated_review` Codex CLI and independent app-server helpers
+pin `gpt-6.1-sol` at `high` reasoning and do not select a fallback model.
+An explicit runtime rejection remains blocked or inconclusive. These helpers
+do not change the named local reviewer role or its peer CLI adapter, which
+retain the model-default `medium` profile described above.
+
+The low-level Claude Code helper pins `claude-opus-5-5` at `high`; an
+explicitly authorized Copilot CLI helper pins `claude-opus-5.5` at `high`.
+These CLI settings do not select the model used by native GitHub reviewers.
+
 ## Fallback Order
 
 When the first adapter cannot realize the intended profile:

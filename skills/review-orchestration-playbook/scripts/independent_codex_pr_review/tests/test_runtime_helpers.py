@@ -17,7 +17,9 @@ from review_supervisor.constants import (
     MAX_EVIDENCE_CONTEXT_BYTES,
     MAX_EVIDENCE_CONTEXT_FILE_BYTES,
     MAX_EVIDENCE_CONTEXT_FILES,
+    MODEL,
     NAMED_LANE_ELIGIBLE,
+    REASONING_EFFORT,
     SCHEMA_VERSION,
 )
 from review_supervisor.evidence import ManifestEntry, manifest_sha256
@@ -1036,8 +1038,8 @@ class RuntimeHelperTests(unittest.TestCase):
             "actual_invocation_enabled": False,
             "cli_version_expected": APP_SERVER_CLI_VERSION,
             "no_child_kernel_profile_verified": False,
-            "requested_model": "gpt-5.6-sol",
-            "requested_reasoning_effort": "xhigh",
+            "requested_model": MODEL,
+            "requested_reasoning_effort": REASONING_EFFORT,
             "supervisor_executable_authenticated": False,
             "transport": "app-server-stdio",
         }
@@ -1608,8 +1610,8 @@ class RuntimeHelperTests(unittest.TestCase):
                     "worktree": str(root),
                     "worktree_identity": identity.to_json(),
                 },
-                "requested_model": "gpt-5.6-sol",
-                "requested_reasoning_effort": "xhigh",
+                "requested_model": MODEL,
+                "requested_reasoning_effort": REASONING_EFFORT,
                 "worktree_path": str(root),
             }
             execution_calls: list[dict[str, object]] = []
@@ -1711,7 +1713,7 @@ class RuntimeHelperTests(unittest.TestCase):
             observed["evidence_bundle_sha256"],
             sha256_bytes(canonical_json(evidence_bundle)),
         )
-        self.assertEqual(observed["requested_model"], "gpt-5.6-sol")
+        self.assertEqual(observed["requested_model"], MODEL)
         self.assertEqual(observed["transport"], "app-server-stdio")
         self.assertTrue(observed["actual_invocation_enabled"])
         self.assertEqual(

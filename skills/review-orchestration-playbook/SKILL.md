@@ -70,7 +70,7 @@ with explicit user authorization.
   does not authorize a reviewer override. Record requested and effective
   adapter, model and reasoning.
 - Claude: read [Claude Code](references/canonical-claude-lane.md) only after
-  explicit opt-in. Default to Opus 5.5 at model-default effort. Use an actual
+  explicit opt-in. Default to Opus 5.5 at `high` effort. Use an actual
   fresh independent Claude process; another Codex process, Copilot or a
   simulation never satisfies this lane. Preserve the preparation-to-launch
   source-authority handoff.

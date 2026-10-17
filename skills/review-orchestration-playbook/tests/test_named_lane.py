@@ -13948,7 +13948,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
             "--model",
             "claude-opus-5-5",
             "--effort",
-            "medium",
+            "high",
             "--permission-mode",
             "dontAsk",
             "--output-format",
@@ -13985,7 +13985,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
         self.assertIs(profile["managed_policy_residual"], True)
         self.assertIs(profile["native_sandbox_effectiveness_attested"], False)
         self.assertEqual(profile["model"], "claude-opus-5-5")
-        self.assertEqual(profile["effort"], "medium")
+        self.assertEqual(profile["effort"], "high")
         self.assertEqual(profile["worktree"], str(self.repo.resolve()))
         self.assertEqual(
             profile["review_git_metadata"], str((self.repo / ".git").resolve())
