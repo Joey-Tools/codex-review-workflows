@@ -22,3 +22,11 @@ removed. CI workflow bytes and the canonical fixture match the target branch.
 The playbook routes diagnostics separately from its unchanged machine producer
 and authoritative automatic-recovery requirements. Review, execution approval
 and merge protections remain intact; the PR holds validation and review status.
+
+The readiness fix loop also scopes its machine-decidable retry restrictions to
+authoritative automatic recovery explicitly, so they do not override the
+ordinary diagnostic route. The private policy producer must retain that same
+distinction when generating the higher-priority personal guidance.
+The private-layout contract test accepts only the exact previous and migrated
+report-only boundaries; unknown grants or changes to the request budget remain
+rejected.
