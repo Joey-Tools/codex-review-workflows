@@ -162,13 +162,12 @@ _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
 
 
 CODEX_MODELS = ("gpt-6.1-sol",)
-CODEX_REASONING_EFFORT = "medium"
+CODEX_REASONING_EFFORT = "high"
 CLAUDE_MODELS = ("claude-opus-5-5",)
-# GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
-# shorter command-reference examples can lag product availability.
-COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
-CLAUDE_REASONING_EFFORT = "medium"
-COPILOT_REASONING_EFFORT = "max"
+# Copilot CLI uses the dotted ID documented by its command reference.
+COPILOT_MODELS = ("claude-opus-5.5",)
+CLAUDE_REASONING_EFFORT = "high"
+COPILOT_REASONING_EFFORT = "high"
 CLAUDE_LINUX_PROMPT_GUIDANCE = b"""
 Linux/WSL2 runtime tool boundary:
 - The sandbox working directory is `/workspace`.
@@ -20755,6 +20754,7 @@ def _parse_copilot_objects(
     *,
     requested_model: str | None = None,
 ) -> tuple[str | None, str | None]:
+    """Bind provider-native Copilot model IDs without punctuation aliases."""
     open_turn: dict[str, Any] | None = None
     completed_turn: tuple[int, dict[str, Any]] | None = None
     latest_session_model: str | None = None
@@ -20773,7 +20773,7 @@ def _parse_copilot_objects(
         if candidate is not None:
             if first_model is None:
                 first_model = candidate
-            elif not _model_matches(first_model, candidate):
+            elif first_model != candidate:
                 evidence_conflict = True
         if _structured_error_item_text(item):
             structured_error = True
@@ -20881,7 +20881,7 @@ def _parse_copilot_objects(
     model = usage_model or message_model or turn["session_model"]
     if not isinstance(model, str) or not model:
         return None, None
-    if first_model is not None and not _model_matches(model, first_model):
+    if first_model is not None and model != first_model:
         return None, None
     return content, model
 
@@ -21580,7 +21580,11 @@ def _record_attempt(
             final_text=None,
             reason="missing-runtime-verification-metadata",
         )
-    if effective_model and not _model_matches(model, effective_model):
+    if effective_model and not (
+        model == effective_model
+        if runtime == "copilot"
+        else _model_matches(model, effective_model)
+    ):
         mismatch = (
             f"requested model {model!r} was replaced by {effective_model!r}; "
             "refusing to infer an entitlement failure from silent model substitution"

@@ -151,7 +151,7 @@ reviewer authorization. No parent-strength comparison authorizes model
 discovery, an upgrade, or a reasoning override.
 
 Claude Code requires separate explicit opt-in. After that opt-in, its default
-is Opus 5.5, `claude-opus-5-5`, at model-default effort (currently `medium`).
+is Opus 5.5, `claude-opus-5-5`, at `high` effort.
 Another Claude model or effort requires explicit selection. Authentication,
 entitlement failure, a strong parent, or cost reduction does not authorize a
 different model, provider, or local Copilot CLI fallback.

@@ -622,7 +622,7 @@ attempt inconclusive even when its terminal text is `No findings.`.
 
 Read [canonical-claude-lane.md](canonical-claude-lane.md).
 
-- Launch only with explicit user opt-in. Default to Opus 5.5 at model-default
+- Launch only with explicit user opt-in. Default to Opus 5.5 at `high`
   effort; another model or effort requires explicit selection.
 - Start one actual supported Claude Code process in its own independently prepared workspace.
 - Give it the same frozen range and an independent prompt; never give it Codex findings.

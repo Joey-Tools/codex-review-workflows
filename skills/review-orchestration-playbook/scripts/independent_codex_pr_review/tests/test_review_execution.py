@@ -22,6 +22,7 @@ import review_supervisor.no_child_profile as no_child_profile
 from review_supervisor.appserver_protocol import (
     AppServerSessionResult,
 )
+from review_supervisor.constants import MODEL, REASONING_EFFORT
 from review_supervisor.auth_carrier import AuthCarrierRefreshRequired
 from review_supervisor.auth_refresh import (
     ManagedAuthRefreshClosureReceipt,
@@ -232,10 +233,10 @@ def _process(final_text: str = "STATUS: clean") -> AppServerProcessResult:
             "ephemeral": True,
             "external_auth": "accepted",
             "instruction_sources": [],
-            "model": "gpt-5.6-sol",
+            "model": MODEL,
             "model_attempt": "primary",
             "model_provider": "openai",
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": REASONING_EFFORT,
             "remote_control": "disabled-notification-observed",
             "runtime_workspace_roots": [],
             "sandbox": {"networkAccess": False, "type": "readOnly"},
@@ -949,8 +950,8 @@ class ReviewExecutionTests(unittest.TestCase):
                     retention_root=root / "retention",
                     checkout_root=root / "checkout",
                     prompt=b"review",
-                    requested_model="gpt-5.6-sol",
-                    requested_reasoning_effort="xhigh",
+                    requested_model=MODEL,
+                    requested_reasoning_effort=REASONING_EFFORT,
                     lifecycle=lifecycle,
                     auth_path=auth_path,
                 )
@@ -999,8 +1000,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         retention_root=root / "retention",
                         checkout_root=root / "checkout",
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model=MODEL,
+                        requested_reasoning_effort=REASONING_EFFORT,
                         lifecycle=_Lifecycle(),
                         auth_path=auth_path,
                     )
@@ -1081,8 +1082,8 @@ class ReviewExecutionTests(unittest.TestCase):
                     retention_root=root / "retention",
                     checkout_root=root / "checkout",
                     prompt=b"review",
-                    requested_model="gpt-5.6-sol",
-                    requested_reasoning_effort="xhigh",
+                    requested_model=MODEL,
+                    requested_reasoning_effort=REASONING_EFFORT,
                     lifecycle=lifecycle,
                     auth_path=auth_path,
                 )
@@ -2084,8 +2085,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=Mock(),
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model=MODEL,
+                        requested_reasoning_effort=REASONING_EFFORT,
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )
@@ -2201,8 +2202,8 @@ class ReviewExecutionTests(unittest.TestCase):
                                 auth=Mock(),
                                 lease=lease,
                                 prompt=b"review",
-                                requested_model="gpt-5.6-sol",
-                                requested_reasoning_effort="xhigh",
+                                requested_model=MODEL,
+                                requested_reasoning_effort=REASONING_EFFORT,
                                 lifecycle=lifecycle,
                                 liveness_checkpoint=lambda: None,
                             )
@@ -2289,8 +2290,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=Mock(),
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model=MODEL,
+                        requested_reasoning_effort=REASONING_EFFORT,
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )
@@ -2391,8 +2392,8 @@ class ReviewExecutionTests(unittest.TestCase):
                         auth=auth,
                         lease=lease,
                         prompt=b"review",
-                        requested_model="gpt-5.6-sol",
-                        requested_reasoning_effort="xhigh",
+                        requested_model=MODEL,
+                        requested_reasoning_effort=REASONING_EFFORT,
                         lifecycle=lifecycle,
                         liveness_checkpoint=lambda: None,
                     )

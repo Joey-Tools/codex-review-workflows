@@ -120,7 +120,7 @@ CLAUDE_DIRECT_REQUIRED_OPTIONS = (
     "--allowedTools",
     "--disallowedTools",
 )
-CLAUDE_DIRECT_EFFORT = "medium"
+CLAUDE_DIRECT_EFFORT = "high"
 CLAUDE_DIRECT_PERMISSION_MODE = "dontAsk"
 CLAUDE_DIRECT_VISIBLE_TOOLS = "Read,Grep,Glob,Bash"
 CLAUDE_DIRECT_ALLOWED_TOOLS = "Read(./**),Grep,Glob,Bash"
