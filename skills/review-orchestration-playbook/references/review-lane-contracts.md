@@ -642,6 +642,15 @@ Read [canonical-claude-lane.md](canonical-claude-lane.md).
 
 Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) before producer or consumer work.
 
+The agent-facing route judges provider meaning and records the supporting
+facts under that authority. Receipt/report schemas below apply only to an
+explicitly selected deterministic consumer, whose exact interface remains in
+[machine evidence v1](github-codex-machine-evidence-v1.md). The semantic route
+does not manufacture those records or reject new prose because the machine
+grammar cannot represent it. Identity, current scope, complete acquisition,
+finding applicability/resolution, and recovery authorization remain mandatory
+facts for both routes; only their representation differs.
+
 - The lane is current-head and PR-scoped.
 - Every repository field is a valid ASCII `owner/name`. Semantic repository
   joins compare its two components case-insensitively, including same-repo
@@ -707,7 +716,13 @@ Read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) be
   `latest head plus no unresolved provider finding passes` always means this
   applicability-filtered rule.
 - A complete exact-provider `+1` reaction basis is a fallback, not the preferred artifact.
-- An applicable provider finding must be proved by three independently frozen
+- Before counting a provider finding, the parent independently proves complete
+  current-scope acquisition, applicability in the exact full-DAG range, and the
+  actual finding plus typed resolution state from that observation. The
+  semantic route records those facts and their sources directly, without
+  requiring the machine grammar to accept the prose. For an explicitly selected
+  deterministic consumer, an applicable provider finding must be proved by
+  three independently frozen
   parent-owned inputs: a `finding_page_receipt` for the complete current-scope
   provider acquisition, a `finding_range_receipt` for the exact full-DAG
   range, and a `finding_carrier_snapshot` selected from that complete

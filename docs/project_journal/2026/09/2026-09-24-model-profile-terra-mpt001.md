@@ -3,7 +3,7 @@ id: 20260924-mpt001
 title: Runtime Model Profile Alignment
 status: completed
 created: 2026-09-24
-updated: 2026-10-14
+updated: 2026-10-17
 branch: codex/daily-skill-friction-20260924-codex-review-workflows-model-profile-terra
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/119
 supersedes: []
@@ -26,4 +26,5 @@ superseded_by:
 ## Evidence
 - Reviewer/routing baseline: canonical PR #127.
 - Routine-readiness baseline: canonical PRs #137 and #138.
+- Preserve the semantic GitHub review evidence and risk-based diagnostic rerun policies from canonical PRs #139, #140, and #141.
 - Private generated copies follow canonical source promotion rather than manual edits.

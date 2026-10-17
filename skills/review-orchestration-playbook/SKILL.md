@@ -87,9 +87,15 @@ An ambiguous response never authorizes a duplicate comment POST.
 A trustworthy current-head terminal clean comment or review plus zero
 applicable unresolved provider findings completes the Codex lane, not CI
 or merge readiness. Provider reactions are only the authority's fallback;
-generic successful checks, service-start markers and unknown prose do not pass.
+judge completion and findings from the full provider body, not an exact prose
+template. Formatting changes alone do not invalidate a result. Identity,
+current-head binding, complete findings, and final reread remain mandatory;
+generic successful checks, service-start markers, and ambiguous meaning do not pass.
 
-When evaluating a producer/status pass basis or any Actions recovery, also
+For a user-directed CI retry or an authorized diagnostic fix loop, follow
+[Ordinary Diagnostic Reruns](references/github-codex-producer-and-recovery.md#ordinary-diagnostic-reruns).
+Do not apply the automatic-recovery proof contract to that operation.
+When evaluating a producer/status pass basis or authoritative automatic recovery,
 read [Producer And Recovery](references/github-codex-producer-and-recovery.md).
 Its outside-candidate trust, immutable closure, exact scope, transaction,
 single-flight and cost requirements remain mandatory. A dispatch alone is

@@ -90,11 +90,13 @@ CANONICAL_REPORT_ONLY_RULE = (
     "exact `@codex review` on an already-existing eligible PR is the "
     "only mutation implied by bare triple."
 )
-# Independently reviewed private PR222, merge b47a626b0f6e4432af466be97d52ef8b903fb451.
-# Pin normalized prefix/suffix, not the denial list's conjunctions or whitespace.
-PRIVATE_REPORT_ONLY_BOUNDARY_SHA256 = (
-    "1e600287ae39a36b34f3be09e272552f6f80f83843918620a4aecda0e3714792"
-)
+# Accept the PR222 baseline and its exact diagnostic-rerun migration boundary.
+# The migration removes the blanket Actions tail, not any report-only denial or
+# the one-shot request budget. Unknown producer suffixes still fail closed.
+PRIVATE_REPORT_ONLY_BOUNDARY_SHA256S = frozenset((
+    "1e600287ae39a36b34f3be09e272552f6f80f83843918620a4aecda0e3714792",
+    "e91616f00b24b31c006fd169d80c7270b9835cd4fadcf823562231f7b65396f9",
+))
 
 
 def _report_only_rule(agents: str) -> str:
@@ -128,7 +130,7 @@ def _expected_report_only_rule() -> str:
     if not marker or len(parts) != 3:
         raise AssertionError("private report-only boundary is incomplete")
     boundary = prefix + "\0" + "".join(parts[1:])
-    if hashlib.sha256(boundary.encode()).hexdigest() != PRIVATE_REPORT_ONLY_BOUNDARY_SHA256:
+    if hashlib.sha256(boundary.encode()).hexdigest() not in PRIVATE_REPORT_ONLY_BOUNDARY_SHA256S:
         raise AssertionError("private report-only boundary differs from the independent baseline")
     return rule
 
@@ -880,6 +882,51 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(changed=changed):
                 self.assertFalse(_report_only_denials(changed, rule))
 
+    def test_private_report_only_boundary_accepts_only_exact_migration(self) -> None:
+        rule = (
+            "- A bare named-review request is report-only and does not authorize "
+            "branch creation or mutation, commits, push, PR creation/update or metadata "
+            "changes, merge, any GitHub Actions rerun, dispatch, or reconciliation, or "
+            "unrelated mutation. Bare triple authorizes only the scoped exact "
+            "`@codex review` producer operation on an already-existing eligible PR. "
+            "Before a first request or any proposed transport retry, read the complete "
+            "exact current-head request set under one parent mutation owner and combine "
+            "it with retained transport evidence: reuse an existing request; send only "
+            "after independent proof that no create-comment HTTP action was invoked or "
+            "no request byte could reach GitHub; unknown delivery stays read-only. "
+            "A possibly delivered POST consumes the epoch budget, and an empty GET "
+            "alone is not proof of non-delivery; it never authorizes a second logical request."
+        )
+        old_tail = (
+            " Any GitHub Actions rerun, dispatch, or reconciliation requires both a "
+            "repository-predeclared exact idempotent or reentrant contract for the "
+            "frozen scope and exact inputs, and separate current-task delivery or "
+            "readiness authorization for that external mutation; it never authorizes "
+            "a different workflow, input, scope, destination, PR, repository, or unrelated action."
+        )
+        for accepted in (rule, rule + old_tail):
+            declaration = "PERSONAL_AGENTS_CURRENT_REVIEW_BLOCK = " + repr(accepted.encode())
+            with self.subTest(accepted=accepted), patch.dict(globals(), CI_PROFILE="private"), patch.object(
+                pathlib.Path, "read_text", return_value=declaration
+            ):
+                self.assertEqual(accepted, _expected_report_only_rule())
+                self.assertEqual(
+                    REPORT_ONLY_DENIALS_BY_PROFILE["private"],
+                    _report_only_denials(accepted, _expected_report_only_rule()),
+                )
+        for rejected in (
+            rule + " The request authorizes commits.",
+            rule + old_tail + "; merge is also authorized",
+            rule.replace("unknown delivery stays read-only", "unknown delivery permits retry"),
+            rule.replace("it never authorizes a second logical request", "it allows a second logical request"),
+        ):
+            declaration = "PERSONAL_AGENTS_CURRENT_REVIEW_BLOCK = " + repr(rejected.encode())
+            with self.subTest(rejected=rejected), patch.dict(globals(), CI_PROFILE="private"), patch.object(
+                pathlib.Path, "read_text", return_value=declaration
+            ):
+                with self.assertRaises(AssertionError):
+                    _expected_report_only_rule()
+
     @unittest.skipUnless(CI_PROFILE == "private", "private producer layout only")
     def test_private_report_only_template_rejects_coupled_producer_grants(self) -> None:
         rule = _expected_report_only_rule()
@@ -898,7 +945,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_range_origin_gates_same_head_merge_base_rederivation(self) -> None:
         skill = _read("SKILL.md")
         readiness = _read("references/pr-readiness.md")
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         probes = _read("references/github-pr-probes.md")
         normalized_skill = _normalize(skill)
         normalized_readiness = _normalize(readiness)
@@ -995,7 +1042,7 @@ class RepositoryContractTest(unittest.TestCase):
         skill = _read("SKILL.md")
         readiness = _read("references/pr-readiness.md")
         normalized_skill = _normalize(skill)
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
         freshness_contract = readiness.split(
             "## Branch Freshness Is Not Linear History", 1
         )[1].split("### Head-Only Provider Responsibility Boundary", 1)[0]
@@ -1064,7 +1111,7 @@ class RepositoryContractTest(unittest.TestCase):
         skill = _normalize(_read("SKILL.md"))
         readiness = _normalize(_read("references/pr-readiness.md"))
         probes = _normalize(_read("references/github-pr-probes.md"))
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
 
         self.assertIn("routine profile is the default", skill)
         self.assertIn("strict base proof is opt-in", skill)
@@ -1135,7 +1182,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "For a direct merge", 1
             )[0]
         )
-        authority = _normalize(_read("references/github-codex-evidence-authority.md"))
+        authority = _normalize(_read("references/github-codex-machine-evidence-v1.md"))
 
         for required_proof in (
             "the frozen `merge_expected_base_ref` equals the final-reread repository plus `baserefname`",
@@ -1642,7 +1689,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Do not execute candidate control code to approve itself", skill)
 
     def test_github_lane_passes_on_current_head_clean_without_findings(self) -> None:
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         contracts = _read("references/review-lane-contracts.md")
         normalized = _normalize(authority)
         for anchor in (
@@ -1675,9 +1722,6 @@ class RepositoryContractTest(unittest.TestCase):
             normalized,
         )
         self.assertIn(
-            "service-start markers and unknown prose do not pass", _normalize(_read("SKILL.md"))
-        )
-        self.assertIn(
             "latest head plus no unresolved provider finding passes",
             _normalize(contracts),
         )
@@ -1686,7 +1730,7 @@ class RepositoryContractTest(unittest.TestCase):
     def test_github_lane_prefers_associated_status_and_keeps_small_reaction_fallback(
         self,
     ) -> None:
-        authority = _read("references/github-codex-evidence-authority.md")
+        authority = _read("references/github-codex-machine-evidence-v1.md")
         probes = _read("references/github-pr-probes.md")
         normalized = _normalize(authority)
         self.assertIn("trustworthy repository merge/status check", normalized)
@@ -1730,6 +1774,22 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("thumbs-up-clean", normalized)
         self.assertNotIn("3–10", authority)
         self.assertNotIn("three-outcome", normalized)
+
+    def test_readiness_retry_restrictions_exclude_ordinary_diagnostics(self) -> None:
+        readiness = _read("references/pr-readiness.md")
+        fix_loop = readiness.split("## Fix Loop", 1)[1].split("## Final Reread", 1)[0]
+        recovery = fix_loop.split("### Authoritative Automatic Recovery", 1)[1]
+        self.assertIn("not to an authorized", recovery)
+        self.assertIn(
+            "[ordinary diagnostic rerun](github-codex-producer-and-recovery.md#ordinary-diagnostic-reruns)",
+            recovery,
+        )
+        self.assertIn(
+            "for authoritative automatic recovery, retry only github states",
+            _normalize(recovery),
+        )
+        self.assertIn("machine-decidable retryable pending", _normalize(recovery))
+        self.assertIn("never an automatic reconcile target", _normalize(recovery))
 
     def test_github_recovery_is_dynamic_single_flight_and_cost_aware(self) -> None:
         skill = _read("SKILL.md")

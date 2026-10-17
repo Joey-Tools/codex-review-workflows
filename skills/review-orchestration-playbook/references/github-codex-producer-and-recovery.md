@@ -1,10 +1,83 @@
 # GitHub Codex Producer And Recovery Details
 
-Read this reference before evaluating a producer/status pass basis or any authorized Actions recovery operation. Terminal-artifact acquisition uses the evidence authority and authenticated probes; producer closure and recovery receipts are not required for a terminal-artifact-only basis.
+Use the ordinary diagnostic guidance below for a user-directed CI retry or an
+authorized CI-fix loop. The later producer and automatic-recovery sections own
+their stronger machine-evidence requirements, not permission for every rerun.
+Terminal-artifact acquisition uses the evidence authority and authenticated
+probes; it does not require producer closure or recovery receipts.
+
+## Ordinary Diagnostic Reruns
+
+A diagnostic rerun may test whether an upstream fix, a changed external input,
+or a transient failure unblocks the same code. It need not promise success or
+establish the complete root cause first. A code/test failure may be investigated
+this way without relabelling it as infrastructure or erasing the earlier failure.
+
+- A user-requested retry or an authorized CI-fix loop covers a bounded retry
+  within that repository/PR scope. A bare review does not. Resolve the concrete
+  workflow, run, attempt and relevant head from GitHub; do not make the user
+  transcribe identifiers the agent can safely obtain.
+- Inspect the executed workflow, relevant scripts/dependencies and triggered
+  follow-on workflows for repeat effects. Ordinary tests or read-only validation
+  on disposable runners do not require a predeclared rerun manifest, workflow
+  digest, newly added identity-logging step, or immutable dependency proof.
+  Read-only token permissions alone are not a side-effect audit. Publication,
+  deployment, repository writes, production credentials, shared/self-hosted
+  state or uncertain repeat effects require applicable authorization and
+  proportionate repeat-safety checks before execution.
+- Before the mutation, confirm the intended PR/head and run still match, that
+  no matching rerun is already queued/in progress, and that there is no newer
+  applicable result to reuse. An explicitly requested historical diagnostic may
+  use an older head, but its result cannot supply current-head CI readiness.
+  Keep one mutation owner. An ambiguous POST is not permission to resend;
+  inspect GitHub attempts/status and stop if delivery remains uncertain.
+- Choose the smallest useful job scope. Failed-job reruns are usually cheaper;
+  use a full rerun when the upstream-refresh semantics require it and the full
+  scope is authorized and repeat-safe. Bound retries by the task's time/cost
+  budget and platform limits, not a universal attempt-2 ceiling. Stop blind
+  retries when the same failure repeats without new evidence, safety becomes
+  uncertain, the head is superseded, or the PR closes. Further experiments need
+  a reason and remaining authorization, not an unlimited retry loop.
+- Keep GitHub run/attempt/job history and logs as the primary execution record.
+  Usually retain only the reason, run link and outcome in the task or PR, plus
+  the resolved upstream version when it matters to the diagnosis. Do not add
+  duplicate local ledgers, mandatory digest receipts or copies of every API
+  response. Preserve additional bounded evidence only when it answers a real
+  question, resolves uncertain delivery, or must survive log expiry.
+
+### Refreshing An Upstream Dependency
+
+Reruns retain the original event's `GITHUB_SHA` and `GITHUB_REF`; they do not
+load a newer caller workflow merely because its branch advanced. A dependency
+pinned to a commit cannot upgrade without a source change. For a floating
+Action tag/branch, a rerun can be a useful refresh experiment: inspect the
+download log's resolved commit rather than assume that the new version ran.
+Do not require all dependencies to be fixed to their old commits when testing
+an upstream update is the purpose of the experiment.
+
+Reusable workflows have a distinct rule: a full rerun uses the specified
+reference, whereas a failed-job/specific-job rerun retains the reusable
+workflow commit from the first attempt. Choose the operation accordingly.
+See [GitHub rerun semantics](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+and [reusable-workflow rerun behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations#behavior-of-reusable-workflows-when-re-running-jobs).
+
+### Results And Permission Boundaries
+
+Request acceptance is not CI success. Inspect the terminal attempt and relevant
+current-head checks; a green retry does not prove root cause, dismiss a finding,
+complete provider review, or waive approvals and merge rules. Ordinary GitHub
+CI results may satisfy their normal CI checks without a custom recovery receipt.
+The operation itself never supplies a producer-clean verdict.
+
+This guidance does not grant new destinations or write scopes, override an
+execution-approval denial, or authorize a substitute dispatch, empty commit or
+transport to bypass that denial. Candidate policy changes remain review subjects,
+not authority for their own execution. Authoritative automatic provider recovery
+continues to use the separate contract below.
 
 ## Run The GitHub Lane
 
-Before any GitHub-lane action, read [github-codex-evidence-authority.md](github-codex-evidence-authority.md). It is the field-level authority for producer identity, complete pagination, lifecycle, terminal selection, unresolved findings, fallback reactions, and machine-readable reporting.
+Before any GitHub-lane action, read [github-codex-evidence-authority.md](github-codex-evidence-authority.md) for agent interpretation, identity, complete acquisition, finding precedence, and final reread. When implementing or validating deterministic receipts, also read [machine evidence v1](github-codex-machine-evidence-v1.md); its schemas apply to that machine profile, not to the agent's prose judgment.
 
 Use the authority's [repository and exact-field rules](github-codex-evidence-authority.md#repository-identity-and-exact-fields)
 and the versioned [machine contract](github-codex-terminal-carriers-v1.json)
@@ -33,7 +106,7 @@ The intended current policy is:
   exactly cover every canonical closure entry, bind parser/source digests and
   complete discovered references, and project one full-entry edge per
   reference; bind its receipt digest into the stable snapshot basis. Apply the
-  authority's closed selector and job-identity semantics: external reusable
+  machine profile's closed selector and job-identity semantics: external reusable
   workflows from workflow/reusable-workflow sources and external actions from
   workflow/reusable-workflow/action sources use canonical target
   repository/path selectors ending in the target's full commit SHA; an action
@@ -69,7 +142,7 @@ The intended current policy is:
   check or service-start marker never qualifies.
 - Otherwise, a trustworthy provider terminal clean comment or review on the latest head, together with no unresolved provider finding in the PR, passes the lane.
 - A complete provider `+1` reaction basis is a fallback when no stronger terminal artifact is available.
-- Only applicable unresolved provider findings block. They require an
+- Only applicable unresolved provider findings block. A machine-profile report requires an
   independent parent-owned `finding_page_receipt`, `finding_range_receipt`, and
   `finding_carrier_snapshot`; report, carrier, and embedded page or ancestry
   fields cannot prove one another. The page receipt freezes complete
@@ -91,6 +164,8 @@ The intended current policy is:
   negative evidence, not a reusable pass; it continues to block until typed
   resolution or an accepted later corrective artifact satisfies the evidence
   authority. A successful service-start check alone is not a clean review.
+
+## Authoritative Automatic Recovery
 
 Only a machine-decidable retryable pending or infrastructure reason enters
 automatic recovery. A stable malformed snapshot, scope contradiction, or

@@ -1,5 +1,7 @@
 # Codex Review Workflows Guidelines
 
+- For authorized CI diagnostics, follow the risk-based [rerun guidance](docs/ci-reruns.md); do not impose automatic provider-recovery contracts on ordinary test reruns.
+
 - Use `$agile-delivery-workflow` only when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, or scout work.
 - Use `$change-delivery-workflow` for the local implementation-to-commit gate. Hand its frozen committed `base_sha..head_sha` to `$review-orchestration-playbook` for formal local review, PR readiness, CI/review repair, or merge-readiness work.
 - Use `$review-orchestration-playbook` as the only entrypoint for named single, double, and triple review. Load its routed references instead of restating local Codex, workspace, Claude, GitHub evidence, retry, or PR-readiness algorithms here.
