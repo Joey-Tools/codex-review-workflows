@@ -1593,7 +1593,7 @@ class GitHubRecoveryContractTest(unittest.TestCase):
         cls.skill = _read(SKILL_ROOT / "SKILL.md")
         cls.producer = _read(REFERENCES / "github-codex-producer-and-recovery.md")
         cls.probes = _read(REFERENCES / "github-pr-probes.md")
-        cls.authority = _read(REFERENCES / "github-codex-evidence-authority.md")
+        cls.authority = _read(REFERENCES / "github-codex-machine-evidence-v1.md")
         cls.contracts = _read(REFERENCES / "review-lane-contracts.md")
         cls.prompts = _read(REFERENCES / "review-prompt-templates.md")
         cls.readiness = _read(REFERENCES / "pr-readiness.md")

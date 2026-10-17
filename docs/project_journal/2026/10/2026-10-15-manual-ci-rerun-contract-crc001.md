@@ -3,9 +3,9 @@ id: 20261015-crc001
 title: Manual CI Diagnostic Rerun Contract
 status: completed
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-10-17
 branch: wip/ci-rerun-contract
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/139
 supersedes: []
 superseded_by:
 ---
@@ -45,3 +45,12 @@ with ShellCheck did not complete: the bounded supervisor hit process-group
 cleanup EPERM both inside and outside the sandbox. Actionlint without ShellCheck
 passed on the final workflow. Project-journal validation passed. Full-suite and
 remote CI results are not asserted here.
+
+The 2026-10-17 base refresh incorporates master
+`7c11e820e2db55ed23488258032a724d927ec572` without conflicts and preserves
+the independently merged semantic review-evidence policy. Python 3.10.19
+passed 129 focused tests (two expected private-layout skips): nine declaration,
+52 repository-contract, 23 recovery, and 45 terminal-carrier tests. The CI
+workflow digest is unchanged; checker smoke, Ruff, Actionlint syntax-only,
+and whitespace checks passed. Current-head remote review/CI remain separate
+PR evidence rather than a claim from this local validation.
