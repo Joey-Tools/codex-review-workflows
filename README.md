@@ -55,13 +55,16 @@ sessions, not the number of internal workers a high-reasoning model may use.
 - [GitHub Codex evidence authority](skills/review-orchestration-playbook/references/github-codex-evidence-authority.md):
   provider identity, current-head result classification, and unresolved-finding rules.
 - [GitHub Codex producer and recovery](skills/review-orchestration-playbook/references/github-codex-producer-and-recovery.md):
-  conditional producer trust, immutable closure, exact Actions transactions, and recovery budgets.
+  ordinary diagnostic reruns, plus separate machine producer and automatic-recovery requirements.
 - [PR readiness](skills/review-orchestration-playbook/references/pr-readiness.md):
   branch, lifecycle, CI, and conversation gates around the requested review shape.
 - [`named_lane_guard`](skills/review-orchestration-playbook/scripts/named_lane_guard):
   public clean-workspace and validated Claude runtime command surface.
 
 ## Development
+
+For CI diagnostics, use the risk-based [rerun guidance](docs/ci-reruns.md).
+GitHub run history is the execution record; a rerun is not review or merge approval.
 
 The helper requires Python 3.10 or later; CI pins the minimum supported runtime.
 From the repository root, run:
