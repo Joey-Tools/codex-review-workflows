@@ -1,6 +1,6 @@
 # Codex Review Workflows Guidelines
 
-- For a separately authorized manual diagnostic rerun of this repository's CI, read [docs/ci-reruns.md](docs/ci-reruns.md). Its exact-workflow repeat-safety declaration is not permission to mutate Actions, retroactive coverage of older workflows, or GitHub Codex automatic-recovery authority.
+- For authorized CI diagnostics, follow the risk-based [rerun guidance](docs/ci-reruns.md); do not impose automatic provider-recovery contracts on ordinary test reruns.
 
 - Use `$agile-delivery-workflow` only when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, or scout work.
 - Use `$change-delivery-workflow` for the local implementation-to-commit gate. Hand its frozen committed `base_sha..head_sha` to `$review-orchestration-playbook` for formal local review, PR readiness, CI/review repair, or merge-readiness work.
