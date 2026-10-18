@@ -36,6 +36,7 @@ from review_supervisor.process import (
     SpawnedProcess,
     await_exec,
     fork_exec,
+    process_start_identity,
 )
 from review_supervisor.runtime import (
     DirectProcessClosureUnproven,
@@ -752,7 +753,12 @@ class FinalAuthorizationTests(unittest.TestCase):
                 "length": len(content),
                 "sha256": sha256_bytes(content),
             }
-            supervisor = {"pid": 1234, "start_identity": "fixture-supervisor"}
+            # Model PID reuse without probing an unrelated system process.
+            supervisor = {"pid": os.getpid(), "start_identity": "fixture-supervisor"}
+            self.assertNotEqual(
+                supervisor["start_identity"],
+                process_start_identity(supervisor["pid"]),
+            )
             leader = {
                 "pid": 5678,
                 "pgid": 5678,

@@ -31,6 +31,7 @@ from review_supervisor.constants import (
     default_state_root,
 )
 from review_supervisor.errors import SupervisorError
+from review_supervisor.process import process_start_identity
 from review_supervisor.secureio import (
     DirectoryPolicyBinding,
     MacOSDirectoryMetadataBinding,
@@ -210,7 +211,9 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
         "length": len(content),
         "sha256": sha256_bytes(content),
     }
-    supervisor = {"pid": 1234, "start_identity": "fixture-supervisor-start"}
+    # Model PID reuse with a live same-user process and a different identity.
+    # An arbitrary fixed PID may name an inaccessible system process.
+    supervisor = {"pid": os.getpid(), "start_identity": "fixture-supervisor-start"}
     leader = {
         "pid": 5678,
         "pgid": 5678,
@@ -338,6 +341,24 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
+    def test_final_fixture_models_an_accessible_reused_supervisor_pid(self) -> None:
+        with owned_temporary_directory("cli-final-supervisor-") as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            attempt = _write_attempt(
+                retention,
+                suffix="e" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+            state = _authorize_final(attempt, b"No findings.\n")
+            supervisor = state["supervisor"]
+            self.assertEqual(supervisor["pid"], os.getpid())
+            self.assertNotEqual(
+                supervisor["start_identity"],
+                process_start_identity(supervisor["pid"]),
+            )
+
     def test_in_process_cli_wrapper_restores_sigpipe_on_return_and_error(self) -> None:
         original_sigpipe = signal.getsignal(signal.SIGPIPE)
 
