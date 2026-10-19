@@ -92,6 +92,10 @@ def unregistered_generic_credential() -> bytes:
     return b"".join((b"Critical", b"Credential", b"Alpha", b"9!"))
 
 
+def source_permission_marker() -> bytes:
+    return b"id-" + b"token: write"
+
+
 def second_unregistered_generic_credential() -> bytes:
     return b"".join((b"Critical", b"Credential", b"Bravo", b"8!"))
 
@@ -286,6 +290,641 @@ class WorkspaceTest(unittest.TestCase):
             tuple(sorted(path.name for path in self.repo.iterdir())),
             repository_entries,
         )
+
+    def test_secret_admission_accepts_complete_source_string_permission_marker(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        payload = (
+            b"from pathlib import Path\n"
+            b"\n"
+            b"for forbidden in (\n"
+            b'    "contents: write",\n'
+            b'    "'
+            + marker
+            + b'",\n'
+            b'    "statuses: write",\n'
+            b"):\n"
+            b"    assert forbidden not in Path(__file__).read_text()\n"
+        )
+        permission_marker_head = self.commit_bytes(
+            "test_required_ci_workflow.py",
+            payload,
+            "Add workflow permission regression",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=permission_marker_head,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_secret_admission_accepts_permission_marker_inside_quoted_prose(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        for label, suffix, payload in (
+            (
+                "source-string-prose",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",\n'
+                b'    "requires '
+                + marker
+                + b' permission",\n'
+                b")\n",
+            ),
+            (
+                "markdown-sentence-prose",
+                ".md",
+                b'Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "markdown-list-prose",
+                ".md",
+                b'- Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "python-hash-comment-prose",
+                ".py",
+                b'# documentation requires "' + marker + b'" permission\n',
+            ),
+            (
+                "html-text-prose",
+                ".html",
+                b'<p>Use "' + marker + b'" permission.</p>\n',
+            ),
+            (
+                "html-comment-prose",
+                ".html",
+                b'<!-- Use "' + marker + b'" permission. -->\n',
+            ),
+        ):
+            with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
+                relative = f"{label}{suffix}"
+                prose_head = self.commit_bytes(
+                    relative,
+                    payload,
+                    f"Add {label} permission prose regression",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=prose_head,
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["status"], "clean")
+                self.assertEqual(summary["secret_delta"]["status"], "clean")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                clean_head = self.remove_and_commit(
+                    relative,
+                    f"Remove {label} permission prose regression",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
+                )
+
+    def test_secret_admission_accepts_permission_marker_with_inline_comment(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        for label, suffix, payload in (
+            (
+                "python-hash-comment",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",  # required for OIDC\n'
+                b")\n",
+            ),
+            (
+                "c-slash-comment",
+                ".c",
+                b"const char *values[] = {\n"
+                b'    "'
+                + marker
+                + b'",  // required for OIDC\n'
+                b"};\n",
+            ),
+            (
+                "python-hash-comment-after-block-note",
+                ".py",
+                b"values = (\n"
+                b'    "'
+                + marker
+                + b'",  # /* note */ required for OIDC\n'
+                b")\n",
+            ),
+        ):
+            with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                relative = f"{label}{suffix}"
+                comment_head = self.commit_bytes(
+                    relative,
+                    payload,
+                    f"Add {label} permission marker regression",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=comment_head,
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["status"], "clean")
+                self.assertEqual(summary["secret_delta"]["status"], "clean")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.remove_and_commit(
+                    relative,
+                    f"Remove {label} permission marker regression",
+                )
+
+    def test_secret_admission_accepts_marker_before_unchanged_provider(self) -> None:
+        marker = source_permission_marker()
+        provider = b"ghp_" + b"A" * 36
+        provider_payload = b'values = (\n    "' + provider + b'",\n)\n'
+        provider_base = self.commit_bytes(
+            "retained-provider.py",
+            provider_payload,
+            "Add retained provider fixture",
+        )
+        marker_head = self.commit_bytes(
+            "retained-provider.py",
+            b'values = (\n    "'
+            + marker
+            + b'",\n    "'
+            + provider
+            + b'",\n)\n',
+            "Add workflow permission marker",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=provider_base,
+            head_ref=marker_head,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_secret_admission_rejects_permission_marker_secret_suffixes(self) -> None:
+        marker = source_permission_marker()
+        credential = unregistered_generic_credential()
+        for label, literal in (
+            ("value", b"id-" + b"token: " + credential + b"\n"),
+            ("suffix", marker + credential + b"\n"),
+        ):
+            with self.subTest(case=label):
+                relative = f"{label}.txt"
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
+                credential_head = self.commit_bytes(
+                    relative,
+                    literal,
+                    f"Add {label} credential fixture",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=credential_head,
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["status"], "violations")
+                self.assertEqual(summary["secret_delta"]["status"], "violations")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                self.assertNotIn(
+                    literal.decode("ascii").strip(),
+                    json.dumps(summary, sort_keys=True),
+                )
+                addition_paths = {
+                    addition["path"]
+                    for violation in summary["secret_delta"]["violations"]
+                    for addition in violation["additions"]
+                }
+                self.assertEqual(addition_paths, {relative})
+                clean_head = self.remove_and_commit(
+                    relative,
+                    f"Remove {label} credential fixture",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
+                )
+
+    def test_secret_admission_fails_closed_for_malformed_permission_markers(
+        self,
+    ) -> None:
+        marker = source_permission_marker()
+        credential = unregistered_generic_credential()
+        credential_fragments = (credential[:13], credential[13:])
+        self.assertEqual(b"".join(credential_fragments), credential)
+        self.assertTrue(all(len(fragment) < 16 for fragment in credential_fragments))
+        escaped_marker = b"id-" + b"token: wr\\x69te"
+        python_prefix = b"for marker in (\n    "
+        python_suffix = b"):\n    pass\n"
+        for label, suffix, payload in (
+            (
+                "bytes-prefix",
+                ".py",
+                python_prefix + b'b"' + marker + b'",\n' + python_suffix,
+            ),
+            (
+                "assignment-bytes-prefix",
+                ".py",
+                b'permission = b"' + marker + b'"\n',
+            ),
+            (
+                "assignment-plain-literal",
+                ".py",
+                b'permission = "' + marker + b'"\n',
+            ),
+            (
+                "comment-without-comma",
+                ".py",
+                b'values = ("' + marker + b'" # required\n)\n',
+            ),
+            (
+                "block-comment-after-comma",
+                ".c",
+                b'const char *values[] = {"'
+                + marker
+                + b'", /* required */};\n',
+            ),
+            (
+                "comment-lookalike-after-comma",
+                ".py",
+                b'values = ("' + marker + b'", / required\n)\n',
+            ),
+            (
+                "hash-directive-after-comma",
+                ".rs",
+                b'values = [\n    "' + marker + b'", #[cfg(test)]\n];\n',
+            ),
+            (
+                "hash-spaced-outer-attribute-after-comma",
+                ".rs",
+                b'values = [\n    "' + marker + b'", # [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-spaced-inner-attribute-after-comma",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # ! [allow(dead_code)]\n];\n',
+            ),
+            (
+                "hash-comment-separated-outer-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* gap */ [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-comment-separated-inner-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # ! /* gap */ [allow(dead_code)]\n];\n',
+            ),
+            (
+                "hash-nested-comment-before-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* outer /* nested */ [cfg(test)]\n];\n',
+            ),
+            (
+                "hash-unclosed-comment-before-attribute",
+                ".rs",
+                b'values = [\n    "'
+                + marker
+                + b'", # /* gap [cfg(test)]\n];\n',
+            ),
+            (
+                "slash-comment-unicode-line-separator",
+                ".js",
+                b'values = [\n    "'
+                + marker
+                + b'", // required\xe2\x80\xa8"suffix"\n];\n',
+            ),
+            (
+                "same-line-list-comment",
+                ".py",
+                b'values = ("' + marker + b'", # required\n)\n',
+            ),
+            (
+                "concatenation",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'" + "suffix",\n'
+                + python_suffix,
+            ),
+            (
+                "escaped",
+                ".py",
+                python_prefix + b'"' + escaped_marker + b'",\n' + python_suffix,
+            ),
+            (
+                "unclosed",
+                ".py",
+                python_prefix + b'"' + marker + b"\n" + python_suffix,
+            ),
+            (
+                "c-adjacent-literal",
+                ".c",
+                b"const char *marker =\n    \""
+                + marker
+                + b'"\n    "'
+                + credential
+                + b'";\n',
+            ),
+            (
+                "c-same-line-adjacent-literal",
+                ".c",
+                b'const char *marker = "'
+                + marker
+                + b'" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-comment-before-adjacent-literal",
+                ".c",
+                b'/* " */ const char *marker = "'
+                + marker
+                + b'" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "python-implicit-concatenation",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'"\n    "'
+                + credential
+                + b'",\n'
+                + python_suffix,
+            ),
+            (
+                "python-next-line-operator",
+                ".py",
+                python_prefix
+                + b'"'
+                + marker
+                + b'"\n    + "'
+                + credential
+                + b'",\n'
+                + python_suffix,
+            ),
+            (
+                "long-leading-context",
+                ".c",
+                b" " * 129
+                + b'"'
+                + marker
+                + b'"\n"'
+                + credential_fragments[0]
+                + b'"\n"'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-u8-adjacent-literals",
+                ".c",
+                b'u8"'
+                + marker
+                + b'"\nu8"'
+                + credential_fragments[0]
+                + b'"\nu8"'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "c-wide-adjacent-literals",
+                ".c",
+                b'L"'
+                + marker
+                + b'"\nL"'
+                + credential_fragments[0]
+                + b'"\nL"'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            ("cpp-raw-r", ".cc", b'R"(' + marker + b')"\n'),
+            (
+                "cpp-raw-u8r-custom-delimiter",
+                ".cc",
+                b'u8R"tag(' + marker + b')tag"\n',
+            ),
+            (
+                "cpp-raw-u8r-maximum-delimiter",
+                ".cc",
+                b'u8R"'
+                + b"d" * 16
+                + b"("
+                + marker
+                + b")"
+                + b"d" * 16
+                + b'"\n',
+            ),
+            (
+                "cpp-raw-u8r-incomplete-overlong-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 17 + marker + b"\n",
+            ),
+            (
+                "cpp-raw-u8r-overlong-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 17 + b"(" + marker + b"\n",
+            ),
+            ("cpp-raw-ur", ".cc", b'uR"(' + marker + b')"\n'),
+            ("cpp-raw-uppercase-u-r", ".cc", b'UR"(' + marker + b')"\n'),
+            ("cpp-raw-lr", ".cc", b'LR"(' + marker + b')"\n'),
+            (
+                "cpp-raw-adjacent-literals",
+                ".cc",
+                b'R"('
+                + marker
+                + b')" "'
+                + credential_fragments[0]
+                + b'" "'
+                + credential_fragments[1]
+                + b'";\n',
+            ),
+            (
+                "rust-raw-nine-hashes",
+                ".rs",
+                b"r"
+                + b"#" * 9
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 9
+                + b"\n",
+            ),
+            (
+                "rust-raw-c-nine-hashes",
+                ".rs",
+                b"cr"
+                + b"#" * 9
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 9
+                + b"\n",
+            ),
+            (
+                "rust-raw-maximum-hashes",
+                ".rs",
+                b"br"
+                + b"#" * 255
+                + b'"'
+                + marker
+                + b'"'
+                + b"#" * 255
+                + b"\n",
+            ),
+            (
+                "rust-raw-over-maximum-incomplete",
+                ".rs",
+                b"r" + b"#" * 256 + b'"' + marker,
+            ),
+            (
+                "html-attribute-marker",
+                ".html",
+                b'<p data-permission="' + marker + b'">permission.</p>\n',
+            ),
+            (
+                "markdown-inline-code-marker",
+                ".md",
+                b'Use `"' + marker + b'"` permission.\n',
+            ),
+            (
+                "markdown-fenced-code-marker",
+                ".md",
+                b'```text\nUse "' + marker + b'" permission.\n```\n',
+            ),
+            (
+                "markdown-four-space-indented-code-marker",
+                ".md",
+                b'    Use "' + marker + b'" permission.\n',
+            ),
+            (
+                "markdown-tab-indented-code-marker",
+                ".md",
+                b'\tUse "' + marker + b'" permission.\n',
+            ),
+            (
+                "cpp-raw-u8r-over-window-delimiter",
+                ".cc",
+                b'u8R"' + b"d" * 129 + b"(" + marker + b"\n",
+            ),
+            (
+                "cpp-raw-u8r-over-window-incomplete-opener",
+                ".cc",
+                b'u8R"' + b"d" * 129 + marker + b"\n",
+            ),
+            (
+                "c-preprocessor-define-marker",
+                ".h",
+                b'#define REQUIRED_PERMISSION "' + marker + b'"\n',
+            ),
+            (
+                "c-preprocessor-spaced-define-marker",
+                ".h",
+                b'# define REQUIRED_PERMISSION "' + marker + b'"\n',
+            ),
+            (
+                "rust-doc-attribute-marker",
+                ".rs",
+                b'#[doc = "' + marker + b'"]\n',
+            ),
+            (
+                "python-multiline-triple",
+                ".py",
+                b'value = """\n' + marker + b'\n"""\n',
+            ),
+            (
+                "python-multiline-raw-triple",
+                ".py",
+                b'value = r"""\n' + marker + b'\n"""\n',
+            ),
+            (
+                "cpp-multiline-raw",
+                ".cc",
+                b'const char *p = R"tag(\n' + marker + b'\n)tag";\n',
+            ),
+            (
+                "rust-multiline-raw",
+                ".rs",
+                b'let p = r#"\n' + marker + b'\n"#;\n',
+            ),
+            (
+                "javascript-multiline-template",
+                ".js",
+                b'const p = `\n' + marker + b'\n`;\n',
+            ),
+        ):
+            with self.subTest(case=label):
+                clean_base = git(self.repo, "rev-parse", "HEAD")
+                clean_tree = git(self.repo, "rev-parse", f"{clean_base}^{{tree}}")
+                malformed_head = self.commit_bytes(
+                    f"{label}{suffix}",
+                    payload,
+                    f"Add {label} permission marker fixture",
+                )
+
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=clean_base,
+                    head_ref=malformed_head,
+                )
+
+                self.assertEqual(exit_code, 75)
+                self.assertEqual(summary["status"], "inconclusive")
+                self.assertEqual(
+                    summary["failure_class"],
+                    "exact-value-scan-incomplete",
+                )
+                self.assertEqual(
+                    summary["secret_delta"]["failure_class"],
+                    "exact-value-scan-incomplete",
+                )
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+                clean_head = self.remove_and_commit(
+                    f"{label}{suffix}",
+                    f"Remove {label} permission marker fixture",
+                )
+                self.assertEqual(
+                    git(self.repo, "rev-parse", f"{clean_head}^{{tree}}"),
+                    clean_tree,
+                )
 
     def test_secret_admission_reports_growth_and_scan_uncertainty(self) -> None:
         added_secret_head = self.commit_bytes(
