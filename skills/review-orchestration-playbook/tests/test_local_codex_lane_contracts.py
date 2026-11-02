@@ -2481,7 +2481,9 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             ("-c", "features.goals=false"),
             ("-c", "features.skill_mcp_dependency_install=false"),
             ("-c", "features.multi_agent=false"),
+            ("-c", "features.daemon_auto_start=false"),
             ("-c", "memories.generate_memories=false"),
+            ("-c", 'web_search="disabled"'),
             ("-c", "features.hooks=false"),
             ("-c", "notify=[]"),
             ("--sandbox", "read-only"),
@@ -2503,7 +2505,9 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
             "Every clean CLI result, including a `runtime-attested` result, also requires",
             "For CLI lanes, shared metadata records the resolved binary, exact version output, literal argv submitted at launch, and `codex_cli_external_tool_surface: verified-disabled` only after parent-owned local preflight evidence verifies the effective tool surface",
-            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `image_generation`, `goals`, `skill_mcp_dependency_install`, `multi_agent`, and `hooks` all false",
+            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `image_generation`, `goals`, `skill_mcp_dependency_install`, `multi_agent`, `daemon_auto_start`, and `hooks` all false",
+            "Safe effective-config metadata must also confirm `web_search: disabled`, `memories.generate_memories: false`, and empty `notify`",
+            "without starting a thread or turn, and never retain the raw configuration response",
             "Build one whole-table `mcp_servers` override",
             "only when all three exactly match the prelaunch prompt record",
             "Missing or unknown argv/version evidence, a missing required flag, or any mismatch is inconclusive",
@@ -3792,7 +3796,6 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             local.split("| Adapter | Use when |", 1)[1].split("\n\nChoose from", 1)[0],
             local.split("## Fallback Order", 1)[1].split("A transient adapter", 1)[0],
             contracts.split("## Local Codex Contract", 1)[1].split("## Claude Code Contract", 1)[0],
-            templates.split("Prefer a clean-context Codex subagent", 1)[1].split("Candidate Markdown remains", 1)[0],
         )
         for route in route_sections:
             normalized = _normalized(route).lower()
@@ -3830,6 +3833,43 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             _normalized(contracts),
         )
         self.assertNotIn("trusted digest-bound reviewer role", _normalized(contracts))
+
+    def test_delivered_prompt_validates_recorded_adapter_without_routing(self) -> None:
+        templates = _read("review-prompt-templates.md")
+        local_section = templates.split("## Local Codex Prompt", 1)[1].split(
+            "## Claude Code Prompt", 1
+        )[0]
+        prompt, parent_launch = local_section.split("```text", 1)[1].split("```", 1)
+        normalized = _normalized(prompt)
+        for required in (
+            "Use only the adapter and launch evidence already recorded in Shared Metadata",
+            "Do not select, launch, delegate, retry, or switch reviewers",
+            "`inconclusive` without attempting another adapter",
+            "Do not start or relaunch a CLI process",
+        ):
+            self.assertIn(required, normalized)
+        for parent_command in (
+            "Prefer a clean-context Codex subagent",
+            "Use the fresh neutral-root CLI adapter when",
+            "For a CLI fallback, start a fresh non-resumed process",
+        ):
+            self.assertNotIn(parent_command, normalized)
+        self.assertIn(
+            "For a subagent adapter, launch the selected adapter recorded above",
+            _normalized(parent_launch),
+        )
+
+    def test_personal_runtime_context_preserves_memory_reading_and_evidence_scope(self) -> None:
+        local = _normalized(_read("local-codex-lane.md"))
+        consent = _normalized(_read("egress-consent.md"))
+        templates = _normalized(_read("review-prompt-templates.md"))
+        self.assertIn("Existing memories supplied by the normal runtime are trusted personal context", local)
+        self.assertIn("leave `memories.use_memories` at its normal user setting", local)
+        self.assertIn("it does not promise account-history isolation", consent)
+        self.assertIn("Never use it as proof of frozen repository contents", consent)
+        self.assertIn("Review tools must not discover, collect, or dump home/session files", consent)
+        self.assertIn("including existing memories supplied by the normal runtime under the user's settings", templates)
+        self.assertIn("Personal context is not evidence of the frozen repository", templates)
 
     def test_always_read_github_contracts_use_closed_recovery_semantics(self) -> None:
         contracts = _read("review-lane-contracts.md")

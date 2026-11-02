@@ -186,7 +186,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Submit this literal argv shape, replacing the executable path, model, effort, and neutral-root path with this launch's resolved or selected values:
 
   ```json
-  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "memories.generate_memories=false", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
+  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "features.daemon_auto_start=false", "-c", "memories.generate_memories=false", "-c", "web_search=\"disabled\"", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
   ```
 
   Resolve all MCP server names from the user's effective configuration at the
@@ -209,7 +209,8 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   model-default reasoning (`medium`); record any separately authorized
   override exactly as selected. The `-c` values disable Apps, plugins,
   computer use, browser use, image generation, persisted goals, automatic MCP
-  dependency installation, nested agent launches, hooks, legacy notification
+  dependency installation, nested agent launches, automatic daemon startup,
+  hooks, legacy notification
   commands, and every configured MCP server for this review process only, as documented in the
   [Codex config reference](https://learn.chatgpt.com/docs/config-file/config-reference).
   Do not alter global configuration or use `--ignore-user-config`. If a higher-priority managed
@@ -218,12 +219,23 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   home. Under the same normal configuration, neutral root, and exact final
   feature/MCP overrides, verify `features list` reports `apps`, `plugins`,
   `computer_use`, `browser_use`, `image_generation`, `goals`,
-  `skill_mcp_dependency_install`, `multi_agent`, and `hooks` all false,
+  `skill_mcp_dependency_install`, `multi_agent`, `daemon_auto_start`, and `hooks` all false,
   and `mcp list --json` reports every configured server disabled with zero
-  enabled servers. Retain only minimal local preflight evidence (feature states
+  enabled servers. Also require safe effective-config metadata to confirm
+  `web_search: disabled`, `memories.generate_memories: false`, and an empty
+  `notify` array. A loaded configuration value is execution-level evidence;
+  parser success alone is not a runtime tool-set attestation. A bounded local
+  app-server `config/read` query with `includeLayers=false` can expose these
+  values after `initialize`/`initialized`, using the same personal configuration,
+  neutral root, and review-control overrides. Disable MCP servers and callbacks
+  before that metadata service starts. Never issue thread, turn, or auth API
+  calls, start a model session, or use `debug prompt-input` for this preflight.
+  Project only the allowlisted enum/boolean values and `notify`-empty state in
+  memory; never retain the raw configuration response. Retain only minimal
+  local preflight evidence (selected configuration values, feature states,
   and MCP names/counts/enabled count); set
-  `codex_cli_external_tool_surface: verified-disabled` only when both checks
-  pass. If either check is unknown or fails, or any external write tool
+  `codex_cli_external_tool_surface: verified-disabled` only when all required checks
+  pass. If any required check is unknown or fails, or any external write tool
   remains enabled, classify the attempt as inconclusive.
   An observed callback has the same blocked/inconclusive outcome.
   Disabling goals also removes persisted-goal mutations and automatic
@@ -233,6 +245,12 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   review thread from future memory-generation inputs; leave
   `memories.use_memories` at its normal user setting to preserve trusted
   personal context. This does not change existing memories or global settings.
+  Fresh-context means fresh conversation turns, not account-history isolation.
+  Existing memories supplied by the normal runtime are trusted personal
+  context, not evidence of the frozen repository or authority to widen the
+  task. This never permits tool-driven home/session discovery or unrelated
+  repository inspection. The explicit shared-personal-context policy is
+  defined in [Review Egress Consent](egress-consent.md).
   `-a never` is the noninteractive approval policy; it leaves the normal
   authenticated Codex account and user configuration in use.
 - Include the same exact parent-owned `sanitized_git_argv_prefix` token array,

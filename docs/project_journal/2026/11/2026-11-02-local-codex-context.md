@@ -22,7 +22,7 @@ superseded_by:
 
 - The previous local lane explicitly prohibited the ordinary user `CODEX_HOME` and required separate temporary auth-only homes for login checks and review execution.
 - The previous subagent contract required complete host instruction-surface receipts even for a zero-inherited-context launch, making the simpler adapter unavailable on hosts without that telemetry.
-- The repository-wide and local Codex lane contract suites run 71 tests with 2 skips and no failures, covering generic-subagent launch/evidence, normal-home fallback, prompt transport, final launch-boundary classification, and process-local tool restrictions.
+- The repository-wide and local Codex lane contract suites run 73 tests with 2 skips and no failures, covering generic-subagent launch/evidence, normal-home fallback, prompt transport, final launch-boundary classification, process-local tool restrictions, and parent-only adapter routing.
 - Skill metadata validation, reviewer TOML parsing, and `git diff --check` pass.
 - Fresh conversation context is distinct from complete host instruction-stack isolation. Known forced candidate controls require the normal-home, neutral-root CLI fallback.
 - Hashed-file prompt transport protects stable file identity and exact bytes without imposing account isolation; neutral-root launch receipts use a stable identity across prelaunch and postlaunch evidence.
@@ -31,6 +31,9 @@ superseded_by:
 - Dedicated and generic subagents share the same host-accepted fresh-launch evidence rule. A role-file digest is recorded when available; its absence alone does not reject a supported clean-context launch.
 - CLI reviews disable persisted goals and automatic continuation for that process, with the effective goal feature state included in the local metadata preflight.
 - The CLI also disables automatic MCP dependency installation and nested agent launches, and excludes the new review thread from memory-generation inputs while preserving the user's existing memory-reading setting.
+- The delivered reviewer prompt validates an already launched adapter and never starts another reviewer. Parent-only launch instructions remain outside the delivered prompt.
+- Hosted web search is disabled for the CLI process. Existing normal-runtime memory injection remains explicitly trusted personal context, with no authority to widen tool inspection or supply evidence of frozen repository contents.
+- Codex CLI 0.166.0 metadata checks confirmed ten controlled features off, zero enabled MCP servers, disabled hosted search, disabled memory-generation inputs, and empty notifications. The no-thread configuration query retained normal existing-memory reading; it did not start a model review or change global configuration.
 
 ## Next Steps
 

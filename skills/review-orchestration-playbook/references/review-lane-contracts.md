@@ -609,8 +609,9 @@ Read [local-codex-lane.md](local-codex-lane.md).
   Launch it with the exact versioned argv specified in
   [Local Codex](local-codex-lane.md), including process-local
   feature/App/plugin/computer-use/browser/image-generation/goal/hook disablement,
-  disabled MCP dependency installation and nested CLI agents, exclusion of this
+  disabled MCP dependency installation, nested CLI agents, and daemon startup, exclusion of this
   thread from memory-generation inputs with existing memory reading unchanged,
+  disabled hosted web search,
   `notify=[]`, and a whole-table `mcp_servers` override disabling every
   configured server. Validate that no MCP server remains enabled with
   `mcp list --json`; do not alter global configuration or bypass a
@@ -656,8 +657,10 @@ accept the complete invocation. Record `codex_cli_launch_match:
 exact-type-preserving`; for non-CLI adapters, all CLI fields including this
 match are `not-applicable`. Require the final
 `codex_cli_external_tool_surface: verified-disabled`, backed by the exact
-process argv and a same-configuration, neutral-root `mcp list --json` result
-showing every configured server disabled and zero enabled. For non-CLI
+process argv and same-configuration, neutral-root feature/MCP checks plus safe
+effective-config metadata confirming disabled hosted web search, disabled
+memory-generation inputs, and empty notifications. Require every configured
+MCP server disabled and zero enabled. For non-CLI
 adapters, this field is `not-applicable`. A CLI `accepted-pinned-launch` additionally
 requires that the requested model/reasoning were pinned by the accepted argv
 and that the full review finished with a structured terminal event and zero
