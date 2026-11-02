@@ -9,7 +9,7 @@ and PR readiness without duplicating those contracts across every caller.
 
 | Request | Review processors | Notes |
 | --- | --- | --- |
-| Single | One fresh-context local Codex review session | The orchestrator may use either the reviewer subagent adapter or the Codex CLI adapter. |
+| Single | One fresh-context local Codex review session | Prefer a clean-context subagent; fall back to a fresh Codex CLI session with the normal user `CODEX_HOME`. |
 | Double | Single plus one independent Claude Code review | Claude is opt-in and reviews the same frozen committed range in a separate clean workspace. |
 | Triple | Double plus current-head GitHub Codex | Requires an eligible existing `github.com` PR and accepted provider evidence. |
 | Unnamed PR-bound delivery | Repository-configured GitHub Codex or native GitHub Copilot review | Remote-only when either is available; local review is added only when explicitly required. Pending remote review is not a pass. |
@@ -28,6 +28,9 @@ are explicit opt-ins, not default delivery shapes.
 Each named local processor gets its own independent, clean Git workspace and
 reviews a frozen `base_sha..head_sha`. A named shape selects logical review
 sessions, not the number of internal workers a high-reasoning model may use.
+Fresh context means no inherited parent conversation or resumed review session.
+Local Codex review uses the trusted personal account environment; it does not
+require a temporary `CODEX_HOME`, copied authentication, or account isolation.
 
 ## Included Skills
 
@@ -45,7 +48,7 @@ sessions, not the number of internal workers a high-reasoning model may use.
 ## Review Resource Map
 
 - [Local Codex lane](skills/review-orchestration-playbook/references/local-codex-lane.md):
-  peer subagent/CLI adapters, capability selection, prompt, and findings contract.
+  preferred subagent and CLI fallback, capability selection, prompt, and findings contract.
 - [Default routing and native Copilot review](skills/review-orchestration-playbook/references/default-review-routing.md#default-review-routing):
   remote-first selection, explicit opt-in, and current-head native-review evidence.
 - [Review workspace](skills/review-orchestration-playbook/references/review-workspace.md):

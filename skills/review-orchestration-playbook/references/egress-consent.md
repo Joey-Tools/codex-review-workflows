@@ -54,6 +54,25 @@ be present in the original tracked range; do not redact, rewrite, encode, or
 block reviewer input solely because a separate secret-admission scan detects
 them. Secret admission controls PR/master acceptance, not reviewer launch.
 
+### Local Codex Personal Runtime Context
+
+Joey explicitly trusts the shared personal Codex environment. Local Codex
+review therefore preserves normal runtime-supplied global guidance and the
+user's existing-memory reading setting. Fresh context means zero inherited
+conversation turns or a fresh non-resumed CLI session; it does not promise
+account-history isolation. The new CLI review thread is excluded from future
+memory-generation inputs without disabling existing-memory reading.
+Normal session and rollout persistence also follows the user's trusted runtime
+settings. `--ephemeral` is an optional user choice, not a default clean gate;
+ordinary Codex session bookkeeping is allowed.
+
+This personal runtime context does not widen the repository evidence scope
+above. Never use it as proof of frozen repository contents or as authority for
+mutation or scope expansion. Review tools must not discover, collect, or dump
+home/session files, untracked private content, or unrelated repositories. This
+exception applies to normal Codex runtime context, not additional reviewer
+providers or tool-driven transmission of private files.
+
 ## Excluded Data
 
 Named consent does not authorize:
