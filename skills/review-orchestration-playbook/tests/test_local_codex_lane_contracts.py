@@ -2384,6 +2384,14 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             self.assertIn(required.lower(), _normalized(subagent).lower())
         self.assertIn("read-only sandbox", subagent)
 
+    def test_generic_subagent_is_representable_in_prompt_and_report(self) -> None:
+        templates = _read("review-prompt-templates.md")
+        adapter_schema = (
+            "adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>"
+        )
+        self.assertEqual(templates.count(adapter_schema), 2)
+        self.assertIn("Preserve that exact adapter value", templates)
+
     def test_self_policy_candidate_agents_has_closed_scoped_guidance_admission(
         self,
     ) -> None:

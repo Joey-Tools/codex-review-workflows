@@ -22,7 +22,7 @@ superseded_by:
 
 - The previous local lane explicitly prohibited the ordinary user `CODEX_HOME` and required separate temporary auth-only homes for login checks and review execution.
 - The previous subagent contract required complete host instruction-surface receipts even for a zero-inherited-context launch, making the simpler adapter unavailable on hosts without that telemetry.
-- The focused local Codex lane contract suite passes all 13 tests.
+- The focused local Codex lane contract suite passes all 14 tests, including generic-subagent representation in both prompt and final-report projections.
 - Skill metadata validation, reviewer TOML parsing, and `git diff --check` pass.
 
 ## Next Steps

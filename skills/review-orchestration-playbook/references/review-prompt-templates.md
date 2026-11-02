@@ -64,7 +64,7 @@ trusted_external_guidance:
 workspace_receipts:
   prepare: <digest or stable receipt identity>
   validate: <digest or stable receipt identity>
-adapter: <reviewer-subagent | codex-cli | claude-code>
+adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>
 requested_profile: <adapter-specific model/profile>
 effective_profile: <observed adapter-specific profile, or pending until init>
 effective_profile_basis: <runtime-attested | accepted-pinned-launch | unknown | mismatch>
@@ -115,6 +115,10 @@ focus:
 non_goals:
   - <optional explicitly excluded work>
 ```
+
+Use `reviewer-subagent` for the dedicated reviewer role and `generic-subagent`
+for a generic child assigned read-only review. Preserve that exact adapter value
+in the parent record, prompt, and final report; neither value adds a review lane.
 
 The object/array placeholders above are exact transport slots, not prompt
 syntax or nested free-form metadata containers. Every active value under
@@ -865,7 +869,7 @@ For each local lane, record:
 
 ```yaml
 lane: <codex | claude>
-adapter: <reviewer-subagent | codex-cli | claude-code>
+adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>
 self_policy_migration: <true | false>
 self_policy_migration_parent_prompt_match: <exact-boolean | invalid>
 self_policy_migration_parent_prompt_report_match: <exact-boolean | invalid>
