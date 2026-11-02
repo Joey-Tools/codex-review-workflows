@@ -249,6 +249,10 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   `memories.use_memories` at its normal user setting to preserve trusted
   personal context. This does not change existing memories or global settings.
   Fresh-context means fresh conversation turns, not account-history isolation.
+  Normal session and rollout persistence follows the user's trusted runtime
+  settings. `--ephemeral` is an optional user choice, not a default clean gate.
+  Report-only review restricts repository and task-visible external mutations;
+  it does not prohibit ordinary Codex session bookkeeping.
   Existing memories supplied by the normal runtime are trusted personal
   context, not evidence of the frozen repository or authority to widen the
   task. This never permits tool-driven home/session discovery or unrelated

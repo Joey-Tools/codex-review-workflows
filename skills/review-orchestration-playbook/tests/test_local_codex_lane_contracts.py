@@ -2524,6 +2524,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         self.assertIn("features.hooks=false", argv)
         self.assertIn("notify=[]", argv)
         self.assertNotIn("features.memories=false", argv)
+        self.assertNotIn("--ephemeral", argv)
         self.assertIn(
             "leave `memories.use_memories` at its normal user setting",
             _normalized(local),
@@ -3846,9 +3847,12 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         prompt, parent_launch = local_section.split("```text", 1)[1].split("```", 1)
         normalized = _normalized(prompt)
         for required in (
-            "Use only the adapter and launch evidence already recorded in Shared Metadata",
+            "Check the supplied adapter and requested control metadata in Shared Metadata for presence and valid form",
+            "`requested_subagent_execution` as launch intent, not proof of the actual adapter",
+            "The parent verifies actual launch, context, execution, and `subagent_launch_evidence`",
+            "missing or unobservable host telemetry alone is not a failure",
             "Do not select, launch, delegate, retry, or switch reviewers",
-            "`inconclusive` without attempting another adapter",
+            "Missing or invalid required requested metadata is `inconclusive`",
             "Do not start or relaunch a CLI process",
         ):
             self.assertIn(required, normalized)
@@ -3870,6 +3874,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         self.assertIn("Existing memories supplied by the normal runtime are trusted personal context", local)
         self.assertIn("leave `memories.use_memories` at its normal user setting", local)
         self.assertIn("it does not promise account-history isolation", consent)
+        self.assertIn("`--ephemeral` is an optional user choice, not a default clean gate", consent)
         self.assertIn("Never use it as proof of frozen repository contents", consent)
         self.assertIn("Review tools must not discover, collect, or dump home/session files", consent)
         self.assertIn("including existing memories supplied by the normal runtime under the user's settings", templates)

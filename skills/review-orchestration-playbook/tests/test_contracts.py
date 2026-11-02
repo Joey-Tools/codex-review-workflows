@@ -1326,7 +1326,8 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, instructions)
         self.assertIn("do not orchestrate another named review", instructions.lower())
-        self.assertIn("Validate only the parent-selected adapter and its recorded launch evidence", instructions)
+        self.assertIn("Check the supplied adapter and requested control metadata for presence and valid form", instructions)
+        self.assertIn("The parent verifies actual launch, context, execution, and launch evidence", instructions)
         self.assertIn("Do not choose, launch, delegate, retry, or switch reviewers", instructions)
         self.assertNotIn("Use a clean-context subagent", instructions)
         self.assertNotIn("Prefer this dedicated reviewer role", instructions)
