@@ -22,12 +22,13 @@ superseded_by:
 
 - The previous local lane explicitly prohibited the ordinary user `CODEX_HOME` and required separate temporary auth-only homes for login checks and review execution.
 - The previous subagent contract required complete host instruction-surface receipts even for a zero-inherited-context launch, making the simpler adapter unavailable on hosts without that telemetry.
-- The repository-wide and local Codex lane contract suites run 70 tests with 2 skips and no failures, covering generic-subagent launch/evidence, normal-home fallback, prompt transport, and final launch-boundary classification.
+- The repository-wide and local Codex lane contract suites run 71 tests with 2 skips and no failures, covering generic-subagent launch/evidence, normal-home fallback, prompt transport, final launch-boundary classification, and process-local tool restrictions.
 - Skill metadata validation, reviewer TOML parsing, and `git diff --check` pass.
 - Fresh conversation context is distinct from complete host instruction-stack isolation. Known forced candidate controls require the normal-home, neutral-root CLI fallback.
 - Hashed-file prompt transport protects stable file identity and exact bytes without imposing account isolation; neutral-root launch receipts use a stable identity across prelaunch and postlaunch evidence.
 - Final lane records expose the actual subagent context/execution/evidence and neutral-root match/pre/post results. The CLI requests JSONL events explicitly with `codex exec --json -`.
-- CLI accepted-pinned evidence binds the actual executable, version, and complete literal argv. Per-process hook and notification overrides preserve report-only execution without changing the normal account or global configuration.
+- CLI accepted-pinned evidence binds the actual executable, version, and complete literal argv. Process-local feature, hook, notification, and MCP restrictions preserve report-only execution without changing the normal account or global configuration; effective metadata checks must confirm the restricted tool surface.
+- Dedicated and generic subagents share the same host-accepted fresh-launch evidence rule. A role-file digest is recorded when available; its absence alone does not reject a supported clean-context launch.
 
 ## Next Steps
 

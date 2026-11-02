@@ -73,6 +73,7 @@ requested_subagent_execution: <read-only | not-applicable>
 codex_cli_version: <exact version output | not-applicable>
 codex_cli_executable: <resolved absolute executable path | not-applicable>
 codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>
+codex_cli_external_tool_surface: <verified-disabled | writable-or-unknown | not-applicable>
 neutral_launch_root: <absolute parent-owned path | not-applicable>
 neutral_launch_root_receipt: <preallocated opaque stable identity | not-applicable>
 codex_git:
@@ -524,8 +525,10 @@ parent turns, and a read-only workspace. Use the installed `reviewer` role when
 available and selected as `reviewer-subagent`; use a generic child when the
 selected adapter is `generic-subagent`. Both satisfy the same launch
 constraints, but do not treat them as proof of full host instruction
-isolation. If the host is known to activate candidate controls automatically
-and they cannot be suppressed, use the fresh neutral-root CLI adapter instead.
+isolation. Use the fresh neutral-root CLI adapter when no eligible zero-context,
+read-only subagent is available; candidate project controls are known to
+activate unsuppressed; or external write tools cannot be constrained to none
+or a verified read-only allowlist.
 Shared user configuration and global guidance belong to the trusted personal
 environment. Missing or unobservable host instruction telemetry alone is not a
 failure; do not require a complete host instruction-source receipt or reject
@@ -910,6 +913,7 @@ codex_cli_version: <exact version output | not-applicable>
 codex_cli_executable: <resolved absolute executable path | not-applicable>
 codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>
 codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>
+codex_cli_external_tool_surface: <verified-disabled | writable-or-unknown | not-applicable>
 subagent_context: <zero-inherited-turns | inherited-turns | unknown | not-applicable>
 subagent_execution: <read-only | writable | unknown | not-applicable>
 subagent_launch_evidence: <host-accepted-launch | runtime-attested | unknown | not-applicable>
@@ -971,8 +975,10 @@ cleanup: <complete | already-absent | retained | not-applicable>
 ```
 
 The parent derives actual subagent fields by verifying that the host accepted
-`fork_turns="none"` and a read-only launch, together with available runtime
-evidence. A clean result for either subagent adapter requires
+`fork_turns="none"`, a host-enforced read-only workspace, and a tool surface
+with no external write tools or a verified read-only allowlist, together with
+available runtime evidence. Prompt prohibitions or a sanitized Git prefix alone
+do not enforce external-tool restrictions. A clean result for either subagent adapter requires
 `subagent_context: zero-inherited-turns`,
 `subagent_execution: read-only`, and `subagent_launch_evidence` equal to
 `host-accepted-launch` or `runtime-attested`. Missing fields, `unknown`,
@@ -984,10 +990,32 @@ personal configuration and global guidance remain allowed, and a missing
 complete host instruction-source receipt alone is not a failure.
 
 For CLI lanes, shared metadata records the resolved binary, exact version
-output, and literal argv submitted at launch. The parent-owned final report
+output, literal argv submitted at launch, and
+`codex_cli_external_tool_surface: verified-disabled` only after parent-owned
+local preflight evidence verifies the effective tool surface. Keep that small
+preflight record local to the parent: the six `features list` values and MCP
+names/counts/enabled count. Do not add a second receipt schema or put server
+URLs, connection arguments, environment values, raw configuration, or
+credentials in the prompt or report. The parent-owned final report
 repeats those actual values and sets `codex_cli_launch_match` to
 `exact-type-preserving` only when all three exactly match the prelaunch prompt
 record. For non-CLI adapters, these four CLI fields are `not-applicable`.
+
+The parent sets CLI `codex_cli_external_tool_surface` to `verified-disabled`
+only after the exact argv disables Apps, plugins, computer use, browser use,
+image generation, hooks, notifications, and every configured MCP server. At
+the neutral root with the same normal user configuration and exact final
+overrides, `features list` must report `apps`, `plugins`, `computer_use`,
+`browser_use`, `image_generation`, and `hooks` all false, and `mcp list --json`
+must show all configured names disabled and zero enabled servers. Build one
+whole-table `mcp_servers` override with every effective
+server name set to `enabled=false`; an empty table does not prove inherited
+servers were cleared. Record only names and counts from the local metadata
+check. If a setting is rejected, a managed policy conflicts, a write tool
+remains enabled, or the check is unknown, the CLI lane is inconclusive. For
+non-CLI adapters this field is `not-applicable`; their
+`subagent_execution: read-only` value already requires the host-enforced
+external-tool boundary above.
 
 For CLI lanes, the parent allocates `neutral_launch_root_receipt` before
 launch, then the final report repeats that identity. A clean result requires
@@ -1005,7 +1033,8 @@ all controls in the Local Codex example, including model/reasoning, noninteracti
 neutral root, process-local hook/notification suppression, read-only sandbox,
 repository-check skip, and JSON stdin. A managed-policy conflict, rejected
 setting, or observed callback is blocked or inconclusive. Do not bypass a
-managed policy. Missing required argv tokens, unknown or mismatched argv/version
+managed policy. The final `codex_cli_external_tool_surface` must be
+`verified-disabled`. Missing required argv tokens, unknown or mismatched argv/version
 evidence, or any mismatch is inconclusive for every CLI clean result.
 
 The classifier accepts a route only when `self_policy_migration` is an exact

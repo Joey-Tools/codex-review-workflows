@@ -2382,7 +2382,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "do not reject it by role name",
         ):
             self.assertIn(required.lower(), _normalized(subagent).lower())
-        self.assertIn("read-only sandbox", subagent)
+        self.assertIn("host-enforced read-only workspace", subagent)
 
     def test_generic_subagent_is_representable_in_prompt_and_report(self) -> None:
         templates = _read("review-prompt-templates.md")
@@ -2397,12 +2397,9 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "acceptance record for the actual launch",
             _normalized(local),
         )
-        self.assertIn(
-            "For a generic child, record that actual launch type",
-            _normalized(local),
-        )
+        self.assertIn("Record a generic child as generic", _normalized(local))
         self.assertIn("generic child", _normalized(local))
-        self.assertIn("do not report it as the dedicated role", _normalized(local))
+        self.assertIn("never report it as the dedicated role", _normalized(local))
         self.assertIn(
             "neutral_launch_root_receipt: <preallocated opaque stable identity | not-applicable>",
             templates,
@@ -2476,6 +2473,11 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             ("-m", "selected_model"),
             ("-c", 'model_reasoning_effort="selected_effort"'),
             ("-C", "/absolute/neutral-root"),
+            ("-c", "features.apps=false"),
+            ("-c", "features.plugins=false"),
+            ("-c", "features.computer_use=false"),
+            ("-c", "features.browser_use=false"),
+            ("-c", "features.image_generation=false"),
             ("-c", "features.hooks=false"),
             ("-c", "notify=[]"),
             ("--sandbox", "read-only"),
@@ -2493,9 +2495,12 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "codex_cli_version: <exact version output | not-applicable>",
             "codex_cli_executable: <resolved absolute executable path | not-applicable>",
             "codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>",
+            "codex_cli_external_tool_surface: <verified-disabled | writable-or-unknown | not-applicable>",
             "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
             "Every clean CLI result, including a `runtime-attested` result, also requires",
-            "For CLI lanes, shared metadata records the resolved binary, exact version output, and literal argv submitted at launch",
+            "For CLI lanes, shared metadata records the resolved binary, exact version output, literal argv submitted at launch, and `codex_cli_external_tool_surface: verified-disabled` only after parent-owned local preflight evidence verifies the effective tool surface",
+            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `image_generation`, and `hooks` all false",
+            "Build one whole-table `mcp_servers` override",
             "only when all three exactly match the prelaunch prompt record",
             "Missing or unknown argv/version evidence, a missing required flag, or any mismatch is inconclusive",
         ):
@@ -2506,9 +2511,19 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         )
         self.assertIn("features.hooks=false", argv)
         self.assertIn("notify=[]", argv)
+        self.assertTrue(
+            any(token.startswith('mcp_servers={"<configured-name-1>"=') for token in argv)
+        )
         self.assertIn("Do not alter global configuration", _normalized(local))
         self.assertIn("managed-policy conflict", _normalized(contracts))
-        self.assertIn("For a generic subagent", contracts)
+        self.assertIn(
+            "applies equally to dedicated reviewer-role and generic subagents",
+            _normalized(contracts),
+        )
+        self.assertIn(
+            "record a reviewer-role path/digest when available without requiring it",
+            _normalized(contracts),
+        )
         self.assertIn("do not use `--ignore-user-config`", local)
         self.assertIn("create a temporary `CODEX_HOME`", _normalized(local))
 
@@ -3748,12 +3763,64 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "gpt-6.1-sol",
             "reasoning: model default (currently `medium`",
             'fork_turns="none"',
-            "Prefer a clean-context subagent",
+            "Prefer a clean-context subagent when an eligible zero-context, read-only",
             "Another model or reasoning override requires explicit user opt-in",
         ):
             self.assertIn(expected, local)
-        self.assertIn("when a subagent is unavailable", local)
+        self.assertIn(
+            "no eligible zero-context, read-only subagent is available",
+            _normalized(local),
+        )
         self.assertIn("peer adapters", contracts)
+
+    def test_cli_route_predicates_are_consistent_across_references(self) -> None:
+        local = _read("local-codex-lane.md")
+        contracts = _read("review-lane-contracts.md")
+        templates = _read("review-prompt-templates.md")
+
+        route_sections = (
+            local.split("## Peer Adapters", 1)[1].split("### Subagent adapter", 1)[0],
+            local.split("| Adapter | Use when |", 1)[1].split("\n\nChoose from", 1)[0],
+            local.split("## Fallback Order", 1)[1].split("A transient adapter", 1)[0],
+            contracts.split("## Local Codex Contract", 1)[1].split("## Claude Code Contract", 1)[0],
+            templates.split("Prefer a clean-context Codex subagent", 1)[1].split("Candidate Markdown remains", 1)[0],
+        )
+        for route in route_sections:
+            normalized = _normalized(route).lower()
+            self.assertIn(
+                "no eligible zero-context, read-only subagent is available",
+                normalized,
+            )
+            self.assertIn(
+                "candidate project controls are known to activate unsuppressed",
+                normalized,
+            )
+            self.assertIn("external write tools cannot be constrained", normalized)
+
+        local_subagent = local.split("### Subagent adapter", 1)[1].split(
+            "### CLI adapter", 1
+        )[0]
+        for required in (
+            "host-accepted fresh launch of either subagent adapter",
+            "requested model and effort",
+            "no contrary telemetry",
+            "record the dedicated reviewer-role path and digest when available",
+            "do not require them",
+        ):
+            self.assertIn(required.lower(), _normalized(local_subagent).lower())
+        self.assertIn(
+            "host-accepted fresh subagent launch with the actual adapter",
+            _normalized(contracts),
+        )
+        self.assertIn(
+            "applies equally to dedicated reviewer-role and generic subagents",
+            _normalized(contracts),
+        )
+        self.assertIn(
+            "A runtime-attested profile that contradicts the requested profile is `mismatch` and inconclusive",
+            _normalized(contracts),
+        )
+        self.assertNotIn("trusted digest-bound reviewer role", _normalized(contracts))
 
     def test_always_read_github_contracts_use_closed_recovery_semantics(self) -> None:
         contracts = _read("review-lane-contracts.md")

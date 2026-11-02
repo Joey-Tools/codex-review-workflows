@@ -577,8 +577,15 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("gpt-6.1-sol", normalized)
             self.assertIn("medium", normalized)
             self.assertIn("internal delegation", normalized)
-        self.assertIn("Prefer a clean-context subagent", local)
-        self.assertIn("when a subagent is unavailable", local)
+        self.assertIn("Prefer a clean-context subagent when an eligible", local)
+        self.assertIn(
+            "no eligible zero-context, read-only subagent is available",
+            _normalize(local),
+        )
+        self.assertIn(
+            "candidate project controls are known to activate unsuppressed",
+            _normalize(local),
+        )
         self.assertIn('fork_turns="none"', local)
         subagent = local.split("### Subagent adapter", 1)[1].split(
             "### CLI adapter", 1
@@ -588,11 +595,11 @@ class RepositoryContractTest(unittest.TestCase):
             "same zero-context and read-only constraints",
             "do not reject it by role name",
             "zero-inherited-context equivalent",
-            "read-only sandbox",
+            "host-enforced read-only workspace",
         ):
             self.assertIn(subagent_control, subagent)
         self.assertIn(
-            "use a fresh non-resumed cli process when a subagent is unavailable",
+            "use the cli adapter when no eligible zero-context, read-only subagent is available",
             _normalize(local),
         )
         self.assertIn("Use the normal authenticated Codex account", local)

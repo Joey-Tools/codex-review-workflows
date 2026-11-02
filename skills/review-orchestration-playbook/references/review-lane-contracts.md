@@ -586,22 +586,33 @@ deviation.
 Read [local-codex-lane.md](local-codex-lane.md).
 
 - Prefer a clean-context Codex subagent launched with `fork_turns="none"`, no
-  parent turns, and a read-only workspace. Use the installed `reviewer` role
+  parent turns, a host-enforced read-only workspace, and a tool surface with no
+  external write tools or a verified read-only allowlist. Use the installed `reviewer` role
   when available; a generic child with those constraints is also eligible. The
-  fresh non-resumed Codex CLI is the fallback adapter.
+  fresh non-resumed Codex CLI is the fallback when no eligible zero-context,
+  read-only subagent is available; candidate project controls are known to
+  activate unsuppressed; or external write tools cannot be constrained to none
+  or a verified read-only allowlist.
 - The default installed profile is `gpt-6.1-sol` at model-default reasoning (currently `medium`).
 - Record requested and effective adapter, model, and mode.
 - Record `self_policy_migration`, the selected adapter, and the zero-turn,
   read-only subagent launch when applicable.
 - Record `effective_profile_basis` as `runtime-attested`,
   `accepted-pinned-launch`, `unknown`, or `mismatch`.
-- The CLI fallback is a fresh non-resumed process using the ordinary user
+- Use the CLI fallback when no eligible zero-context, read-only subagent is
+  available; candidate project controls
+  are known to activate unsuppressed; or external write tools cannot be
+  constrained to none or a verified read-only allowlist.
+  The fallback is a fresh non-resumed process using the ordinary user
   `CODEX_HOME`. Use the normal authenticated Codex account and user
   configuration; do not copy credentials or create a temporary auth home.
   Launch it with the exact versioned argv specified in
   [Local Codex](local-codex-lane.md), including process-local
-  `features.hooks=false` and `notify=[]`; do not alter global configuration or
-  bypass a higher-priority managed policy.
+  feature/App/plugin/computer-use/browser/image-generation/hook disablement,
+  `notify=[]`, and a whole-table `mcp_servers` override disabling every
+  configured server. Validate that no MCP server remains enabled with
+  `mcp list --json`; do not alter global configuration or bypass a
+  higher-priority managed policy.
   Preserve the neutral launch root and its short pre/post identity, owner, mode,
   access-policy, ACL-grant, and empty-inventory evidence. Trusted personal
   configuration and global guidance are allowed; candidate project controls
@@ -619,17 +630,19 @@ Read [local-codex-lane.md](local-codex-lane.md).
 - One invocation remains one logical lane even with internal delegation.
 
 Both peer adapters use the same effective-profile rule. An exact
-`runtime-attested` match may support clean. When authoritative runtime fields are
-absent, a version-proven exact CLI argv accepted through a successful complete
-run, or a trusted digest-bound reviewer role accepted by the host, is
-`accepted-pinned-launch` and may supply the requested pinned model/mode as
-execution-level effective values. For a generic subagent, the host-accepted
-fresh launch, recorded actual adapter, requested model/mode, and absence of
-contrary runtime telemetry may likewise establish `accepted-pinned-launch`;
-this records the generic adapter and does not claim that a dedicated reviewer
-role was used. None of these accepted launches attests provider backend aliases,
-routing, or weights. `unknown` and `mismatch` are always inconclusive; a clean
-sentinel never repairs either state.
+`runtime-attested` match may support clean. When authoritative runtime fields
+are absent, a version-proven exact CLI argv accepted through a successful
+complete run, or a host-accepted fresh subagent launch with the actual adapter,
+zero inherited turns, read-only execution, requested model/mode, and no
+contrary runtime telemetry, is `accepted-pinned-launch` and may supply the
+requested pinned model/mode as execution-level effective values. This applies
+equally to dedicated reviewer-role and generic subagents; record the actual
+adapter, and record a reviewer-role path/digest when available without
+requiring it or claiming file binding when unavailable. A runtime-attested
+profile that contradicts the requested profile is `mismatch` and inconclusive.
+None of these accepted launches attests provider backend aliases, routing, or
+weights. `unknown` and `mismatch` are always inconclusive; a clean sentinel
+never repairs either state.
 
 For every CLI clean result, require the resolved Codex executable and exact
 version plus the actual submitted argv copied into the final report and
@@ -639,7 +652,11 @@ hook/notification, read-only sandbox, repository-check, and JSON-stdin control
 specified in [Local Codex](local-codex-lane.md), and that binary version must
 accept the complete invocation. Record `codex_cli_launch_match:
 exact-type-preserving`; for non-CLI adapters, all CLI fields including this
-match are `not-applicable`. A CLI `accepted-pinned-launch` additionally
+match are `not-applicable`. Require the final
+`codex_cli_external_tool_surface: verified-disabled`, backed by the exact
+process argv and a same-configuration, neutral-root `mcp list --json` result
+showing every configured server disabled and zero enabled. For non-CLI
+adapters, this field is `not-applicable`. A CLI `accepted-pinned-launch` additionally
 requires that the requested model/reasoning were pinned by the accepted argv
 and that the full review finished with a structured terminal event and zero
 exit status. No CLI clean result may contain a contrary error, substitution,
@@ -648,7 +665,9 @@ missing required flag, a mismatch, or a managed-policy conflict is
 inconclusive or blocked; never treat the requested profile alone as effective
 evidence. These controls do not attest backend aliases, routing, or weights.
 
-For a subagent, the clean-context launch and read-only workspace are required;
+For a subagent, the clean-context launch and host-enforced read-only workspace
+are required. Its read-only tool surface means no external write tools or a
+verified read-only allowlist; prompt prohibitions alone do not enforce it.
 the installed reviewer role is preferred, while a generic child remains
 eligible. A zero-turn, read-only launch does not prove full host instruction
 isolation. If the host is known to activate candidate controls automatically

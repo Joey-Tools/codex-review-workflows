@@ -64,7 +64,7 @@ with explicit user authorization.
 
 - Local Codex: read [Local Codex](references/local-codex-lane.md) and
   [Prompt Templates](references/review-prompt-templates.md). Prefer a clean-context,
-  read-only subagent; use a fresh non-resumed CLI process when one is unavailable.
+  read-only subagent; otherwise use a fresh non-resumed CLI for unsuppressed candidate controls or external write tools.
   Default to `gpt-6.1-sol` at model-default reasoning, currently `medium`, not
   the parent's effort. A generic subagent with the same boundaries is also
   eligible. Another model/effort requires explicit opt-in;
