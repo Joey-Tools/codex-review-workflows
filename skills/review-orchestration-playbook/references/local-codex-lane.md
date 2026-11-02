@@ -186,7 +186,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Submit this literal argv shape, replacing the executable path, model, effort, and neutral-root path with this launch's resolved or selected values:
 
   ```json
-  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "features.daemon_auto_start=false", "-c", "memories.generate_memories=false", "-c", "web_search=\"disabled\"", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
+  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.browser_use_external=false", "-c", "features.browser_use_full_cdp_access=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.daemon_auto_start=false", "-c", "agents.enabled=false", "-c", "memories.generate_memories=false", "-c", "web_search=\"disabled\"", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
   ```
 
   Resolve all MCP server names from the user's effective configuration at the
@@ -218,11 +218,14 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   or inconclusive; do not bypass that policy or create another configuration
   home. Under the same normal configuration, neutral root, and exact final
   feature/MCP overrides, verify `features list` reports `apps`, `plugins`,
-  `computer_use`, `browser_use`, `image_generation`, `goals`,
-  `skill_mcp_dependency_install`, `multi_agent`, `daemon_auto_start`, and `hooks` all false,
+  `computer_use`, `browser_use`, `browser_use_external`,
+  `browser_use_full_cdp_access`, `image_generation`, `goals`,
+  `skill_mcp_dependency_install`, `multi_agent`, `multi_agent_v2`,
+  `daemon_auto_start`, and `hooks` all false,
   and `mcp list --json` reports every configured server disabled with zero
   enabled servers. Also require safe effective-config metadata to confirm
-  `web_search: disabled`, `memories.generate_memories: false`, and an empty
+  `web_search: disabled`, `agents.enabled: false`,
+  `memories.generate_memories: false`, and an empty
   `notify` array. A loaded configuration value is execution-level evidence;
   parser success alone is not a runtime tool-set attestation. A bounded local
   app-server `config/read` query with `includeLayers=false` can expose these

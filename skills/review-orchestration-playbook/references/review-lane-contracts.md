@@ -659,6 +659,7 @@ match are `not-applicable`. Require the final
 `codex_cli_external_tool_surface: verified-disabled`, backed by the exact
 process argv and same-configuration, neutral-root feature/MCP checks plus safe
 effective-config metadata confirming disabled hosted web search, disabled
+`agents.enabled` alongside both `multi_agent` feature variants, disabled
 memory-generation inputs, and empty notifications. Require every configured
 MCP server disabled and zero enabled. For non-CLI
 adapters, this field is `not-applicable`. A CLI `accepted-pinned-launch` additionally

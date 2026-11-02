@@ -31,9 +31,9 @@ superseded_by:
 - Dedicated and generic subagents share the same host-accepted fresh-launch evidence rule. A role-file digest is recorded when available; its absence alone does not reject a supported clean-context launch.
 - CLI reviews disable persisted goals and automatic continuation for that process, with the effective goal feature state included in the local metadata preflight.
 - The CLI also disables automatic MCP dependency installation and nested agent launches, and excludes the new review thread from memory-generation inputs while preserving the user's existing memory-reading setting.
-- The delivered reviewer prompt validates an already launched adapter and never starts another reviewer. Parent-only launch instructions remain outside the delivered prompt.
+- The delivered reviewer prompt and installed reviewer role validate an already launched adapter and never start another reviewer. Parent-only launch instructions remain outside the delivered prompt.
 - Hosted web search is disabled for the CLI process. Existing normal-runtime memory injection remains explicitly trusted personal context, with no authority to widen tool inspection or supply evidence of frozen repository contents.
-- Codex CLI 0.166.0 metadata checks confirmed ten controlled features off, zero enabled MCP servers, disabled hosted search, disabled memory-generation inputs, and empty notifications. The no-thread configuration query retained normal existing-memory reading; it did not start a model review or change global configuration.
+- Codex CLI 0.166.0 metadata checks confirmed thirteen controlled features off, zero enabled MCP servers, disabled agents and hosted search, disabled memory-generation inputs, and empty notifications. Both multi-agent implementations and browser extension/CDP variants are explicitly disabled. The no-thread configuration query retained normal existing-memory reading; it did not start a model review or change global configuration.
 
 ## Next Steps
 

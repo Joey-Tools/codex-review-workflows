@@ -1326,6 +1326,10 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, instructions)
         self.assertIn("do not orchestrate another named review", instructions.lower())
+        self.assertIn("Validate only the parent-selected adapter and its recorded launch evidence", instructions)
+        self.assertIn("Do not choose, launch, delegate, retry, or switch reviewers", instructions)
+        self.assertNotIn("Use a clean-context subagent", instructions)
+        self.assertNotIn("Prefer this dedicated reviewer role", instructions)
 
     def test_codex_peer_adapters_share_sanitized_git_prefix_contract(self) -> None:
         contracts = _read("references/review-lane-contracts.md")

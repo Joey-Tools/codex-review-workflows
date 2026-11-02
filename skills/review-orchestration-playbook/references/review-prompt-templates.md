@@ -998,7 +998,7 @@ For CLI lanes, shared metadata records the resolved binary, exact version
 output, literal argv submitted at launch, and
 `codex_cli_external_tool_surface: verified-disabled` only after parent-owned
 local preflight evidence verifies the effective tool surface. Keep that small
-preflight record local to the parent: the ten `features list` values, MCP
+preflight record local to the parent: the thirteen `features list` values, MCP
 names/counts/enabled count, and selected configuration values. Do not add a second receipt schema or put server
 URLs, connection arguments, environment values, raw configuration, or
 credentials in the prompt or report. The parent-owned final report
@@ -1015,15 +1015,16 @@ hooks, notifications, and every configured MCP server. The argv also pins
 existing-memory reading unchanged. At
 the neutral root with the same normal user configuration and exact final
 overrides, `features list` must report `apps`, `plugins`, `computer_use`,
-`browser_use`, `image_generation`, `goals`, `skill_mcp_dependency_install`,
-`multi_agent`, `daemon_auto_start`, and `hooks` all false, and `mcp list --json`
+`browser_use`, `browser_use_external`, `browser_use_full_cdp_access`,
+`image_generation`, `goals`, `skill_mcp_dependency_install`,
+`multi_agent`, `multi_agent_v2`, `daemon_auto_start`, and `hooks` all false, and `mcp list --json`
 must show all configured names disabled and zero enabled servers. Build one
 whole-table `mcp_servers` override with every effective
 server name set to `enabled=false`; an empty table does not prove inherited
 servers were cleared. Record only names and counts from the local metadata
 check, plus the selected safe configuration values. Safe effective-config
 metadata must also confirm `web_search: disabled`,
-`memories.generate_memories: false`, and empty `notify`; query only metadata
+`agents.enabled: false`, `memories.generate_memories: false`, and empty `notify`; query only metadata
 without starting a thread or turn, and never retain the raw configuration
 response. Parser success alone is not runtime tool-set attestation.
 If a setting is rejected, a managed policy conflicts, a write tool
