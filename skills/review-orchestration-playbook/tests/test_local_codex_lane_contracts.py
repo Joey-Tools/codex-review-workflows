@@ -2386,11 +2386,35 @@ class LocalCodexLaneContractTest(unittest.TestCase):
 
     def test_generic_subagent_is_representable_in_prompt_and_report(self) -> None:
         templates = _read("review-prompt-templates.md")
+        local = _read("local-codex-lane.md")
+        contracts = _read("review-lane-contracts.md")
         adapter_schema = (
             "adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>"
         )
         self.assertEqual(templates.count(adapter_schema), 2)
         self.assertIn("Preserve that exact adapter value", templates)
+        self.assertIn(
+            "acceptance record for the actual launch",
+            _normalized(local),
+        )
+        self.assertIn(
+            "For a generic child, record that actual launch type",
+            _normalized(local),
+        )
+        self.assertIn("generic child", _normalized(local))
+        self.assertIn("do not report it as the dedicated role", _normalized(local))
+        self.assertIn(
+            "neutral_launch_root_receipt: <preallocated opaque stable identity | not-applicable>",
+            templates,
+        )
+        self.assertEqual(templates.count("neutral_launch_root_receipt:"), 2)
+        self.assertIn(
+            "exact parent/prompt/report identity equality", _normalized(templates)
+        )
+        self.assertIn(
+            "records successful prelaunch and postlaunch checks of root identity",
+            _normalized(contracts),
+        )
 
     def test_self_policy_candidate_agents_has_closed_scoped_guidance_admission(
         self,
@@ -3573,9 +3597,14 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         self.assertIn("do not copy credentials", normalized)
         self.assertIn("create a temporary `CODEX_HOME`", normalized)
         self.assertIn(
-            "do not require a complete host instruction-source receipt",
+            "missing telemetry or a complete host receipt alone is not a failure",
             normalized.lower(),
         )
+        self.assertIn(
+            "candidate-control injection or override of the trusted review task",
+            normalized,
+        )
+        self.assertIn("inconclusive", normalized)
 
     def test_peer_adapters_share_fail_closed_effective_profile_matrix(self) -> None:
         local = _read("local-codex-lane.md")

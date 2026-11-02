@@ -379,10 +379,12 @@ parent/prompt/report equality before accepting the result.
 
 Every local Codex reviewer also receives the parent-owned
 `sanitized_git_argv_prefix` exact token sequence plus its identity metadata as
-defined below. A CLI reviewer also receives the opaque stable identity of the
-neutral launch-root receipt for that review process; the final lane report
-repeats the identity and must type-preservingly match the prompt projection.
-The receipt binds the root's pre/post identity, owner, mode, access policy,
+defined below. Before a CLI launch, the parent allocates an opaque stable
+identity for that process's neutral launch-root receipt and copies the identity
+into the parent record and prompt. Do not hash a receipt that includes future
+postlaunch results. The final lane report repeats the same identity; the parent
+requires exact parent/prompt/report identity equality and records successful
+prelaunch and postlaunch checks of root identity, owner, mode, access policy,
 absence of non-owner ACL grants, and empty inventory. The prefix is opaque to
 the reviewer: it is copied, not rebuilt from prose.
 
@@ -611,19 +613,27 @@ Both peer adapters use the same effective-profile rule. An exact
 absent, a version-proven exact CLI argv accepted through a successful complete
 run, or a trusted digest-bound reviewer role accepted by the host, is
 `accepted-pinned-launch` and may supply the requested pinned model/mode as
-execution-level effective values. This does not attest provider backend aliases,
+execution-level effective values. For a generic subagent, the host-accepted
+fresh launch, recorded actual adapter, requested model/mode, and absence of
+contrary runtime telemetry may likewise establish `accepted-pinned-launch`;
+this records the generic adapter and does not claim that a dedicated reviewer
+role was used. None of these accepted launches attests provider backend aliases,
 routing, or weights. `unknown` and `mismatch` are always inconclusive; a clean
 sentinel never repairs either state.
 
 For a subagent, the clean-context launch and read-only workspace are required;
 the installed reviewer role is preferred, while a generic child remains
-eligible. A complete host instruction-source receipt is not required, and
-trusted personal configuration and global guidance are allowed. The selected
-adapter's requested model and mode must still be supported by the effective-
-profile evidence above. An observed candidate-control injection or override of
-trusted parent instructions, an incomplete or mismatched subject inventory, or
-invalid or mismatched candidate admission makes that attempt inconclusive even
-when its terminal text is `No findings.`.
+eligible. A zero-turn, read-only launch does not prove full host instruction
+isolation. If the host is known to activate candidate controls automatically
+and they cannot be suppressed, use the fresh neutral-root CLI adapter instead.
+A complete host instruction-source receipt is not required, and unobservable
+instruction telemetry alone is not a failure; trusted personal configuration
+and global guidance are allowed. The selected adapter's requested model and
+mode must still be supported by the effective-profile evidence above. An
+observed candidate-control injection or override of trusted parent
+instructions, an incomplete or mismatched subject inventory, or invalid or
+mismatched candidate admission makes that attempt inconclusive even when its
+terminal text is `No findings.`.
 
 ## Claude Code Contract
 

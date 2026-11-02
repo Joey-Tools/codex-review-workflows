@@ -577,57 +577,58 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("gpt-6.1-sol", normalized)
             self.assertIn("medium", normalized)
             self.assertIn("internal delegation", normalized)
-        self.assertIn("Neither adapter has a standing priority", local)
+        self.assertIn("Prefer a clean-context subagent", local)
+        self.assertIn("when a subagent is unavailable", local)
         self.assertIn('fork_turns="none"', local)
-        self.assertIn("new, non-resumed Codex review process", local)
-        for cli_control in (
-            "--ephemeral",
-            "--ignore-user-config",
-            "--strict-config",
-            "-s read-only",
-            "-m gpt-6.1-sol",
-            'model_reasoning_effort="medium"',
-            "-C <absolute-validated-workspace>",
-            "exact UTF-8 prompt bytes",
-            "stdin descriptor",
-            "prompt byte length and SHA-256 digest",
-            "general `exec -`",
-            "hashed-file-redirection",
-            "never embed prompt content in the command",
-            "interactive PTY injection",
+        subagent = local.split("### Subagent adapter", 1)[1].split(
+            "### CLI adapter", 1
+        )[0]
+        for subagent_control in (
+            "generic child is also eligible",
+            "same zero-context and read-only constraints",
+            "do not reject it by role name",
+            "zero-inherited-context equivalent",
+            "read-only sandbox",
         ):
-            self.assertIn(cli_control, local)
+            self.assertIn(subagent_control, subagent)
         self.assertIn(
-            "specialized `review --base` surface rejects a positional custom prompt",
-            local,
+            "use a fresh non-resumed cli process when a subagent is unavailable",
+            _normalize(local),
         )
-        self.assertIn(
-            "does not provide a receipt proving that an stdin prompt was preserved",
-            local,
-        )
+        self.assertIn("Use the normal authenticated Codex account", local)
+        self.assertIn("ordinary user `CODEX_HOME`", local)
+        self.assertIn("Never copy credentials", local)
+        self.assertIn("create a temporary `CODEX_HOME`", local)
+        self.assertIn("neutral, empty launch directory", local)
+        self.assertIn("outside the candidate and source checkout", local)
+        self.assertIn("read-only sandbox", local)
+        self.assertIn("--skip-git-repo-check", local)
+        self.assertIn("exact parent-owned `sanitized_git_argv_prefix`", local)
+        self.assertIn("exact prompt UTF-8 bytes", local)
+        self.assertIn("initial-prompt", local)
+        self.assertIn("missing telemetry or a complete host receipt alone is not a", local)
+        self.assertIn("failure", _normalize(local))
+        for prompt_transport_control in (
+            "`direct-stdin` or `hashed-file-redirection`",
+            "single fixed `< <absolute-parent-owned-prompt-file>` redirection",
+            "object identity, byte length, and SHA-256 are checked before launch",
+            "revalidated after process exit",
+            "Use a resolved shell and literal absolute paths",
+            "Never put\nprompt bytes in the command, use a pipeline, heredoc, command substitution,\nenvironment expansion, or interactive PTY injection",
+            "Do not\nuse timestamps or directory-entry churn as mutation evidence",
+        ):
+            self.assertIn(_normalize(prompt_transport_control), _normalize(local))
         self.assertIn(
             "A runtime's default review prompt or range selector never substitutes for this control prompt",
             contracts,
         )
         self.assertIn(
-            "use general `codex exec -` with exact prompt bytes on stdin",
+            "adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>",
             _read("references/review-prompt-templates.md"),
         )
-        cli_argv = local.split("normalized direct-argv shape is:", 1)[1].split(
-            "```", 2
-        )[1]
-        self.assertIn("--json\n  -", cli_argv)
-        self.assertNotIn("\n  review\n", cli_argv)
-        self.assertNotIn("--base", cli_argv)
-        self.assertIn("does not by itself suppress global `AGENTS.md`", local)
         self.assertIn(
-            "Any unallowlisted external model/tool read invalidates the attempt", local
+            "observed candidate-control injection", local
         )
-        self.assertIn("record the effective value as `unknown`", local)
-        self.assertIn("An observed mismatch or downgrade is inconclusive", local)
-        self.assertIn("PTY bulk writes can drop or transform bytes", local)
-        self.assertIn("SHA-256 digest before and after launch", local)
-        self.assertIn("requested and effective model and Codex mode", local)
         self.assertIn("using both does not create extra consent", consent)
         self.assertNotIn("sole lane that satisfies", _normalize(skill + local))
 
