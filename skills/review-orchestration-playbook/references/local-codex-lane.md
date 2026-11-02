@@ -172,6 +172,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   below. The trusted prompt and sanitized Git prefix target the validated
   workspace. Never reuse a parent or earlier reviewer session.
 - Deliver the complete parent-constructed control metadata and shared review prompt through the CLI's initial-prompt channel. Do not assume a specialized review subcommand accepts, preserves, or combines a custom prompt with its range selector.
+- Use the general `codex exec --json -` entrypoint so the parent can classify the structured terminal event; capability-check that this CLI supports both `--json` and `-` for stdin before launch. If either is unavailable, use a verified peer adapter or classify the CLI launch inconclusive.
 - Include the same exact parent-owned `sanitized_git_argv_prefix` token array,
   exact-sequence conformance and digest used by the subagent adapter. The CLI
   process `-C` selects its
@@ -183,8 +184,8 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Explicitly bind the intended model/mode, read-only sandbox, workspace, and fresh-session controls.
 - Use the normal authenticated Codex account and user configuration. Shared
   user configuration and global guidance belong to the trusted personal
-  environment; do not copy credentials, create a temporary `CODEX_HOME`, or
-  require account-level isolation.
+  environment; do not use `--ignore-user-config`; do not copy credentials,
+  create a temporary `CODEX_HOME`, or require account-level isolation.
 - Never use the candidate workspace as a CLI launch root. Launch from an
   empty, owner-private neutral directory outside the candidate and source
   checkout, use `--skip-git-repo-check`, and target the validated workspace only
@@ -280,7 +281,8 @@ the absence of every host-level instruction surface.
 
 Keep all Codex arguments literal. Prefer writing the exact prompt UTF-8 bytes
 directly to the child's stdin descriptor, then close it; on the current `exec`
-surface, use `-` for stdin. If the orchestrator exposes only a shell command
+surface, use `codex exec --json -`; capability-check support for `--json` and
+`-` for stdin. If the orchestrator exposes only a shell command
 interface, a single fixed `< <absolute-parent-owned-prompt-file>` redirection
 is also valid when the prompt file is a regular UTF-8 file and its object
 identity, byte length, and SHA-256 are checked before launch and revalidated

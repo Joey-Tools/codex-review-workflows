@@ -598,7 +598,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Use the normal authenticated Codex account", local)
         self.assertIn("ordinary user `CODEX_HOME`", local)
         self.assertIn("Never copy credentials", local)
-        self.assertIn("create a temporary `CODEX_HOME`", local)
+        self.assertIn("create a temporary `codex_home`", _normalize(local))
         self.assertIn("neutral, empty launch directory", local)
         self.assertIn("outside the candidate and source checkout", local)
         self.assertIn("read-only sandbox", local)
@@ -626,6 +626,15 @@ class RepositoryContractTest(unittest.TestCase):
             "adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>",
             _read("references/review-prompt-templates.md"),
         )
+        self.assertIn(
+            "general `codex exec --json -`",
+            _read("references/review-prompt-templates.md"),
+        )
+        self.assertIn(
+            "capability-check support for `--json` and `-`",
+            _normalize(local),
+        )
+        self.assertIn("do not use `--ignore-user-config`", local)
         self.assertIn(
             "observed candidate-control injection", local
         )

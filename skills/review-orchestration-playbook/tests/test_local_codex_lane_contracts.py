@@ -2412,9 +2412,47 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "exact parent/prompt/report identity equality", _normalized(templates)
         )
         self.assertIn(
-            "records successful prelaunch and postlaunch checks of root identity",
+            "requires exact parent/prompt/report identity equality and records the result in Parent Classification",
             _normalized(contracts),
         )
+        for required in (
+            "subagent_context: <zero-inherited-turns | inherited-turns | unknown | not-applicable>",
+            "subagent_execution: <read-only | writable | unknown | not-applicable>",
+            "subagent_launch_evidence: <host-accepted-launch | runtime-attested | unknown | not-applicable>",
+            "neutral_launch_root_receipt_match: <exact-type-preserving | invalid | unknown | not-applicable>",
+            "neutral_launch_root_prelaunch_validation: <passed | failed | unknown | not-applicable>",
+            "neutral_launch_root_postlaunch_validation: <passed | failed | unknown | not-applicable>",
+        ):
+            self.assertIn(required, templates)
+        self.assertIn(
+            "requested_subagent_context: <zero-inherited-turns | not-applicable>",
+            templates,
+        )
+        self.assertIn(
+            "requested_subagent_execution: <read-only | not-applicable>",
+            templates,
+        )
+
+    def test_actual_adapter_boundaries_and_neutral_root_checks_gate_clean(self) -> None:
+        templates = _read("review-prompt-templates.md")
+        parent_classification = templates.split("## Parent Classification", 1)[1]
+        normalized = _normalized(parent_classification)
+
+        for required in (
+            "requires `subagent_context: zero-inherited-turns`",
+            "`subagent_execution: read-only`",
+            "`subagent_launch_evidence` equal to `host-accepted-launch` or `runtime-attested`",
+            "Missing fields, `unknown`, `inherited-turns`, `writable`, or other invalid evidence makes the lane inconclusive",
+            "For CLI and Claude adapters, all three subagent fields are `not-applicable`",
+            "`git_read_only_boundary` proves only the sanitized Git prefix boundary",
+            "a missing complete host instruction-source receipt alone is not a failure",
+            "requires the identity to be non-`not-applicable`",
+            "`neutral_launch_root_receipt_match: exact-type-preserving`",
+            "both neutral root validation fields to be `passed`",
+            "Missing fields, `unknown`, `invalid`, `failed`, or mismatched identities makes the lane inconclusive",
+            "For every non-CLI adapter, the identity match and both validation fields are `not-applicable`",
+        ):
+            self.assertIn(required, normalized)
 
     def test_self_policy_candidate_agents_has_closed_scoped_guidance_admission(
         self,

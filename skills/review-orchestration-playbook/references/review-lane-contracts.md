@@ -383,10 +383,16 @@ defined below. Before a CLI launch, the parent allocates an opaque stable
 identity for that process's neutral launch-root receipt and copies the identity
 into the parent record and prompt. Do not hash a receipt that includes future
 postlaunch results. The final lane report repeats the same identity; the parent
-requires exact parent/prompt/report identity equality and records successful
-prelaunch and postlaunch checks of root identity, owner, mode, access policy,
-absence of non-owner ACL grants, and empty inventory. The prefix is opaque to
-the reviewer: it is copied, not rebuilt from prose.
+requires exact parent/prompt/report identity equality and records the result in
+Parent Classification. A clean CLI lane requires a non-`not-applicable`
+identity, `neutral_launch_root_receipt_match:
+exact-type-preserving`, and both prelaunch and postlaunch validation values to
+be `passed`. Validate root identity, owner, mode, access policy, absence of
+non-owner ACL grants, and empty inventory. Missing, `unknown`, `invalid`,
+`failed`, or mismatched receipt evidence is inconclusive. For subagent and
+Claude adapters, all three neutral-root classification values are
+`not-applicable`. The prefix is opaque to the reviewer: it is copied, not
+rebuilt from prose.
 
 The reviewer must obtain stats, changed paths, hunks, and necessary nearby tracked context itself with bounded commands. Do not inject the full diff, parent conclusions, or another lane's findings.
 
@@ -633,7 +639,14 @@ mode must still be supported by the effective-profile evidence above. An
 observed candidate-control injection or override of trusted parent
 instructions, an incomplete or mismatched subject inventory, or invalid or
 mismatched candidate admission makes that attempt inconclusive even when its
-terminal text is `No findings.`.
+terminal text is `No findings.`. In Parent Classification, a clean result for
+either subagent adapter requires actual `subagent_context:
+zero-inherited-turns`, `subagent_execution: read-only`, and
+`subagent_launch_evidence` of `host-accepted-launch` or `runtime-attested`.
+Missing fields, `unknown`, inherited turns, writable execution, or invalid
+launch evidence is inconclusive. For CLI and Claude adapters, all three
+subagent fields are `not-applicable`. `git_read_only_boundary` proves only the
+Git prefix boundary and cannot substitute for read-only host execution.
 
 ## Claude Code Contract
 

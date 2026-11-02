@@ -68,6 +68,8 @@ adapter: <reviewer-subagent | generic-subagent | codex-cli | claude-code>
 requested_profile: <adapter-specific model/profile>
 effective_profile: <observed adapter-specific profile, or pending until init>
 effective_profile_basis: <runtime-attested | accepted-pinned-launch | unknown | mismatch>
+requested_subagent_context: <zero-inherited-turns | not-applicable>
+requested_subagent_execution: <read-only | not-applicable>
 neutral_launch_root: <absolute parent-owned path | not-applicable>
 neutral_launch_root_receipt: <preallocated opaque stable identity | not-applicable>
 codex_git:
@@ -115,6 +117,11 @@ focus:
 non_goals:
   - <optional explicitly excluded work>
 ```
+
+The `requested_subagent_*` fields record launch intent in shared metadata: use
+`zero-inherited-turns` and `read-only` for either subagent adapter, and
+`not-applicable` for CLI and Claude adapters. They do not claim those controls
+were realized.
 
 Use `reviewer-subagent` for the dedicated reviewer role and `generic-subagent`
 for a generic child assigned read-only review. Preserve that exact adapter value
@@ -605,7 +612,7 @@ exactly:
 No findings.
 ```
 
-For a subagent adapter, launch the selected adapter recorded above with zero inherited turns: use the installed `reviewer` role for `reviewer-subagent`, or the generic child for `generic-subagent`. Both launches must use the same clean-context and read-only boundaries. For the CLI adapter, start a new non-resumed process and deliver this complete prompt through the capability-proven initial-prompt channel. On the current CLI, use general `codex exec -` with exact prompt bytes on stdin; do not use `review --base` because that surface cannot prove preservation of this custom prompt. Use direct stdin or a fixed hash-verified parent-owned prompt file as defined by the local-lane contract, never interactive PTY injection. For both adapters, preserve the same exact prefix array and digest in the delivered prompt, establish the required read-only adapter boundary, and retain whatever Git-argv telemetry the runtime actually exposes. Record the prompt transport, byte length, and SHA-256 digest. The transport does not change lane identity.
+For a subagent adapter, launch the selected adapter recorded above with zero inherited turns: use the installed `reviewer` role for `reviewer-subagent`, or the generic child for `generic-subagent`. Both launches must use the same clean-context and read-only boundaries. For the CLI adapter, start a new non-resumed process and deliver this complete prompt through the capability-proven initial-prompt channel. On the current CLI, use general `codex exec --json -` with exact prompt bytes on stdin; the capability check must confirm `--json` and `-` stdin support. Do not use `review --base` because that surface cannot prove preservation of this custom prompt. Use direct stdin or a fixed hash-verified parent-owned prompt file as defined by the local-lane contract, never interactive PTY injection. For both adapters, preserve the same exact prefix array and digest in the delivered prompt, establish the required read-only adapter boundary, and retain whatever Git-argv telemetry the runtime actually exposes. Record the prompt transport, byte length, and SHA-256 digest. The transport does not change lane identity.
 
 ## Claude Code Prompt
 
@@ -896,7 +903,13 @@ effective_model: <runtime-attested or accepted-pinned-launch value, or unknown>
 requested_codex_mode: <value or not-applicable>
 effective_codex_mode: <runtime-attested or accepted-pinned-launch value, unknown, or not-applicable>
 effective_profile_basis: <runtime-attested | accepted-pinned-launch | unknown | mismatch | not-applicable>
+subagent_context: <zero-inherited-turns | inherited-turns | unknown | not-applicable>
+subagent_execution: <read-only | writable | unknown | not-applicable>
+subagent_launch_evidence: <host-accepted-launch | runtime-attested | unknown | not-applicable>
 neutral_launch_root_receipt: <stable receipt identity | not-applicable>
+neutral_launch_root_receipt_match: <exact-type-preserving | invalid | unknown | not-applicable>
+neutral_launch_root_prelaunch_validation: <passed | failed | unknown | not-applicable>
+neutral_launch_root_postlaunch_validation: <passed | failed | unknown | not-applicable>
 candidate_projection_encoding: <canonical-json-utf8-v1>
 candidate_projection_encoding_parent_prompt_match: <exact-type-preserving | invalid>
 candidate_projection_encoding_parent_prompt_report_match: <exact-type-preserving | invalid>
@@ -950,6 +963,28 @@ result: <clean | findings | blocked-* | inconclusive>
 cleanup: <complete | already-absent | retained | not-applicable>
 ```
 
+The parent derives actual subagent fields by verifying that the host accepted
+`fork_turns="none"` and a read-only launch, together with available runtime
+evidence. A clean result for either subagent adapter requires
+`subagent_context: zero-inherited-turns`,
+`subagent_execution: read-only`, and `subagent_launch_evidence` equal to
+`host-accepted-launch` or `runtime-attested`. Missing fields, `unknown`,
+`inherited-turns`, `writable`, or other invalid evidence makes the lane
+inconclusive. For CLI and Claude adapters, all three subagent fields are
+`not-applicable`. `git_read_only_boundary` proves only the sanitized Git
+prefix boundary; it does not prove a host read-only subagent launch. Trusted
+personal configuration and global guidance remain allowed, and a missing
+complete host instruction-source receipt alone is not a failure.
+
+For CLI lanes, the parent allocates `neutral_launch_root_receipt` before
+launch, then the final report repeats that identity. A clean result requires
+the identity to be non-`not-applicable`,
+`neutral_launch_root_receipt_match: exact-type-preserving`, and both neutral
+root validation fields to be `passed`. Missing fields, `unknown`, `invalid`,
+`failed`, or mismatched identities makes the lane inconclusive. For every
+non-CLI adapter, the identity match and both validation fields are
+`not-applicable`.
+
 The classifier accepts a route only when `self_policy_migration` is an exact
 boolean, the parent and prompt copies were type-preservingly equal before
 launch, the report repeats that same boolean after termination, and both
@@ -1001,8 +1036,8 @@ deviation.
 For every CLI lane, require exact parent/prompt/report identity equality and
 record successful prelaunch and postlaunch validation of the root's identity,
 owner, mode, access policy, absence of non-owner ACL grants, and empty
-inventory. The lane report must state that both checks completed. Use the
-normal authenticated Codex account and user
+inventory in the corresponding classification fields. The lane report must
+state that both checks completed. Use the normal authenticated Codex account and user
 configuration; do not copy credentials or create a temporary auth home. Shared
 user configuration and global guidance belong to the trusted personal
 environment. Do not require a complete host instruction-source receipt or
