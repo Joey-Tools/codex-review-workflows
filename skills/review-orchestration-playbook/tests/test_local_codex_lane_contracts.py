@@ -3794,7 +3794,6 @@ class LocalCodexLaneContractTest(unittest.TestCase):
     def test_cli_route_predicates_are_consistent_across_references(self) -> None:
         local = _read("local-codex-lane.md")
         contracts = _read("review-lane-contracts.md")
-        templates = _read("review-prompt-templates.md")
 
         route_sections = (
             local.split("## Peer Adapters", 1)[1].split("### Subagent adapter", 1)[0],

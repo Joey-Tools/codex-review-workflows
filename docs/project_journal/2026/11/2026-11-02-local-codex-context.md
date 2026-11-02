@@ -24,6 +24,7 @@ superseded_by:
 - The previous subagent contract required complete host instruction-surface receipts even for a zero-inherited-context launch, making the simpler adapter unavailable on hosts without that telemetry.
 - The repository-wide and local Codex lane contract suites run 73 tests with 2 skips and no failures, covering generic-subagent launch/evidence, normal-home fallback, prompt transport, final launch-boundary classification, process-local tool restrictions, and parent-only adapter routing.
 - Skill metadata validation, reviewer TOML parsing, and `git diff --check` pass.
+- Downstream lint validation exposed an unused template read in the new route-consistency test. Remove that unused local while preserving every route assertion; both contract modules pass Ruff and the same 73-test selection with 2 skips.
 - Fresh conversation context is distinct from complete host instruction-stack isolation. Known forced candidate controls require the normal-home, neutral-root CLI fallback.
 - Hashed-file prompt transport protects stable file identity and exact bytes without imposing account isolation; neutral-root launch receipts use a stable identity across prelaunch and postlaunch evidence.
 - Final lane records expose the actual subagent context/execution/evidence and neutral-root match/pre/post results. The CLI requests JSONL events explicitly with `codex exec --json -`.
