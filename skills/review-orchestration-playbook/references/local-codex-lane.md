@@ -173,6 +173,25 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   workspace. Never reuse a parent or earlier reviewer session.
 - Deliver the complete parent-constructed control metadata and shared review prompt through the CLI's initial-prompt channel. Do not assume a specialized review subcommand accepts, preserves, or combines a custom prompt with its range selector.
 - Use the general `codex exec --json -` entrypoint so the parent can classify the structured terminal event; capability-check that this CLI supports both `--json` and `-` for stdin before launch. If either is unavailable, use a verified peer adapter or classify the CLI launch inconclusive.
+- Submit this literal argv shape, replacing the executable path, model, effort, and neutral-root path with this launch's resolved or selected values:
+
+  ```json
+  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.hooks=false", "-c", "notify=[]", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
+  ```
+
+  Record the resolved executable, exact version output, and complete literal
+  submitted token array in shared metadata; the final report repeats the actual
+  values and requires exact match. Defaults remain `gpt-6.1-sol` and
+  model-default reasoning (`medium`); record any separately authorized
+  override exactly as selected. The `-c` values disable Codex hooks and legacy
+  notification commands for this review process only, as documented in the
+  [Codex config reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+  Do not alter global configuration or use `--ignore-user-config`. If a higher-priority managed
+  policy rejects or overrides either setting, classify the launch as blocked
+  or inconclusive; do not bypass that policy or create another configuration
+  home. An observed callback has the same blocked/inconclusive outcome.
+  `-a never` is the noninteractive approval policy; it leaves the normal
+  authenticated Codex account and user configuration in use.
 - Include the same exact parent-owned `sanitized_git_argv_prefix` token array,
   exact-sequence conformance and digest used by the subagent adapter. The CLI
   process `-C` selects its
@@ -301,7 +320,8 @@ preserve the full prompt, frozen range, neutral launch root, and read-only
 boundary.
 
 The CLI lane record binds the resolved binary and version, actual launch type,
-requested and effective model and reasoning, prompt transport
+the complete literal argv submitted at launch and its exact match to the
+parent/prompt/report record, requested and effective model and reasoning, prompt transport
 (`direct-stdin` or `hashed-file-redirection`), prompt byte length and SHA-256,
 plus prompt-file object identity, byte length, and SHA-256 before and after
 when file redirection is used,
@@ -316,14 +336,31 @@ Use this effective-profile outcome matrix for both peer adapters:
 | Evidence basis | Effective values | May a clean terminal result count? |
 | --- | --- | --- |
 | `runtime-attested` exact match | Attested model and mode | Yes, if every other lane gate passes. |
-| `accepted-pinned-launch` with no contradictory telemetry | Requested pinned model and mode | Yes, if every other lane gate passes. |
+| `accepted-pinned-launch` with no contradictory telemetry | Requested model and mode proved by the exact accepted launch | Yes, if every other lane gate passes. |
 | `unknown` | `unknown` for every unproved field | No; the lane is `inconclusive`. |
 | `mismatch` | Observed substituted or downgraded values | No; the lane is `inconclusive`. |
 
-For the CLI, `accepted-pinned-launch` requires a fresh non-resumed process,
-requested model and reasoning, a read-only sandbox, a validated neutral launch
-root, zero process status, a complete structured terminal event, and no error,
-substitution, or downgrade signal. For a subagent, it requires an accepted
+For every CLI clean result, require the resolved binary/version and complete
+literal submitted argv to match the parent/prompt/report record exactly. Use
+the full argv specified under the CLI adapter, including selected model and
+reasoning, noninteractive approval policy `-a never`, the neutral root,
+process-local hook/notification suppression, the read-only sandbox, skipped
+repository check, and structured JSON stdin. An observed managed-policy
+conflict, rejected setting, or callback blocks or makes the attempt
+inconclusive; do not bypass policy. A configuration file or requested profile
+alone is intent, not argv evidence.
+
+For the CLI, `accepted-pinned-launch` additionally requires the actual
+`codex_cli_argv`, resolved executable, and exact version output in Parent
+Classification to match the parent/prompt/report record exactly. Verify that
+the accepted argv pins the selected model and quoted reasoning value and
+contains every required approval, neutral-root, process-local hook/notify,
+read-only sandbox, repository-check, and structured-JSON control shown above.
+It must be a fresh non-resumed process with a validated neutral launch root,
+zero process status, a complete structured terminal event, and no error,
+substitution, downgrade, or callback signal. Missing required argv tokens,
+unknown argv/version evidence, or any mismatch is inconclusive. For a subagent,
+it requires an accepted
 launch, its recorded launch type, zero inherited turns, a read-only workspace,
 the requested model and reasoning, and no contradictory host telemetry. A
 complete host instruction-source receipt is not required. If the runtime

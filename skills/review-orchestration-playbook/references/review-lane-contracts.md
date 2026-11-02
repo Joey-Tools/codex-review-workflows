@@ -598,6 +598,10 @@ Read [local-codex-lane.md](local-codex-lane.md).
 - The CLI fallback is a fresh non-resumed process using the ordinary user
   `CODEX_HOME`. Use the normal authenticated Codex account and user
   configuration; do not copy credentials or create a temporary auth home.
+  Launch it with the exact versioned argv specified in
+  [Local Codex](local-codex-lane.md), including process-local
+  `features.hooks=false` and `notify=[]`; do not alter global configuration or
+  bypass a higher-priority managed policy.
   Preserve the neutral launch root and its short pre/post identity, owner, mode,
   access-policy, ACL-grant, and empty-inventory evidence. Trusted personal
   configuration and global guidance are allowed; candidate project controls
@@ -626,6 +630,23 @@ this records the generic adapter and does not claim that a dedicated reviewer
 role was used. None of these accepted launches attests provider backend aliases,
 routing, or weights. `unknown` and `mismatch` are always inconclusive; a clean
 sentinel never repairs either state.
+
+For every CLI clean result, require the resolved Codex executable and exact
+version plus the actual submitted argv copied into the final report and
+matched exactly to the parent-owned prelaunch record and prompt. The argv must
+include every required selected-profile, noninteractive approval-policy, neutral-root, process-local
+hook/notification, read-only sandbox, repository-check, and JSON-stdin control
+specified in [Local Codex](local-codex-lane.md), and that binary version must
+accept the complete invocation. Record `codex_cli_launch_match:
+exact-type-preserving`; for non-CLI adapters, all CLI fields including this
+match are `not-applicable`. A CLI `accepted-pinned-launch` additionally
+requires that the requested model/reasoning were pinned by the accepted argv
+and that the full review finished with a structured terminal event and zero
+exit status. No CLI clean result may contain a contrary error, substitution,
+downgrade, or callback signal. Missing or unknown version/argv evidence, any
+missing required flag, a mismatch, or a managed-policy conflict is
+inconclusive or blocked; never treat the requested profile alone as effective
+evidence. These controls do not attest backend aliases, routing, or weights.
 
 For a subagent, the clean-context launch and read-only workspace are required;
 the installed reviewer role is preferred, while a generic child remains

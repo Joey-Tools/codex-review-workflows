@@ -2454,6 +2454,64 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         ):
             self.assertIn(required, normalized)
 
+    def test_cli_accepted_pinned_profile_requires_versioned_literal_argv(self) -> None:
+        local = _read("local-codex-lane.md")
+        contracts = _read("review-lane-contracts.md")
+        templates = _read("review-prompt-templates.md")
+        parent_classification = templates.split("## Parent Classification", 1)[1]
+        normalized_classification = _normalized(parent_classification)
+        normalized_templates = _normalized(templates)
+
+        invocation = local.split("Submit this literal argv shape", 1)[1]
+        argv = json.loads(invocation.split("```json", 1)[1].split("```", 1)[0])
+
+        def has_pair(left: str, right: str) -> bool:
+            return any(
+                argv[index : index + 2] == [left, right]
+                for index in range(len(argv) - 1)
+            )
+
+        for pair in (
+            ("-a", "never"),
+            ("-m", "selected_model"),
+            ("-c", 'model_reasoning_effort="selected_effort"'),
+            ("-C", "/absolute/neutral-root"),
+            ("-c", "features.hooks=false"),
+            ("-c", "notify=[]"),
+            ("--sandbox", "read-only"),
+        ):
+            self.assertTrue(has_pair(*pair), pair)
+        for required_token in (
+            "exec",
+            "--skip-git-repo-check",
+            "--json",
+            "-",
+        ):
+            self.assertIn(required_token, argv)
+
+        for required in (
+            "codex_cli_version: <exact version output | not-applicable>",
+            "codex_cli_executable: <resolved absolute executable path | not-applicable>",
+            "codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>",
+            "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
+            "Every clean CLI result, including a `runtime-attested` result, also requires",
+            "For CLI lanes, shared metadata records the resolved binary, exact version output, and literal argv submitted at launch",
+            "only when all three exactly match the prelaunch prompt record",
+            "Missing or unknown argv/version evidence, a missing required flag, or any mismatch is inconclusive",
+        ):
+            self.assertIn(required, normalized_templates)
+        self.assertIn(
+            "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
+            normalized_classification,
+        )
+        self.assertIn("features.hooks=false", argv)
+        self.assertIn("notify=[]", argv)
+        self.assertIn("Do not alter global configuration", _normalized(local))
+        self.assertIn("managed-policy conflict", _normalized(contracts))
+        self.assertIn("For a generic subagent", contracts)
+        self.assertIn("do not use `--ignore-user-config`", local)
+        self.assertIn("create a temporary `CODEX_HOME`", _normalized(local))
+
     def test_self_policy_candidate_agents_has_closed_scoped_guidance_admission(
         self,
     ) -> None:
@@ -3667,7 +3725,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             matrix,
         )
         self.assertIn(
-            "| `accepted-pinned-launch` with no contradictory telemetry | Requested pinned model and mode | Yes",
+            "| `accepted-pinned-launch` with no contradictory telemetry | Requested model and mode proved by the exact accepted launch | Yes",
             matrix,
         )
         self.assertIn(

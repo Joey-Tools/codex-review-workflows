@@ -70,6 +70,9 @@ effective_profile: <observed adapter-specific profile, or pending until init>
 effective_profile_basis: <runtime-attested | accepted-pinned-launch | unknown | mismatch>
 requested_subagent_context: <zero-inherited-turns | not-applicable>
 requested_subagent_execution: <read-only | not-applicable>
+codex_cli_version: <exact version output | not-applicable>
+codex_cli_executable: <resolved absolute executable path | not-applicable>
+codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>
 neutral_launch_root: <absolute parent-owned path | not-applicable>
 neutral_launch_root_receipt: <preallocated opaque stable identity | not-applicable>
 codex_git:
@@ -903,6 +906,10 @@ effective_model: <runtime-attested or accepted-pinned-launch value, or unknown>
 requested_codex_mode: <value or not-applicable>
 effective_codex_mode: <runtime-attested or accepted-pinned-launch value, unknown, or not-applicable>
 effective_profile_basis: <runtime-attested | accepted-pinned-launch | unknown | mismatch | not-applicable>
+codex_cli_version: <exact version output | not-applicable>
+codex_cli_executable: <resolved absolute executable path | not-applicable>
+codex_cli_argv: <exact literal UTF-8 JSON token array | not-applicable>
+codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>
 subagent_context: <zero-inherited-turns | inherited-turns | unknown | not-applicable>
 subagent_execution: <read-only | writable | unknown | not-applicable>
 subagent_launch_evidence: <host-accepted-launch | runtime-attested | unknown | not-applicable>
@@ -976,6 +983,12 @@ prefix boundary; it does not prove a host read-only subagent launch. Trusted
 personal configuration and global guidance remain allowed, and a missing
 complete host instruction-source receipt alone is not a failure.
 
+For CLI lanes, shared metadata records the resolved binary, exact version
+output, and literal argv submitted at launch. The parent-owned final report
+repeats those actual values and sets `codex_cli_launch_match` to
+`exact-type-preserving` only when all three exactly match the prelaunch prompt
+record. For non-CLI adapters, these four CLI fields are `not-applicable`.
+
 For CLI lanes, the parent allocates `neutral_launch_root_receipt` before
 launch, then the final report repeats that identity. A clean result requires
 the identity to be non-`not-applicable`,
@@ -984,6 +997,16 @@ root validation fields to be `passed`. Missing fields, `unknown`, `invalid`,
 `failed`, or mismatched identities makes the lane inconclusive. For every
 non-CLI adapter, the identity match and both validation fields are
 `not-applicable`.
+
+Every clean CLI result, including a `runtime-attested` result, also requires
+the resolved executable, exact version, and complete submitted argv to match
+the prelaunch shared metadata and final report exactly. The argv must contain
+all controls in the Local Codex example, including model/reasoning, noninteractive approval policy `-a never`,
+neutral root, process-local hook/notification suppression, read-only sandbox,
+repository-check skip, and JSON stdin. A managed-policy conflict, rejected
+setting, or observed callback is blocked or inconclusive. Do not bypass a
+managed policy. Missing required argv tokens, unknown or mismatched argv/version
+evidence, or any mismatch is inconclusive for every CLI clean result.
 
 The classifier accepts a route only when `self_policy_migration` is an exact
 boolean, the parent and prompt copies were type-preservingly equal before
@@ -1008,6 +1031,16 @@ support clean; `unknown` and `mismatch` are always inconclusive. A qualifying
 accepted pinned launch records the requested pinned model/mode as the
 execution-level effective values, while explicitly not claiming
 provider-authenticated backend alias, routing, or weight identity.
+
+For a CLI `accepted-pinned-launch`, additionally require that the actual
+`codex_cli_argv`, resolved executable, and exact version output in Parent
+Classification match the prelaunch shared metadata and final report exactly.
+The selected model and quoted reasoning controls must be accepted by that
+binary version; the full review must complete with a structured terminal event
+and zero exit status, with no contrary error, substitution, downgrade, or
+callback signal. Missing or unknown argv/version evidence, a missing required
+flag, or any mismatch is inconclusive. This is execution-level evidence, not
+backend-weight attestation.
 
 For a Codex lane, `sanitized_git_argv_prefix_conformance` must be
 `exact-token-sequence`, `git_prefix_delivery` must be `verified`, and
