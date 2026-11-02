@@ -186,7 +186,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 - Submit this literal argv shape, replacing the executable path, model, effort, and neutral-root path with this launch's resolved or selected values:
 
   ```json
-  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.image_generation=false", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
+  ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "memories.generate_memories=false", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
   ```
 
   Resolve all MCP server names from the user's effective configuration at the
@@ -208,7 +208,8 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   values and requires exact match. Defaults remain `gpt-6.1-sol` and
   model-default reasoning (`medium`); record any separately authorized
   override exactly as selected. The `-c` values disable Apps, plugins,
-  computer use, browser use, image generation, hooks, legacy notification
+  computer use, browser use, image generation, persisted goals, automatic MCP
+  dependency installation, nested agent launches, hooks, legacy notification
   commands, and every configured MCP server for this review process only, as documented in the
   [Codex config reference](https://learn.chatgpt.com/docs/config-file/config-reference).
   Do not alter global configuration or use `--ignore-user-config`. If a higher-priority managed
@@ -216,7 +217,8 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   or inconclusive; do not bypass that policy or create another configuration
   home. Under the same normal configuration, neutral root, and exact final
   feature/MCP overrides, verify `features list` reports `apps`, `plugins`,
-  `computer_use`, `browser_use`, `image_generation`, and `hooks` all false,
+  `computer_use`, `browser_use`, `image_generation`, `goals`,
+  `skill_mcp_dependency_install`, `multi_agent`, and `hooks` all false,
   and `mcp list --json` reports every configured server disabled with zero
   enabled servers. Retain only minimal local preflight evidence (feature states
   and MCP names/counts/enabled count); set
@@ -224,6 +226,13 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   pass. If either check is unknown or fails, or any external write tool
   remains enabled, classify the attempt as inconclusive.
   An observed callback has the same blocked/inconclusive outcome.
+  Disabling goals also removes persisted-goal mutations and automatic
+  continuation from this report-only process.
+  The CLI fallback disables nested agent launches so its restrictions stay
+  within one process. `memories.generate_memories=false` excludes this new
+  review thread from future memory-generation inputs; leave
+  `memories.use_memories` at its normal user setting to preserve trusted
+  personal context. This does not change existing memories or global settings.
   `-a never` is the noninteractive approval policy; it leaves the normal
   authenticated Codex account and user configuration in use.
 - Include the same exact parent-owned `sanitized_git_argv_prefix` token array,

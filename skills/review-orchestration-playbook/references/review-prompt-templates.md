@@ -993,7 +993,7 @@ For CLI lanes, shared metadata records the resolved binary, exact version
 output, literal argv submitted at launch, and
 `codex_cli_external_tool_surface: verified-disabled` only after parent-owned
 local preflight evidence verifies the effective tool surface. Keep that small
-preflight record local to the parent: the six `features list` values and MCP
+preflight record local to the parent: the nine `features list` values and MCP
 names/counts/enabled count. Do not add a second receipt schema or put server
 URLs, connection arguments, environment values, raw configuration, or
 credentials in the prompt or report. The parent-owned final report
@@ -1003,10 +1003,14 @@ record. For non-CLI adapters, these four CLI fields are `not-applicable`.
 
 The parent sets CLI `codex_cli_external_tool_surface` to `verified-disabled`
 only after the exact argv disables Apps, plugins, computer use, browser use,
-image generation, hooks, notifications, and every configured MCP server. At
+image generation, persisted goals, MCP dependency installation, nested agents,
+hooks, notifications, and every configured MCP server. The argv also pins
+`memories.generate_memories=false` for this new thread while leaving normal
+existing-memory reading unchanged. At
 the neutral root with the same normal user configuration and exact final
 overrides, `features list` must report `apps`, `plugins`, `computer_use`,
-`browser_use`, `image_generation`, and `hooks` all false, and `mcp list --json`
+`browser_use`, `image_generation`, `goals`, `skill_mcp_dependency_install`,
+`multi_agent`, and `hooks` all false, and `mcp list --json`
 must show all configured names disabled and zero enabled servers. Build one
 whole-table `mcp_servers` override with every effective
 server name set to `enabled=false`; an empty table does not prove inherited

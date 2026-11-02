@@ -608,7 +608,9 @@ Read [local-codex-lane.md](local-codex-lane.md).
   configuration; do not copy credentials or create a temporary auth home.
   Launch it with the exact versioned argv specified in
   [Local Codex](local-codex-lane.md), including process-local
-  feature/App/plugin/computer-use/browser/image-generation/hook disablement,
+  feature/App/plugin/computer-use/browser/image-generation/goal/hook disablement,
+  disabled MCP dependency installation and nested CLI agents, exclusion of this
+  thread from memory-generation inputs with existing memory reading unchanged,
   `notify=[]`, and a whole-table `mcp_servers` override disabling every
   configured server. Validate that no MCP server remains enabled with
   `mcp list --json`; do not alter global configuration or bypass a

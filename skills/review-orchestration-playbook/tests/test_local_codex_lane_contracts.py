@@ -2478,6 +2478,10 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             ("-c", "features.computer_use=false"),
             ("-c", "features.browser_use=false"),
             ("-c", "features.image_generation=false"),
+            ("-c", "features.goals=false"),
+            ("-c", "features.skill_mcp_dependency_install=false"),
+            ("-c", "features.multi_agent=false"),
+            ("-c", "memories.generate_memories=false"),
             ("-c", "features.hooks=false"),
             ("-c", "notify=[]"),
             ("--sandbox", "read-only"),
@@ -2499,7 +2503,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
             "Every clean CLI result, including a `runtime-attested` result, also requires",
             "For CLI lanes, shared metadata records the resolved binary, exact version output, literal argv submitted at launch, and `codex_cli_external_tool_surface: verified-disabled` only after parent-owned local preflight evidence verifies the effective tool surface",
-            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `image_generation`, and `hooks` all false",
+            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `image_generation`, `goals`, `skill_mcp_dependency_install`, `multi_agent`, and `hooks` all false",
             "Build one whole-table `mcp_servers` override",
             "only when all three exactly match the prelaunch prompt record",
             "Missing or unknown argv/version evidence, a missing required flag, or any mismatch is inconclusive",
@@ -2511,6 +2515,11 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         )
         self.assertIn("features.hooks=false", argv)
         self.assertIn("notify=[]", argv)
+        self.assertNotIn("features.memories=false", argv)
+        self.assertIn(
+            "leave `memories.use_memories` at its normal user setting",
+            _normalized(local),
+        )
         self.assertTrue(
             any(token.startswith('mcp_servers={"<configured-name-1>"=') for token in argv)
         )

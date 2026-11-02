@@ -29,6 +29,8 @@ superseded_by:
 - Final lane records expose the actual subagent context/execution/evidence and neutral-root match/pre/post results. The CLI requests JSONL events explicitly with `codex exec --json -`.
 - CLI accepted-pinned evidence binds the actual executable, version, and complete literal argv. Process-local feature, hook, notification, and MCP restrictions preserve report-only execution without changing the normal account or global configuration; effective metadata checks must confirm the restricted tool surface.
 - Dedicated and generic subagents share the same host-accepted fresh-launch evidence rule. A role-file digest is recorded when available; its absence alone does not reject a supported clean-context launch.
+- CLI reviews disable persisted goals and automatic continuation for that process, with the effective goal feature state included in the local metadata preflight.
+- The CLI also disables automatic MCP dependency installation and nested agent launches, and excludes the new review thread from memory-generation inputs while preserving the user's existing memory-reading setting.
 
 ## Next Steps
 
