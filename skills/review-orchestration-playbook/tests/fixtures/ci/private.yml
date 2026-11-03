@@ -319,7 +319,8 @@ jobs:
 
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
-    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-26"]') }}
+    # Keep hosted fingerprint, no-child regression, and broker byte proof intact.
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -331,7 +332,6 @@ jobs:
         run: |
           python3 -B -c 'import pathlib; paths = sorted(pathlib.Path("review_supervisor").rglob("*.py")); [compile(path.read_bytes(), str(path), "exec") for path in paths]'
       - name: Report hosted no-child runtime fingerprint
-        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
@@ -339,7 +339,6 @@ jobs:
           /usr/bin/uname -m
           /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
       - name: Match hosted no-child blocker signature
-        if: ${{ runner.environment == 'github-hosted' }}
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
@@ -367,23 +366,11 @@ jobs:
         if: always()
         timeout-minutes: 2
         env:
-          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-          DEVELOPER_DIR: ${{ runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer' || '' }}
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
         run: |
-          if [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
-            /bin/bash \
-              personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
-              --check
-          elif [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "self-hosted" ]]; then
-            DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"
-            export DEVELOPER_DIR
-            /bin/bash \
-              personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
-              --developer-check
-          else
-            echo "::error::Unsupported runner environment: $CODEX_REVIEW_RUNNER_ENVIRONMENT"
-            exit 1
-          fi
+          /bin/bash \
+            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+            --check
       - name: Require source-only Python tree
         if: always()
         run: |

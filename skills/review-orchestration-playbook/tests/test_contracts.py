@@ -373,6 +373,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("runs-on: ${{ matrix.os }}", workflow)
         hosted_exceptions = {
             "linux_isolation_tests": "ubuntu-latest",
+            "independent_supervisor_tests": "macos-26",
             "readonly_install_supervisor_tests": "macos-26",
         }
         for job_name, job in jobs.items():
@@ -405,10 +406,6 @@ class RepositoryContractTest(unittest.TestCase):
             "private_overlay_sync_tests": (
                 "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
                 '["macos-latest"]',
-            ),
-            "independent_supervisor_tests": (
-                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
-                '["macos-26"]',
             ),
             "private_overlay_tests": (
                 "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
@@ -444,23 +441,25 @@ class RepositoryContractTest(unittest.TestCase):
             "Report hosted no-child runtime fingerprint",
             "Match hosted no-child blocker signature",
         ):
-            self.assertIn("runner.environment == 'github-hosted'", steps[name])
+            self.assertNotIn("if:", steps[name])
+        self.assertIn(
+            "# Keep hosted fingerprint, no-child regression, and broker byte proof intact.",
+            independent,
+        )
+        self.assertNotIn("CODEX_PRIVATE_MACOS_RUNNER_LABELS", independent)
         deterministic = steps["Run deterministic independent supervisor tests"]
         self.assertNotIn("if:", deterministic)
         self.assertIn("tests.run_required_deterministic_supervisor", deterministic)
         broker = steps["Require hosted-runner byte reproduction"]
         self.assertIn("if: always()", broker)
         self.assertIn(
-            "runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer'",
+            "DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer",
             broker,
         )
-        self.assertIn('== "github-hosted"', broker)
-        self.assertIn('== "self-hosted"', broker)
         self.assertIn("--check", broker)
-        self.assertIn("xcode-select -p", broker)
-        self.assertIn("--developer-check", broker)
-        self.assertIn("Unsupported runner environment", broker)
-        self.assertIn("exit 1", broker)
+        self.assertNotIn("--developer-check", broker)
+        self.assertNotIn("xcode-select -p", broker)
+        self.assertNotIn("runner.environment", broker)
 
         readonly = jobs["readonly_install_supervisor_tests"]
         self.assertIn(

@@ -1,6 +1,6 @@
 # Private CI Runner Routing
 
-The private CI workflow fixture in this repository mirrors `codex-private-workflows` and is covered by its contract tests. Runner routing preserves the existing jobs, test modules, shards, and matrices while adapting provider-specific runtime setup. Two isolation jobs retain disposable GitHub-hosted runners.
+The private CI workflow fixture in this repository mirrors `codex-private-workflows` and is covered by its contract tests. Runner routing preserves the existing jobs, test modules, shards, and matrices while adapting provider-specific runtime setup. Three jobs retain GitHub-hosted runners for their hosted checks or disposable environments.
 
 ## Repository Variables
 
@@ -17,7 +17,7 @@ Runner registration is repository-only. The planned Linux pool has four instance
 
 ## Platform-Specific Checks
 
-- Hosted macOS fingerprint reporting and hosted-only no-child probes continue to run only on GitHub-hosted runners. Functional supervisor tests continue on both runner types; self-hosted macOS discovers Xcode with `xcode-select -p`.
+- `independent_supervisor_tests` stays on hosted `macos-26` so its fingerprint, hosted no-child regressions, and broker byte-reproduction check all remain covered.
 - `readonly_install_supervisor_tests` stays on hosted `macos-26`: failure and cancellation paths can retain local accounts and immutable root-owned trees until runner disposal.
 - `linux_isolation_tests` stays on hosted `ubuntu-latest` because it changes the global AppArmor user-namespace restriction. Persistent runners retain their existing host policy.
 - The Linux Python 3.9 compatibility job keeps `actions/setup-python` on hosted runners. On self-hosted Ubuntu 26, it uses `uv` to install Python 3.9 and create a seeded per-job virtual environment because the official setup-python artifact is unavailable there.
