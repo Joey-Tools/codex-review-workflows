@@ -571,6 +571,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("codex-uv-python", action)
         self.assertIn("codex-uv-cache", action)
         self.assertIn("python install --install-dir", action)
+        self.assertIn('--no-bin "$uv_python_version"', action)
         self.assertIn('python find --managed-python "$uv_python_version"', action)
         self.assertIn('venv --python "$managed_python" --seed "$python_env"', action)
         smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')

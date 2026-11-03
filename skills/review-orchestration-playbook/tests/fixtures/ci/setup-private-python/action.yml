@@ -48,7 +48,7 @@ runs:
         export UV_PYTHON_INSTALL_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-python"
         export UV_CACHE_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-cache"
         mkdir -p "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR"
-        "$UV_EXECUTABLE" python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$uv_python_version"
+        "$UV_EXECUTABLE" python install --install-dir "$UV_PYTHON_INSTALL_DIR" --no-bin "$uv_python_version"
         managed_python="$("$UV_EXECUTABLE" python find --managed-python "$uv_python_version")"
 
         python_env="$(mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX")"
