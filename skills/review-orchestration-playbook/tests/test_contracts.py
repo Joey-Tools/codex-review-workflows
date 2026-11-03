@@ -564,15 +564,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("runner.environment != 'self-hosted'", action)
         self.assertIn("uses: actions/setup-python@v5", action)
         self.assertIn("inputs.python-version", action)
-        self.assertIn(
-            "uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
-            action,
-        )
-        self.assertIn('version: "0.11.18"', action)
-        self.assertIn("enable-cache: false", action)
+        self.assertNotIn("setup-uv@", action)
+        self.assertNotIn("steps.setup-uv", action)
         self.assertIn("Prepare isolated self-hosted Python root", action)
         self.assertLess(
-            action.index("id: python-root"), action.index("id: setup-uv")
+            action.index("id: python-root"),
+            action.index("Download verified uv and install managed Python"),
         )
         self.assertIn(
             'mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX"', action
@@ -596,6 +593,45 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIsNotNone(
                     re.fullmatch(uv_selector.group("pattern"), version)
                 )
+        self.assertIn('case "${RUNNER_OS:-}:${RUNNER_ARCH:-}" in', action)
+        self.assertIn('Linux:X64)', action)
+        self.assertIn('macOS:ARM64)', action)
+        self.assertIn(
+            'uv_archive="uv-x86_64-unknown-linux-gnu.tar.gz"', action
+        )
+        self.assertIn('uv_archive_size="24198195"', action)
+        self.assertIn('uv_member="uv-x86_64-unknown-linux-gnu/uv"', action)
+        self.assertIn(
+            'uv_sha256="588f3e360f69ce02b6982aa99f2240e803933a6b7e176ac01617830adf955add"',
+            action,
+        )
+        self.assertIn('uv_archive="uv-aarch64-apple-darwin.tar.gz"', action)
+        self.assertIn('uv_archive_size="20688438"', action)
+        self.assertIn('uv_member="uv-aarch64-apple-darwin/uv"', action)
+        self.assertIn(
+            'uv_sha256="1a7adf8dadae3b55853115d13a8bf564d219597ad13824b93b213706933863e5"',
+            action,
+        )
+        self.assertIn(
+            'https://github.com/astral-sh/uv/releases/download/0.11.18/$uv_archive',
+            action,
+        )
+        self.assertIn("--max-time 120", action)
+        self.assertIn("--max-filesize 134217728", action)
+        self.assertIn("--proto '=https' --proto-redir '=https'", action)
+        size_check = action.index('if [[ "$actual_uv_size" != "$uv_archive_size" ]]')
+        digest_check = action.index('if [[ "$actual_uv_sha256" != "$uv_sha256" ]]')
+        extraction = action.index('tar -xzf "$uv_archive_path"')
+        first_uv_execution = action.index('uv_version_output="$("$uv_executable"')
+        self.assertLess(size_check, digest_check)
+        self.assertLess(digest_check, extraction)
+        self.assertLess(extraction, first_uv_execution)
+        self.assertIn(
+            'tar -xzf "$uv_archive_path" -C "$PRIVATE_PYTHON_ROOT" "$uv_member"',
+            action,
+        )
+        self.assertIn('checksum_command=(sha256sum)', action)
+        self.assertIn('checksum_command=(shasum -a 256)', action)
         self.assertIn(
             'PRIVATE_PYTHON_ROOT: ${{ steps.python-root.outputs.root }}', action
         )
@@ -604,11 +640,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn('UV_CACHE_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-cache"', action)
         self.assertNotIn("RUNNER_TOOL_CACHE", action)
-        self.assertIn("python install --install-dir", action)
+        self.assertIn(
+            '"$uv_executable" --no-config python install --install-dir', action
+        )
         self.assertIn('--no-bin "$uv_python_version"', action)
-        self.assertIn('python find --managed-python "$uv_python_version"', action)
+        self.assertIn(
+            '"$uv_executable" --no-config python find --managed-python '
+            '"$uv_python_version"',
+            action,
+        )
         self.assertIn('python_env="$PRIVATE_PYTHON_ROOT/venv"', action)
-        self.assertIn('venv --python "$managed_python" --seed "$python_env"', action)
+        self.assertIn(
+            '"$uv_executable" --no-config venv --no-project --python '
+            '"$managed_python" --seed "$python_env"',
+            action,
+        )
+        self.assertEqual(action.count('"$uv_executable" --no-config'), 4)
         smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
         path_export = action.index('>> "$GITHUB_PATH"')
         self.assertLess(smoke, path_export)
