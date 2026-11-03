@@ -645,9 +645,15 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn('--no-bin "$uv_python_version"', action)
         self.assertIn(
-            '"$uv_executable" --no-config python find --managed-python '
-            '"$uv_python_version"',
+            'env -u VIRTUAL_ENV -u CONDA_PREFIX "$uv_executable" --no-config '
+            'python find --system --managed-python --no-project "$uv_python_version"',
             action,
+        )
+        self.assertIn('cd "$PRIVATE_PYTHON_ROOT"', action)
+        self.assertIn('case "$managed_python" in', action)
+        self.assertIn('"$UV_PYTHON_INSTALL_DIR"/*)', action)
+        self.assertIn(
+            "uv selected Python outside the per-job managed installation", action
         )
         self.assertIn('python_env="$PRIVATE_PYTHON_ROOT/venv"', action)
         self.assertIn(
@@ -656,6 +662,76 @@ class RepositoryContractTest(unittest.TestCase):
             action,
         )
         self.assertEqual(action.count('"$uv_executable" --no-config'), 4)
+        python_find = action.index('managed_python="$(')
+        managed_path_check = action.index('case "$managed_python" in', python_find)
+        venv_creation = action.index('"$uv_executable" --no-config venv', python_find)
+        self.assertLess(managed_path_check, venv_creation)
+
+        with tempfile.TemporaryDirectory() as temporary_root:
+            root = pathlib.Path(temporary_root)
+            private_root = root / "private-root"
+            install_root = private_root / "codex-uv-python"
+            install_root.mkdir(parents=True)
+            checkout = root / "checkout"
+            checkout_python = checkout / ".venv" / "bin" / "python"
+            checkout_python.parent.mkdir(parents=True)
+            marker = root / "checkout-python-executed"
+            checkout_python.write_text(
+                "#!/bin/sh\ntouch \"$UV_POISON_MARKER\"\n",
+                encoding="utf-8",
+            )
+            checkout_python.chmod(0o700)
+            uv_stub = root / "uv-stub"
+            uv_stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *python\\ find*)\n"
+                "    printf '%s\\n' \"$PWD\" > \"$UV_FIND_CWD\"\n"
+                "    printf '%s\\n' \"$CHECKOUT_PYTHON\"\n"
+                "    ;;\n"
+                "  *venv*) \"$CHECKOUT_PYTHON\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            uv_stub.chmod(0o700)
+            find_cwd = root / "find-cwd"
+            discovery_env = os.environ.copy()
+            discovery_env.update(
+                {
+                    "PRIVATE_PYTHON_ROOT": str(private_root),
+                    "UV_PYTHON_INSTALL_DIR": str(install_root),
+                    "uv_executable": str(uv_stub),
+                    "uv_python_version": "3.13",
+                    "CHECKOUT_PYTHON": str(checkout_python),
+                    "UV_POISON_MARKER": str(marker),
+                    "UV_FIND_CWD": str(find_cwd),
+                }
+            )
+            discovery_start = action.index('managed_python="$(')
+            venv_command = action.index(
+                '"$uv_executable" --no-config venv', discovery_start
+            )
+            snippet_end = action.index("\n", venv_command)
+            discovery_snippet = action[discovery_start:snippet_end]
+            discovery_result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", discovery_snippet],
+                cwd=checkout,
+                env=discovery_env,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(discovery_result.returncode, 0)
+            self.assertIn(
+                "uv selected Python outside the per-job managed installation",
+                discovery_result.stdout,
+            )
+            self.assertEqual(
+                find_cwd.read_text(encoding="utf-8").strip(), str(private_root)
+            )
+            self.assertFalse(marker.exists())
         smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
         path_export = action.index('>> "$GITHUB_PATH"')
         self.assertLess(smoke, path_export)

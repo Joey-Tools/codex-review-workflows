@@ -102,7 +102,17 @@ runs:
         export UV_CACHE_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-cache"
         mkdir -p "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR"
         "$uv_executable" --no-config python install --install-dir "$UV_PYTHON_INSTALL_DIR" --no-bin "$uv_python_version"
-        managed_python="$("$uv_executable" --no-config python find --managed-python "$uv_python_version")"
+        managed_python="$(
+          cd "$PRIVATE_PYTHON_ROOT"
+          env -u VIRTUAL_ENV -u CONDA_PREFIX "$uv_executable" --no-config python find --system --managed-python --no-project "$uv_python_version"
+        )"
+        case "$managed_python" in
+          "$UV_PYTHON_INSTALL_DIR"/*) ;;
+          *)
+            echo "::error::uv selected Python outside the per-job managed installation"
+            exit 1
+            ;;
+        esac
 
         python_env="$PRIVATE_PYTHON_ROOT/venv"
         "$uv_executable" --no-config venv --no-project --python "$managed_python" --seed "$python_env"
