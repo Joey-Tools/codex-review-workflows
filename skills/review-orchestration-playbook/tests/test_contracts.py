@@ -362,6 +362,176 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(tested_results, set(expected_results))
 
+    def test_private_ci_fixture_routes_runners_without_changing_hosted_defaults(
+        self,
+    ) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_blocks(workflow)
+        runs_on = re.findall(r"(?m)^    runs-on: (.+)$", workflow)
+
+        self.assertEqual(len(runs_on), len(jobs))
+        self.assertTrue(all("fromJSON(" in item for item in runs_on))
+        self.assertNotIn("runs-on: ${{ matrix.os }}", workflow)
+        for variable in (
+            "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
+            "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
+        ):
+            self.assertIn(f"vars.{variable}", workflow)
+
+        matrix_routing = jobs["review_syntax_tests"].splitlines()
+        matrix_runs_on = next(line for line in matrix_routing if "runs-on:" in line)
+        self.assertIn("startsWith(matrix.os, 'macos')", matrix_runs_on)
+        self.assertIn("vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS", matrix_runs_on)
+        self.assertIn("vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS", matrix_runs_on)
+        self.assertIn("'[\"macos-latest\"]'", matrix_runs_on)
+        self.assertIn("'[\"ubuntu-latest\"]'", matrix_runs_on)
+
+        expected_fallbacks = {
+            "review_macos_shard_tests": (
+                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
+                '["macos-latest"]',
+            ),
+            "private_overlay_sync_tests": (
+                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
+                '["macos-latest"]',
+            ),
+            "independent_supervisor_tests": (
+                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
+                '["macos-26"]',
+            ),
+            "readonly_install_supervisor_tests": (
+                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
+                '["macos-26"]',
+            ),
+            "linux_isolation_tests": (
+                "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
+                '["ubuntu-latest"]',
+            ),
+            "private_overlay_tests": (
+                "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
+                '["ubuntu-latest"]',
+            ),
+            "private_overlay_contract_tests": (
+                "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
+                '["ubuntu-latest"]',
+            ),
+            "python-39-compatibility": (
+                "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
+                '["ubuntu-slim"]',
+            ),
+            "test": ("CODEX_PRIVATE_LINUX_RUNNER_LABELS", '["ubuntu-slim"]'),
+        }
+        for job_name, (variable, fallback) in expected_fallbacks.items():
+            with self.subTest(job=job_name):
+                run_line = next(
+                    line for line in jobs[job_name].splitlines() if "runs-on:" in line
+                )
+                self.assertIn(f"vars.{variable}", run_line)
+                self.assertIn(repr(fallback), run_line)
+
+        independent = jobs["independent_supervisor_tests"]
+        steps = {
+            name: body
+            for name, body in re.findall(
+                r"(?ms)^      - name: ([^\n]+)\n(?P<body>.*?)(?=^      - |\Z)",
+                independent,
+            )
+        }
+        for name in (
+            "Report hosted no-child runtime fingerprint",
+            "Match hosted no-child blocker signature",
+        ):
+            self.assertIn("runner.environment == 'github-hosted'", steps[name])
+        deterministic = steps["Run deterministic independent supervisor tests"]
+        self.assertNotIn("if:", deterministic)
+        self.assertIn("tests.run_required_deterministic_supervisor", deterministic)
+        broker = steps["Require hosted-runner byte reproduction"]
+        self.assertIn("if: always()", broker)
+        self.assertIn(
+            "runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer'",
+            broker,
+        )
+        self.assertIn('== "github-hosted"', broker)
+        self.assertIn('== "self-hosted"', broker)
+        self.assertIn("--check", broker)
+        self.assertIn("xcode-select -p", broker)
+        self.assertIn("--developer-check", broker)
+        self.assertIn("Unsupported runner environment", broker)
+        self.assertIn("exit 1", broker)
+
+        readonly = jobs["readonly_install_supervisor_tests"]
+        readonly_deterministic = re.search(
+            r"(?ms)^      - name: Run deterministic supervisor from read-only install\n(?P<body>.*?)(?=^      - |\Z)",
+            readonly,
+        )
+        self.assertIsNotNone(readonly_deterministic)
+        self.assertNotIn("if:", readonly_deterministic.group("body"))
+        self.assertIn("trusted_mac_gate.py", readonly_deterministic.group("body"))
+        self.assertIn("sandbox-exec", readonly_deterministic.group("body"))
+        self.assertIn("hosted-readonly", readonly_deterministic.group("body"))
+        self.assertIn('== "github-hosted"', readonly_deterministic.group("body"))
+        self.assertIn('== "self-hosted"', readonly_deterministic.group("body"))
+        self.assertIn("xcode-select -p", readonly_deterministic.group("body"))
+        self.assertIn(
+            "Unsupported runner environment",
+            readonly_deterministic.group("body"),
+        )
+        self.assertIn("exit 1", readonly_deterministic.group("body"))
+        readonly_concurrency = re.search(
+            r"(?ms)^    concurrency:\n(?P<body>.*?)(?=^    timeout-minutes:)",
+            readonly,
+        )
+        self.assertIsNotNone(readonly_concurrency)
+        concurrency = readonly_concurrency.group("body")
+        self.assertIn("vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS != ''", concurrency)
+        self.assertIn("private-self-hosted-readonly-install", concurrency)
+        self.assertIn(
+            "format('readonly-install-{0}-{1}', github.run_id, github.run_attempt)",
+            concurrency,
+        )
+        self.assertIn("cancel-in-progress: false", concurrency)
+        self.assertIn("queue: max", concurrency)
+        self.assertNotIn("runner.", concurrency)
+
+    def test_private_python39_job_uses_managed_interpreter_only_on_self_hosted(
+        self,
+    ) -> None:
+        workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+        job = _workflow_job_blocks(workflow)["python-39-compatibility"]
+        setup_python = re.search(
+            r"(?ms)^      - uses: actions/setup-python@v5\n(?P<body>.*?)(?=^      - |\Z)",
+            job,
+        )
+        self.assertIsNotNone(setup_python)
+        self.assertIn(
+            "if: ${{ runner.environment == 'github-hosted' }}",
+            setup_python.group("body"),
+        )
+        self.assertIn('python-version: "3.9"', setup_python.group("body"))
+
+        selfhosted_uv = re.search(
+            r"(?ms)^      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b(?: # v8\.1\.0)?\n(?P<body>.*?)(?=^      - |\Z)",
+            job,
+        )
+        self.assertIsNotNone(selfhosted_uv)
+        self.assertIn("runner.environment == 'self-hosted'", selfhosted_uv.group("body"))
+        self.assertIn('version: "0.11.18"', selfhosted_uv.group("body"))
+        self.assertIn("enable-cache: false", selfhosted_uv.group("body"))
+
+        install = re.search(
+            r"(?ms)^      - name: Install managed Python 3\.9 for self-hosted runner\n(?P<body>.*?)(?=^      - |\Z)",
+            job,
+        )
+        self.assertIsNotNone(install)
+        install_body = install.group("body")
+        self.assertIn("runner.environment == 'self-hosted'", install_body)
+        self.assertIn('"$RUNNER_TEMP/codex-python39-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', install_body)
+        self.assertIn('"$UV_EXECUTABLE" python install 3.9', install_body)
+        self.assertIn('venv --python 3.9 --seed "$python_env"', install_body)
+        self.assertIn('"$python_env/bin" >> "$GITHUB_PATH"', install_body)
+        self.assertIn("python3 -B -c", job)
+        self.assertIn("python3 -m unittest \\", job)
+
     def test_private_reconciliation_step_has_bounded_budget_and_progress(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         job = _workflow_job_blocks(workflow)["independent_supervisor_tests"]
@@ -409,7 +579,11 @@ class RepositoryContractTest(unittest.TestCase):
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_blocks(workflow)
         macos_shards = jobs["review_macos_shard_tests"]
-        self.assertIn("    runs-on: macos-latest", macos_shards)
+        self.assertIn(
+            'runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '
+            '\'["macos-latest"]\') }}',
+            macos_shards,
+        )
         self.assertIn("python3 -B scripts/run_unittest_shard.py", macos_shards)
         self.assertIn('--shard-index "${{ matrix.shard }}"', macos_shards)
         self.assertIn('--shard-count "${{ matrix.shard_count }}"', macos_shards)

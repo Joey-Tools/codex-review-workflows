@@ -22,7 +22,7 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(startsWith(matrix.os, 'macos') && (vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') || (vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]')) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +85,7 @@ jobs:
             module: test_providers.py
           - os: macos-latest
             module: test_review_workspace.py
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(startsWith(matrix.os, 'macos') && (vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') || (vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]')) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,7 +134,7 @@ jobs:
           - module: test_review_workspace.py
             shard: 1
             shard_count: 2
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,7 +166,7 @@ jobs:
           - macos-latest
         module:
           - test_project_journal.py
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(startsWith(matrix.os, 'macos') && (vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') || (vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]')) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -186,7 +186,7 @@ jobs:
 
   private_overlay_sync_tests:
     name: private-overlay-sync-tests (macos-latest)
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -206,7 +206,7 @@ jobs:
 
   linux_isolation_tests:
     name: linux-isolation-tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -265,7 +265,7 @@ jobs:
           - test_skill_validator_wrapper.py
           - test_sync_manifest_changes.py
           - test_unittest_shard.py
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -285,7 +285,7 @@ jobs:
 
   private_overlay_contract_tests:
     name: private-overlay-contract-tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -318,7 +318,7 @@ jobs:
 
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
-    runs-on: macos-26
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-26"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -330,6 +330,7 @@ jobs:
         run: |
           python3 -B -c 'import pathlib; paths = sorted(pathlib.Path("review_supervisor").rglob("*.py")); [compile(path.read_bytes(), str(path), "exec") for path in paths]'
       - name: Report hosted no-child runtime fingerprint
+        if: ${{ runner.environment == 'github-hosted' }}
         run: |
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
@@ -337,6 +338,7 @@ jobs:
           /usr/bin/uname -m
           /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
       - name: Match hosted no-child blocker signature
+        if: ${{ runner.environment == 'github-hosted' }}
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
@@ -364,11 +366,23 @@ jobs:
         if: always()
         timeout-minutes: 2
         env:
-          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          DEVELOPER_DIR: ${{ runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer' || '' }}
         run: |
-          /bin/bash \
-            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
-            --check
+          if [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            /bin/bash \
+              personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+              --check
+          elif [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "self-hosted" ]]; then
+            DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"
+            export DEVELOPER_DIR
+            /bin/bash \
+              personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+              --developer-check
+          else
+            echo "::error::Unsupported runner environment: $CODEX_REVIEW_RUNNER_ENVIRONMENT"
+            exit 1
+          fi
       - name: Require source-only Python tree
         if: always()
         run: |
@@ -376,7 +390,11 @@ jobs:
 
   readonly_install_supervisor_tests:
     name: read-only-install-supervisor (python-3.13)
-    runs-on: macos-26
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-26"]') }}
+    concurrency:
+      group: ${{ vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS != '' && 'private-self-hosted-readonly-install' || format('readonly-install-{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: false
+      queue: max
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -392,10 +410,20 @@ jobs:
           enable-cache: false
       - name: Run deterministic supervisor from read-only install
         env:
-          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          DEVELOPER_DIR: ${{ runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer' || '' }}
           REVIEW_SOURCE_RELATIVE: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
           UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
         run: |
+          if [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
+            :
+          elif [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "self-hosted" ]]; then
+            DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"
+            export DEVELOPER_DIR
+          else
+            echo "::error::Unsupported runner environment: $CODEX_REVIEW_RUNNER_ENVIRONMENT"
+            exit 1
+          fi
           isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/codex-review-readonly.XXXXXX)"
           echo "Read-only isolation recovery root: $isolated_root"
           if [[ ! "$isolated_root" =~ ^/private/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then
@@ -1993,13 +2021,30 @@ jobs:
 
   python-39-compatibility:
     # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
-    runs-on: ubuntu-slim
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: ${{ runner.environment == 'github-hosted' }}
         with:
           python-version: "3.9"
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        if: ${{ runner.environment == 'self-hosted' }}
+        id: setup-uv
+        with:
+          version: "0.11.18"
+          enable-cache: false
+      - name: Install managed Python 3.9 for self-hosted runner
+        if: ${{ runner.environment == 'self-hosted' }}
+        env:
+          UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
+        run: |
+          set -euo pipefail
+          python_env="$RUNNER_TEMP/codex-python39-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          "$UV_EXECUTABLE" python install 3.9
+          "$UV_EXECUTABLE" venv --python 3.9 --seed "$python_env"
+          printf '%s\n' "$python_env/bin" >> "$GITHUB_PATH"
       - name: Check supported runtime syntax without bytecode
         run: |
           python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(path).read_bytes(), path, "exec") for path in sys.argv[1:]]' \
@@ -2038,7 +2083,7 @@ jobs:
       - private_overlay_tests
       - private_overlay_contract_tests
     # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
-    runs-on: ubuntu-slim
+    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15
     steps:
       - name: Require every CI leaf to pass
