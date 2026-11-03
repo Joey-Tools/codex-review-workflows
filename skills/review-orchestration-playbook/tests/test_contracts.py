@@ -493,9 +493,7 @@ class RepositoryContractTest(unittest.TestCase):
             linux_isolation,
         )
 
-    def test_private_ci_python_action_routes_hosted_and_managed_interpreters(
-        self,
-    ) -> None:
+    def test_private_ci_uses_official_setup_python_with_original_versions(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_blocks(workflow)
         python_jobs = {
@@ -507,276 +505,30 @@ class RepositoryContractTest(unittest.TestCase):
             "private_overlay_tests": "3.10",
             "private_overlay_contract_tests": "3.10",
             "python-39-compatibility": "3.9",
+            "linux_isolation_tests": "3.10",
         }
-        action_reference = "./.github/actions/setup-private-python"
-        self.assertEqual(
-            workflow.count(f"uses: {action_reference}"), len(python_jobs)
-        )
+        action_reference = "uses: actions/setup-python@v5"
         for job_name, version in python_jobs.items():
             with self.subTest(job=job_name):
                 job = jobs[job_name]
-                use = re.search(
-                    rf"(?ms)^      - uses: {re.escape(action_reference)}\n(?P<body>.*?)(?=^      - |\Z)",
+                setup_steps = re.findall(
+                    rf"(?ms)^      - {re.escape(action_reference)}\n(?P<body>.*?)(?=^      - |\Z)",
                     job,
                 )
-                self.assertIsNotNone(use)
-                self.assertIn(f'python-version: "{version}"', use.group("body"))
-                self.assertNotIn("uses: actions/setup-python@v5", job)
+                self.assertEqual(len(setup_steps), 1)
+                self.assertIn(f'python-version: "{version}"', setup_steps[0])
 
-        hosted_setup_python_jobs = {
-            "linux_isolation_tests": ("3.10", 1),
-            "independent_supervisor_tests": ("3.13", 2),
-        }
-        for job_name, (version, count) in hosted_setup_python_jobs.items():
-            with self.subTest(hosted_job=job_name):
-                job = jobs[job_name]
-                self.assertEqual(job.count("uses: actions/setup-python@v5"), count)
-                self.assertIn(f'python-version: "{version}"', job)
-        self.assertIn('python-version: "3.x"', jobs["independent_supervisor_tests"])
-        self.assertNotIn(
-            "uses: actions/setup-python@v5",
-            jobs["readonly_install_supervisor_tests"],
+        independent = jobs["independent_supervisor_tests"]
+        independent_versions = re.findall(
+            r'(?m)^          python-version: "([^"]+)"$', independent
         )
-
-        action_path = CI_FIXTURE_ROOT / "setup-private-python" / "action.yml"
-        self.assertTrue(action_path.is_file())
-        action = action_path.read_text(encoding="utf-8")
-        if CI_PROFILE == "private":
-            deployed_action_path = (
-                REPO_ROOT
-                / ".github"
-                / "actions"
-                / "setup-private-python"
-                / "action.yml"
-            )
-            self.assertTrue(
-                deployed_action_path.is_file(),
-                "private layout must include the reviewed local Python action",
-            )
-            self.assertEqual(
-                deployed_action_path.read_bytes(),
-                action_path.read_bytes(),
-                "deployed private Python action differs from its reviewed fixture",
-            )
-        self.assertIn("using: composite", action)
-        self.assertIn("runner.environment == 'github-hosted'", action)
-        self.assertIn("runner.environment == 'self-hosted'", action)
-        self.assertIn("runner.environment != 'self-hosted'", action)
-        self.assertIn("uses: actions/setup-python@v5", action)
-        self.assertIn("inputs.python-version", action)
-        self.assertNotIn("setup-uv@", action)
-        self.assertNotIn("steps.setup-uv", action)
-        self.assertIn("Prepare isolated self-hosted Python root", action)
-        self.assertLess(
-            action.index("id: python-root"),
-            action.index("Download verified uv and install managed Python"),
+        self.assertEqual(independent_versions, ["3.13", "3.x"])
+        self.assertEqual(independent.count(action_reference), 2)
+        self.assertNotIn(action_reference, jobs["readonly_install_supervisor_tests"])
+        self.assertNotIn("./.github/actions/setup-private-python", workflow)
+        self.assertFalse(
+            (CI_FIXTURE_ROOT / "setup-private-python" / "action.yml").exists()
         )
-        self.assertIn(
-            'mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX"', action
-        )
-        self.assertIn('chmod 700 "$python_root"', action)
-        self.assertIn(
-            'printf \'root=%s\\n\' "$python_root" >> "$GITHUB_OUTPUT"', action
-        )
-        self.assertIn('if [[ "$REQUESTED_PYTHON_VERSION" == "3.x" ]]; then', action)
-        self.assertIn('uv_python_version="3"', action)
-        self.assertIn(
-            'elif [[ "$REQUESTED_PYTHON_VERSION" =~ ^3\\.[0-9]+$ ]]', action
-        )
-        uv_selector = re.search(
-            r'REQUESTED_PYTHON_VERSION" =~ (?P<pattern>\S+) \]\]', action
-        )
-        self.assertIsNotNone(uv_selector)
-        self.assertEqual(uv_selector.group("pattern"), r"^3\.[0-9]+$")
-        for version in ("3.9", "3.10", "3.13"):
-            with self.subTest(managed_python_version=version):
-                self.assertIsNotNone(
-                    re.fullmatch(uv_selector.group("pattern"), version)
-                )
-        self.assertIn('case "${RUNNER_OS:-}:${RUNNER_ARCH:-}" in', action)
-        self.assertIn('Linux:X64)', action)
-        self.assertIn('macOS:ARM64)', action)
-        self.assertIn(
-            'uv_archive="uv-x86_64-unknown-linux-gnu.tar.gz"', action
-        )
-        self.assertIn('uv_archive_size="16671812"', action)
-        self.assertIn('uv_member="uv-x86_64-unknown-linux-gnu/uv"', action)
-        self.assertIn(
-            'uv_sha256="c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"',
-            action,
-        )
-        self.assertIn('uv_archive="uv-aarch64-apple-darwin.tar.gz"', action)
-        self.assertIn('uv_archive_size="14347867"', action)
-        self.assertIn('uv_member="uv-aarch64-apple-darwin/uv"', action)
-        self.assertIn(
-            'uv_sha256="81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"',
-            action,
-        )
-        self.assertIn(
-            'https://github.com/astral-sh/uv/releases/download/0.13.7/$uv_archive',
-            action,
-        )
-        self.assertIn('uv\\ 0.13.7*', action)
-        self.assertIn("--max-time 120", action)
-        self.assertIn("--max-filesize 134217728", action)
-        self.assertIn("--proto '=https' --proto-redir '=https'", action)
-        size_check = action.index('if [[ "$actual_uv_size" != "$uv_archive_size" ]]')
-        digest_check = action.index('if [[ "$actual_uv_sha256" != "$uv_sha256" ]]')
-        extraction = action.index('tar -xzf "$uv_archive_path"')
-        first_uv_execution = action.index('uv_version_output="$("$uv_executable"')
-        self.assertLess(size_check, digest_check)
-        self.assertLess(digest_check, extraction)
-        self.assertLess(extraction, first_uv_execution)
-        self.assertIn(
-            'tar -xzf "$uv_archive_path" -C "$PRIVATE_PYTHON_ROOT" "$uv_member"',
-            action,
-        )
-        self.assertIn('checksum_command=(sha256sum)', action)
-        self.assertIn('checksum_command=(shasum -a 256)', action)
-        self.assertIn(
-            'PRIVATE_PYTHON_ROOT: ${{ steps.python-root.outputs.root }}', action
-        )
-        self.assertIn(
-            'UV_PYTHON_INSTALL_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-python"', action
-        )
-        self.assertIn('UV_CACHE_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-cache"', action)
-        self.assertNotIn("RUNNER_TOOL_CACHE", action)
-        self.assertIn(
-            '"$uv_executable" --no-config python install --install-dir', action
-        )
-        self.assertIn('--no-bin "$uv_python_version"', action)
-        self.assertIn(
-            'env -u VIRTUAL_ENV -u CONDA_PREFIX "$uv_executable" --no-config '
-            'python find --system --managed-python --no-project "$uv_python_version"',
-            action,
-        )
-        self.assertIn('cd "$PRIVATE_PYTHON_ROOT"', action)
-        self.assertIn('case "$managed_python" in', action)
-        self.assertIn('"$UV_PYTHON_INSTALL_DIR"/*)', action)
-        self.assertIn(
-            "uv selected Python outside the per-job managed installation", action
-        )
-        self.assertIn('python_env="$PRIVATE_PYTHON_ROOT/venv"', action)
-        self.assertIn(
-            '"$uv_executable" --no-config venv --no-project --python '
-            '"$managed_python" --seed "$python_env"',
-            action,
-        )
-        self.assertIn(
-            "certifi==2026.10.23 --hash=sha256:"
-            "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1",
-            action,
-        )
-        self.assertIn(
-            '"$uv_executable" --no-config pip install --python '
-            '"$python_env/bin/python3"',
-            action,
-        )
-        self.assertIn(
-            "--no-deps --only-binary :all: --require-hashes --no-cache", action
-        )
-        self.assertIn('--requirement "$certifi_requirements"', action)
-        self.assertIn('certifi_bundle="$("$python_env/bin/python3" -I -c', action)
-        self.assertIn(
-            '"$python_env"/lib/python*/site-packages/certifi/cacert.pem)', action
-        )
-        self.assertIn("ssl.create_default_context(cafile=sys.argv[1])", action)
-        self.assertIn("emSign ECC Root CA - G3", action)
-        self.assertIn(
-            'printf \'PIP_CERT=%s\\n\' "$certifi_bundle" >> "$GITHUB_ENV"', action
-        )
-        self.assertNotIn("SSL_CERT_FILE", action)
-        self.assertNotIn("SSL_CERT_DIR", action)
-        self.assertEqual(action.count('"$uv_executable" --no-config'), 5)
-        certifi_install = action.index('"$uv_executable" --no-config pip install')
-        certifi_validation = action.index(
-            "ssl.create_default_context(cafile=sys.argv[1])"
-        )
-        pip_cert_export = action.index('PIP_CERT=%s\\n')
-        smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
-        path_export = action.index('>> "$GITHUB_PATH"')
-        self.assertLess(certifi_install, certifi_validation)
-        self.assertLess(certifi_validation, pip_cert_export)
-        self.assertLess(pip_cert_export, smoke)
-        self.assertLess(smoke, path_export)
-        python_find = action.index('managed_python="$(')
-        managed_path_check = action.index('case "$managed_python" in', python_find)
-        venv_creation = action.index('"$uv_executable" --no-config venv', python_find)
-        self.assertLess(managed_path_check, venv_creation)
-
-        with tempfile.TemporaryDirectory() as temporary_root:
-            root = pathlib.Path(temporary_root)
-            private_root = root / "private-root"
-            install_root = private_root / "codex-uv-python"
-            install_root.mkdir(parents=True)
-            checkout = root / "checkout"
-            checkout_python = checkout / ".venv" / "bin" / "python"
-            checkout_python.parent.mkdir(parents=True)
-            marker = root / "checkout-python-executed"
-            checkout_python.write_text(
-                "#!/bin/sh\ntouch \"$UV_POISON_MARKER\"\n",
-                encoding="utf-8",
-            )
-            checkout_python.chmod(0o700)
-            uv_stub = root / "uv-stub"
-            uv_stub.write_text(
-                "#!/bin/sh\n"
-                "case \"$*\" in\n"
-                "  *python\\ find*)\n"
-                "    printf '%s\\n' \"$PWD\" > \"$UV_FIND_CWD\"\n"
-                "    printf '%s\\n' \"$CHECKOUT_PYTHON\"\n"
-                "    ;;\n"
-                "  *venv*) \"$CHECKOUT_PYTHON\" ;;\n"
-                "  *) exit 2 ;;\n"
-                "esac\n",
-                encoding="utf-8",
-            )
-            uv_stub.chmod(0o700)
-            find_cwd = root / "find-cwd"
-            discovery_env = os.environ.copy()
-            discovery_env.update(
-                {
-                    "PRIVATE_PYTHON_ROOT": str(private_root),
-                    "UV_PYTHON_INSTALL_DIR": str(install_root),
-                    "uv_executable": str(uv_stub),
-                    "uv_python_version": "3.13",
-                    "CHECKOUT_PYTHON": str(checkout_python),
-                    "UV_POISON_MARKER": str(marker),
-                    "UV_FIND_CWD": str(find_cwd),
-                }
-            )
-            discovery_start = action.index('managed_python="$(')
-            venv_command = action.index(
-                '"$uv_executable" --no-config venv', discovery_start
-            )
-            snippet_end = action.index("\n", venv_command)
-            discovery_snippet = action[discovery_start:snippet_end]
-            discovery_result = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", discovery_snippet],
-                cwd=checkout,
-                env=discovery_env,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertNotEqual(discovery_result.returncode, 0)
-            self.assertIn(
-                "uv selected Python outside the per-job managed installation",
-                discovery_result.stdout,
-            )
-            self.assertEqual(
-                find_cwd.read_text(encoding="utf-8").strip(), str(private_root)
-            )
-            self.assertFalse(marker.exists())
-        self.assertIn("RUNNER_TEMP", action)
-        self.assertIn("codex-private-python.XXXXXX", action)
-        self.assertNotRegex(action, r"LD_[A-Z0-9_]+")
-        self.assertNotIn("RUNNER_TOOL_CACHE/Python", action)
-
-        python39_job = jobs["python-39-compatibility"]
-        self.assertIn("python3 -B -c", python39_job)
-        self.assertIn("python3 -m unittest", python39_job)
 
     def test_private_reconciliation_step_has_bounded_budget_and_progress(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")

@@ -4007,9 +4007,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
     def test_entrypoint_skips_global_site_hooks_with_no_site(self) -> None:
         _, guard = self.copy_guard_bundle()
         environment_root = self.root / "sitecustomize-environment"
-        venv.EnvBuilder(with_pip=False, symlinks=(os.name != "nt")).create(
-            environment_root
-        )
+        venv.EnvBuilder(with_pip=False).create(environment_root)
         interpreter = environment_root / (
             "Scripts/python.exe" if os.name == "nt" else "bin/python"
         )
@@ -15163,8 +15161,7 @@ raise AssertionError("terminal publisher returned with an active mask owner")
                 stderr_path=stderr,
                 command=(str(executable),),
                 prompt=b"",
-                # Allow launcher startup under load on self-hosted macOS.
-                timeout_seconds=10.0,
+                timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
             )
 
