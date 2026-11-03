@@ -493,44 +493,97 @@ class RepositoryContractTest(unittest.TestCase):
             linux_isolation,
         )
 
-    def test_private_python39_job_uses_managed_interpreter_only_on_self_hosted(
+    def test_private_ci_python_action_routes_hosted_and_managed_interpreters(
         self,
     ) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
-        job = _workflow_job_blocks(workflow)["python-39-compatibility"]
-        setup_python = re.search(
-            r"(?ms)^      - uses: actions/setup-python@v5\n(?P<body>.*?)(?=^      - |\Z)",
-            job,
+        jobs = _workflow_job_blocks(workflow)
+        python_jobs = {
+            "review_syntax_tests": "3.10",
+            "review_tests": "3.10",
+            "review_macos_shard_tests": "3.10",
+            "project_journal_tests": "3.10",
+            "private_overlay_sync_tests": "3.10",
+            "private_overlay_tests": "3.10",
+            "private_overlay_contract_tests": "3.10",
+            "python-39-compatibility": "3.9",
+        }
+        action_reference = "./.github/actions/setup-private-python"
+        self.assertEqual(
+            workflow.count(f"uses: {action_reference}"), len(python_jobs)
         )
-        self.assertIsNotNone(setup_python)
+        for job_name, version in python_jobs.items():
+            with self.subTest(job=job_name):
+                job = jobs[job_name]
+                use = re.search(
+                    rf"(?ms)^      - uses: {re.escape(action_reference)}\n(?P<body>.*?)(?=^      - |\Z)",
+                    job,
+                )
+                self.assertIsNotNone(use)
+                self.assertIn(f'python-version: "{version}"', use.group("body"))
+                self.assertNotIn("uses: actions/setup-python@v5", job)
+
+        hosted_setup_python_jobs = {
+            "linux_isolation_tests": ("3.10", 1),
+            "independent_supervisor_tests": ("3.13", 2),
+        }
+        for job_name, (version, count) in hosted_setup_python_jobs.items():
+            with self.subTest(hosted_job=job_name):
+                job = jobs[job_name]
+                self.assertEqual(job.count("uses: actions/setup-python@v5"), count)
+                self.assertIn(f'python-version: "{version}"', job)
+        self.assertIn('python-version: "3.x"', jobs["independent_supervisor_tests"])
+        self.assertNotIn(
+            "uses: actions/setup-python@v5",
+            jobs["readonly_install_supervisor_tests"],
+        )
+
+        action_path = CI_FIXTURE_ROOT / "setup-private-python" / "action.yml"
+        self.assertTrue(action_path.is_file())
+        action = action_path.read_text(encoding="utf-8")
+        self.assertIn("using: composite", action)
+        self.assertIn("runner.environment == 'github-hosted'", action)
+        self.assertIn("runner.environment == 'self-hosted'", action)
+        self.assertIn("runner.environment != 'self-hosted'", action)
+        self.assertIn("uses: actions/setup-python@v5", action)
+        self.assertIn("inputs.python-version", action)
         self.assertIn(
-            "if: ${{ runner.environment == 'github-hosted' }}",
-            setup_python.group("body"),
+            "uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
+            action,
         )
-        self.assertIn('python-version: "3.9"', setup_python.group("body"))
+        self.assertIn('version: "0.11.18"', action)
+        self.assertIn("enable-cache: false", action)
+        self.assertIn('if [[ "$REQUESTED_PYTHON_VERSION" == "3.x" ]]; then', action)
+        self.assertIn('uv_python_version="3"', action)
+        self.assertIn(
+            'elif [[ "$REQUESTED_PYTHON_VERSION" =~ ^3\\.[0-9]+$ ]]', action
+        )
+        uv_selector = re.search(
+            r'REQUESTED_PYTHON_VERSION" =~ (?P<pattern>\S+) \]\]', action
+        )
+        self.assertIsNotNone(uv_selector)
+        self.assertEqual(uv_selector.group("pattern"), r"^3\.[0-9]+$")
+        for version in ("3.9", "3.10", "3.13"):
+            with self.subTest(managed_python_version=version):
+                self.assertIsNotNone(
+                    re.fullmatch(uv_selector.group("pattern"), version)
+                )
+        self.assertIn("codex-uv-python", action)
+        self.assertIn("codex-uv-cache", action)
+        self.assertIn("python install --install-dir", action)
+        self.assertIn('python find --managed-python "$uv_python_version"', action)
+        self.assertIn('venv --python "$managed_python" --seed "$python_env"', action)
+        smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
+        path_export = action.index('>> "$GITHUB_PATH"')
+        self.assertLess(smoke, path_export)
+        self.assertIn("RUNNER_TEMP", action)
+        self.assertIn("codex-private-python.XXXXXX", action)
+        self.assertNotRegex(action, r"LD_[A-Z0-9_]+")
+        self.assertNotIn("RUNNER_TOOL_CACHE/Python", action)
 
-        selfhosted_uv = re.search(
-            r"(?ms)^      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b(?: # v8\.1\.0)?\n(?P<body>.*?)(?=^      - |\Z)",
-            job,
-        )
-        self.assertIsNotNone(selfhosted_uv)
-        self.assertIn("runner.environment == 'self-hosted'", selfhosted_uv.group("body"))
-        self.assertIn('version: "0.11.18"', selfhosted_uv.group("body"))
-        self.assertIn("enable-cache: false", selfhosted_uv.group("body"))
-
-        install = re.search(
-            r"(?ms)^      - name: Install managed Python 3\.9 for self-hosted runner\n(?P<body>.*?)(?=^      - |\Z)",
-            job,
-        )
-        self.assertIsNotNone(install)
-        install_body = install.group("body")
-        self.assertIn("runner.environment == 'self-hosted'", install_body)
-        self.assertIn('"$RUNNER_TEMP/codex-python39-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', install_body)
-        self.assertIn('"$UV_EXECUTABLE" python install 3.9', install_body)
-        self.assertIn('venv --python 3.9 --seed "$python_env"', install_body)
-        self.assertIn('"$python_env/bin" >> "$GITHUB_PATH"', install_body)
-        self.assertIn("python3 -B -c", job)
-        self.assertIn("python3 -m unittest \\", job)
+        python39_job = jobs["python-39-compatibility"]
+        self.assertIn("python3 -B -c", python39_job)
+        self.assertIn("python3 -m unittest", python39_job)
 
     def test_private_reconciliation_step_has_bounded_budget_and_progress(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")

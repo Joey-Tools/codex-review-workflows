@@ -1,0 +1,67 @@
+name: Set up private CI Python
+description: Use setup-python on hosted runners and an isolated uv-managed interpreter on self-hosted runners.
+inputs:
+  python-version:
+    description: Requested Python major/minor version, including 3.x.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Set up hosted Python
+      if: ${{ runner.environment == 'github-hosted' }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install pinned uv
+      if: ${{ runner.environment == 'self-hosted' }}
+      id: setup-uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        version: "0.11.18"
+        enable-cache: false
+    - name: Install and smoke-test managed Python
+      if: ${{ runner.environment == 'self-hosted' }}
+      shell: bash
+      env:
+        REQUESTED_PYTHON_VERSION: ${{ inputs.python-version }}
+        UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
+      run: |
+        set -euo pipefail
+        if [[ "$REQUESTED_PYTHON_VERSION" == "3.x" ]]; then
+          uv_python_version="3"
+        elif [[ "$REQUESTED_PYTHON_VERSION" =~ ^3\.[0-9]+$ ]]; then
+          uv_python_version="$REQUESTED_PYTHON_VERSION"
+        else
+          echo "::error::Unsupported requested Python version: $REQUESTED_PYTHON_VERSION"
+          exit 1
+        fi
+
+        if [[ -z "$UV_EXECUTABLE" || ! -x "$UV_EXECUTABLE" ]]; then
+          echo "::error::Pinned setup-uv executable is unavailable"
+          exit 1
+        fi
+        if [[ -z "${RUNNER_TOOL_CACHE:-}" || -z "${RUNNER_TEMP:-}" || -z "${GITHUB_PATH:-}" ]]; then
+          echo "::error::Required GitHub runner paths are unavailable"
+          exit 1
+        fi
+
+        export UV_PYTHON_INSTALL_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-python"
+        export UV_CACHE_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-cache"
+        mkdir -p "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR"
+        "$UV_EXECUTABLE" python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$uv_python_version"
+        managed_python="$("$UV_EXECUTABLE" python find --managed-python "$uv_python_version")"
+
+        python_env="$(mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX")"
+        "$UV_EXECUTABLE" venv --python "$managed_python" --seed "$python_env"
+        env -i "$python_env/bin/python3" -I -S -c \
+          'import sys; expected = tuple(map(int, sys.argv[1].split("."))); actual = tuple(sys.version_info[:len(expected)]); sys.exit(f"expected Python {sys.argv[1]}, got {sys.version.split()[0]}") if actual != expected else print(f"empty-environment Python smoke test passed: {sys.version.split()[0]}")' \
+          "$uv_python_version"
+        printf '%s\n' "$python_env/bin" >> "$GITHUB_PATH"
+    - name: Reject unsupported runner environment
+      if: ${{ runner.environment != 'github-hosted' && runner.environment != 'self-hosted' }}
+      shell: bash
+      env:
+        CODEX_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      run: |
+        echo "::error::Unsupported runner environment: $CODEX_RUNNER_ENVIRONMENT"
+        exit 1

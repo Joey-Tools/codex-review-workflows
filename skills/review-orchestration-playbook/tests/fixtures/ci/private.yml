@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Check synced review helper syntax without bytecode
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -271,7 +271,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -291,7 +291,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.10"
       - name: Install Python test dependencies
@@ -2000,26 +2000,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        if: ${{ runner.environment == 'github-hosted' }}
+      - uses: ./.github/actions/setup-private-python
         with:
           python-version: "3.9"
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        if: ${{ runner.environment == 'self-hosted' }}
-        id: setup-uv
-        with:
-          version: "0.11.18"
-          enable-cache: false
-      - name: Install managed Python 3.9 for self-hosted runner
-        if: ${{ runner.environment == 'self-hosted' }}
-        env:
-          UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
-        run: |
-          set -euo pipefail
-          python_env="$RUNNER_TEMP/codex-python39-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          "$UV_EXECUTABLE" python install 3.9
-          "$UV_EXECUTABLE" venv --python 3.9 --seed "$python_env"
-          printf '%s\n' "$python_env/bin" >> "$GITHUB_PATH"
       - name: Check supported runtime syntax without bytecode
         run: |
           python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(path).read_bytes(), path, "exec") for path in sys.argv[1:]]' \

@@ -11,15 +11,15 @@ Set these Actions variables in `Joey-Tools/codex-private-workflows` to route the
 | `CODEX_PRIVATE_LINUX_RUNNER_LABELS` | `["self-hosted","Linux","X64","codex-private-linux"]` |
 | `CODEX_PRIVATE_MACOS_RUNNER_LABELS` | `["self-hosted","macOS","ARM64","codex-private-macos"]` |
 
-Each value is a JSON array of labels. An empty or unset value selects the original hosted label for every job in that OS route. Clear both private runner variables and `CODEX_REVIEW_GATE_RUNNER_LABELS` to restore every hosted route. `CODEX_REVIEW_GATE_RUNNER_LABELS` already accepts JSON labels; its existing `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST` fallback remains supported.
+Each value is a JSON array of labels. An empty or unset value selects the original hosted label for each dynamically routed job in that OS route; the three hosted-only jobs below are fixed exceptions. Clear both private runner variables and `CODEX_REVIEW_GATE_RUNNER_LABELS` to restore every dynamic route to its hosted default. `CODEX_REVIEW_GATE_RUNNER_LABELS` already accepts JSON labels; its existing `CODEX_REVIEW_GATE_USE_UBUNTU_LATEST` fallback remains supported.
 
-Runner registration is repository-only. The planned Linux pool has four instances on `dradar-hoteng`. The planned macOS pool has two instances under a dedicated runner account on `India-mac-mini-m4-hoteng`. Provisioning is not complete, so these values describe the intended configuration and do not establish that either pool is live.
+Runner registration is repository-only. Four Linux instances on `dradar-hoteng` and two macOS instances under a dedicated runner account on `India-mac-mini-m4-hoteng` are registered and have accepted jobs. Full CI validation of the portable Python setup remains separate from runner availability.
 
 ## Platform-Specific Checks
 
 - `independent_supervisor_tests` stays on hosted `macos-26` so its fingerprint, hosted no-child regressions, and broker byte-reproduction check all remain covered.
 - `readonly_install_supervisor_tests` stays on hosted `macos-26`: failure and cancellation paths can retain local accounts and immutable root-owned trees until runner disposal.
 - `linux_isolation_tests` stays on hosted `ubuntu-latest` because it changes the global AppArmor user-namespace restriction. Persistent runners retain their existing host policy.
-- The Linux Python 3.9 compatibility job keeps `actions/setup-python` on hosted runners. On self-hosted Ubuntu 26, it uses `uv` to install Python 3.9 and create a seeded per-job virtual environment because the official setup-python artifact is unavailable there.
+- Dynamically routed jobs use the local `setup-private-python` composite action. Hosted runners keep `actions/setup-python@v5` with the requested version. Self-hosted runners use pinned `setup-uv` 0.11.18 to install managed CPython under `RUNNER_TOOL_CACHE/codex-uv-python`, then create a seeded per-job environment under `RUNNER_TEMP` and smoke-test it with an empty environment before adding it to `PATH`. The `3.x` request is passed to uv as `3`; fixed minor requests such as `3.9` and `3.10` are preserved.
 
-This routing slice does not include CI optimization. Timing-based optimization belongs in a follow-up PR, and live self-hosted validation requires completed runner provisioning.
+This routing slice does not include CI optimization. Timing-based optimization and removing the three hosted dependencies belong in a follow-up PR.

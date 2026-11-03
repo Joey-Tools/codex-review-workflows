@@ -14,22 +14,24 @@ superseded_by:
 
 ## Summary
 
-- Add opt-in JSON label routing for private CI Linux and macOS jobs while preserving the hosted defaults and existing test coverage.
+- Add opt-in JSON label routing for eligible private CI Linux and macOS jobs while preserving hosted defaults and existing test coverage.
 
 ## Current State
 
 - The canonical private workflow fixture and contract tests describe the routing variables and retain the original job and matrix structure.
-- Independent supervisor checks retain hosted macOS coverage. The read-only macOS installation job and Linux isolation job retain disposable hosted runners because their side effects require host disposal.
-- `docs/private-ci-runners.md` records the repository-variable contract, intended runner pools, and platform-specific checks.
-- The routing implementation slice is complete for the post-merge target state. Runner provisioning is not complete; no live self-hosted execution is claimed.
+- Independent supervisor checks, read-only macOS installation, and Linux isolation retain hosted runners for hosted evidence or disposal-dependent side effects.
+- The shared Python setup fixture preserves `setup-python` on hosted runners and uses pinned uv-managed CPython plus an empty-environment smoke test on self-hosted runners.
+- `docs/private-ci-runners.md` records the repository-variable contract, provisioned runner pools, and platform-specific checks.
+- Four Linux and two macOS runners are registered and have accepted jobs. The routing implementation slice is complete for the post-merge target state; full CI validation of its portable Python setup remains a separate gate.
 
 ## Next Steps
 
-- Complete repository-only runner provisioning before claiming live self-hosted validation.
-- Keep CI timing and optimization work in a separate follow-up PR.
+- Verify full CI execution with the portable Python setup.
+- Keep CI timing, optimization, and removal of the three hosted dependencies in a separate follow-up PR.
 
 ## Evidence
 
 - Canonical fixture: `skills/review-orchestration-playbook/tests/fixtures/ci/private.yml`.
+- Canonical private Python setup fixture: `skills/review-orchestration-playbook/tests/fixtures/ci/setup-private-python/action.yml`.
 - Canonical contract tests: `skills/review-orchestration-playbook/tests/test_contracts.py`.
 - Runner configuration and validation limits: `docs/private-ci-runners.md`.
