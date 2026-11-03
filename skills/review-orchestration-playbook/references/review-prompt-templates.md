@@ -1003,9 +1003,9 @@ complete host instruction-source receipt alone is not a failure.
 For CLI lanes, shared metadata records the resolved binary, exact version
 output, literal argv submitted at launch, and
 `codex_cli_external_tool_surface: verified-disabled` only after parent-owned
-local preflight evidence verifies the effective tool surface. Keep that small
-preflight record local to the parent: the thirteen `features list` values, MCP
-names/counts/enabled count, and selected configuration values. Do not add a second receipt schema or put server
+local preflight evidence verifies the effective configuration gate. Keep that
+small preflight record local to the parent: the thirteen effective feature
+booleans, MCP names/counts/enabled count, and selected configuration values. Do not add a second receipt schema or put server
 URLs, connection arguments, environment values, raw configuration, or
 credentials in the prompt or report. The parent-owned final report
 repeats those actual values and sets `codex_cli_launch_match` to
@@ -1015,27 +1015,35 @@ record. For non-CLI adapters, these four CLI fields are `not-applicable`.
 The parent sets CLI `codex_cli_external_tool_surface` to `verified-disabled`
 only after the exact argv disables Apps, plugins, computer use, browser use,
 image generation, persisted goals, MCP dependency installation, nested agents,
-automatic daemon startup,
-hooks, notifications, and every configured MCP server. The argv also pins
+automatic daemon startup, hooks, and notifications. The argv also pins
 `memories.generate_memories=false` for this new thread while leaving normal
-existing-memory reading unchanged. At
-the neutral root with the same normal user configuration and exact final
-overrides, `features list` must report `apps`, `plugins`, `computer_use`,
-`browser_use`, `browser_use_external`, `browser_use_full_cdp_access`,
+existing-memory reading unchanged. Before launch, follow the two-read
+no-thread `config/read` procedure in [Local Codex](local-codex-lane.md),
+including its exact source-version and standard standalone-provider boundary.
+Use the same normal user configuration and neutral root. The second response
+must show `apps`, `plugins`, `computer_use`, `browser_use`,
+`browser_use_external`, `browser_use_full_cdp_access`,
 `image_generation`, `goals`, `skill_mcp_dependency_install`,
-`multi_agent`, `multi_agent_v2`, `daemon_auto_start`, and `hooks` all false, and `mcp list --json`
-must show all configured names disabled and zero enabled servers. Build one
-whole-table `mcp_servers` override with every effective
-server name set to `enabled=false`; an empty table does not prove inherited
-servers were cleared. Record only names and counts from the local metadata
-check, plus the selected safe configuration values. Safe effective-config
-metadata must also confirm `web_search: disabled`,
-`agents.enabled: false`, `memories.generate_memories: false`, and empty `notify`; query only metadata
-without starting a thread or turn, and never retain the raw configuration
-response. Parser success alone is not runtime tool-set attestation.
-If a setting is rejected, a managed policy conflicts, a write tool
-remains enabled, or the check is unknown, the CLI lane is inconclusive. For
-non-CLI adapters this field is `not-applicable`; their
+`multi_agent`, `multi_agent_v2`, `daemon_auto_start`, and `hooks` all
+false, with every declared top-level transport-backed MCP name disabled.
+Build the whole-table `mcp_servers` override from the first response's
+transport-backed top-level names, preserving its source-proven recursive
+merge. If there are no such names, omit the override and verify the empty
+top-level table in both reads. Record only names and counts from the existing
+local metadata check, plus selected safe configuration values.
+
+Safe effective-config values must also confirm `web_search: disabled`,
+`agents.enabled: false`, `memories.generate_memories: false`, and empty
+`notify`. The preflight sends only `initialize`, `initialized`, and
+`config/read` with `includeLayers=false`; do not start a thread, turn, or
+model session, or issue auth, feature-list, or MCP runtime requests. Never
+retain raw configuration, connection URLs, command arguments, environment
+values, or credentials. Unknown or mismatched version/source, custom provider
+or extension paths, a managed-policy conflict, a missing value, or a remaining
+write tool makes the CLI lane inconclusive. These config reads verify declared
+effective settings; they are not a runtime tool inventory, host-isolation
+proof, or zero-network guarantee. For non-CLI adapters this field is
+`not-applicable`; their
 `subagent_execution: read-only` value already requires the host-enforced
 external-tool boundary above.
 
