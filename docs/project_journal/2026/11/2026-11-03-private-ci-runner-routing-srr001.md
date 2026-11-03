@@ -20,7 +20,7 @@ superseded_by:
 
 - The canonical private workflow fixture and contract tests describe the routing variables and retain the original job and matrix structure.
 - Independent supervisor checks, read-only macOS installation, and Linux isolation retain hosted runners for hosted evidence or disposal-dependent side effects.
-- The shared Python setup fixture preserves `setup-python` on hosted runners and uses pinned uv-managed CPython plus an empty-environment smoke test on self-hosted runners.
+- The shared Python setup fixture preserves `setup-python` on hosted runners and uses pinned uv-managed CPython on self-hosted runners. Each self-hosted job creates a fresh mode-700 root under `RUNNER_TEMP` for its managed interpreter, uv package cache, and seeded venv; the empty-environment smoke test runs before the venv is added to `PATH`. The pinned host-provided uv executable remains within the runner tool trust boundary.
 - `docs/private-ci-runners.md` records the repository-variable contract, provisioned runner pools, and platform-specific checks.
 - Four Linux and two macOS runners are registered and have accepted jobs. The routing implementation slice is complete for the post-merge target state; full CI validation of its portable Python setup remains a separate gate.
 

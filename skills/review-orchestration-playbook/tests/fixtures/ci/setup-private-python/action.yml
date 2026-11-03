@@ -12,6 +12,22 @@ runs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python-version }}
+    - name: Prepare isolated self-hosted Python root
+      if: ${{ runner.environment == 'self-hosted' }}
+      id: python-root
+      shell: bash
+      env:
+        RUNNER_TEMP: ${{ runner.temp }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${RUNNER_TEMP:-}" || -z "${GITHUB_OUTPUT:-}" ]]; then
+          echo "::error::Required GitHub runner paths are unavailable"
+          exit 1
+        fi
+
+        python_root="$(mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX")"
+        chmod 700 "$python_root"
+        printf 'root=%s\n' "$python_root" >> "$GITHUB_OUTPUT"
     - name: Install pinned uv
       if: ${{ runner.environment == 'self-hosted' }}
       id: setup-uv
@@ -24,6 +40,7 @@ runs:
       shell: bash
       env:
         REQUESTED_PYTHON_VERSION: ${{ inputs.python-version }}
+        PRIVATE_PYTHON_ROOT: ${{ steps.python-root.outputs.root }}
         UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
       run: |
         set -euo pipefail
@@ -40,18 +57,18 @@ runs:
           echo "::error::Pinned setup-uv executable is unavailable"
           exit 1
         fi
-        if [[ -z "${RUNNER_TOOL_CACHE:-}" || -z "${RUNNER_TEMP:-}" || -z "${GITHUB_PATH:-}" ]]; then
+        if [[ -z "$PRIVATE_PYTHON_ROOT" || ! -d "$PRIVATE_PYTHON_ROOT" || -z "${GITHUB_PATH:-}" ]]; then
           echo "::error::Required GitHub runner paths are unavailable"
           exit 1
         fi
 
-        export UV_PYTHON_INSTALL_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-python"
-        export UV_CACHE_DIR="${RUNNER_TOOL_CACHE%/}/codex-uv-cache"
+        export UV_PYTHON_INSTALL_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-python"
+        export UV_CACHE_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-cache"
         mkdir -p "$UV_PYTHON_INSTALL_DIR" "$UV_CACHE_DIR"
         "$UV_EXECUTABLE" python install --install-dir "$UV_PYTHON_INSTALL_DIR" --no-bin "$uv_python_version"
         managed_python="$("$UV_EXECUTABLE" python find --managed-python "$uv_python_version")"
 
-        python_env="$(mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX")"
+        python_env="$PRIVATE_PYTHON_ROOT/venv"
         "$UV_EXECUTABLE" venv --python "$managed_python" --seed "$python_env"
         env -i "$python_env/bin/python3" -I -S -c \
           'import sys; expected = tuple(map(int, sys.argv[1].split("."))); actual = tuple(sys.version_info[:len(expected)]); sys.exit(f"expected Python {sys.argv[1]}, got {sys.version.split()[0]}") if actual != expected else print(f"empty-environment Python smoke test passed: {sys.version.split()[0]}")' \

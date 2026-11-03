@@ -541,6 +541,23 @@ class RepositoryContractTest(unittest.TestCase):
         action_path = CI_FIXTURE_ROOT / "setup-private-python" / "action.yml"
         self.assertTrue(action_path.is_file())
         action = action_path.read_text(encoding="utf-8")
+        if CI_PROFILE == "private":
+            deployed_action_path = (
+                REPO_ROOT
+                / ".github"
+                / "actions"
+                / "setup-private-python"
+                / "action.yml"
+            )
+            self.assertTrue(
+                deployed_action_path.is_file(),
+                "private layout must include the reviewed local Python action",
+            )
+            self.assertEqual(
+                deployed_action_path.read_bytes(),
+                action_path.read_bytes(),
+                "deployed private Python action differs from its reviewed fixture",
+            )
         self.assertIn("using: composite", action)
         self.assertIn("runner.environment == 'github-hosted'", action)
         self.assertIn("runner.environment == 'self-hosted'", action)
@@ -553,6 +570,17 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn('version: "0.11.18"', action)
         self.assertIn("enable-cache: false", action)
+        self.assertIn("Prepare isolated self-hosted Python root", action)
+        self.assertLess(
+            action.index("id: python-root"), action.index("id: setup-uv")
+        )
+        self.assertIn(
+            'mktemp -d "${RUNNER_TEMP%/}/codex-private-python.XXXXXX"', action
+        )
+        self.assertIn('chmod 700 "$python_root"', action)
+        self.assertIn(
+            'printf \'root=%s\\n\' "$python_root" >> "$GITHUB_OUTPUT"', action
+        )
         self.assertIn('if [[ "$REQUESTED_PYTHON_VERSION" == "3.x" ]]; then', action)
         self.assertIn('uv_python_version="3"', action)
         self.assertIn(
@@ -568,11 +596,18 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIsNotNone(
                     re.fullmatch(uv_selector.group("pattern"), version)
                 )
-        self.assertIn("codex-uv-python", action)
-        self.assertIn("codex-uv-cache", action)
+        self.assertIn(
+            'PRIVATE_PYTHON_ROOT: ${{ steps.python-root.outputs.root }}', action
+        )
+        self.assertIn(
+            'UV_PYTHON_INSTALL_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-python"', action
+        )
+        self.assertIn('UV_CACHE_DIR="$PRIVATE_PYTHON_ROOT/codex-uv-cache"', action)
+        self.assertNotIn("RUNNER_TOOL_CACHE", action)
         self.assertIn("python install --install-dir", action)
         self.assertIn('--no-bin "$uv_python_version"', action)
         self.assertIn('python find --managed-python "$uv_python_version"', action)
+        self.assertIn('python_env="$PRIVATE_PYTHON_ROOT/venv"', action)
         self.assertIn('venv --python "$managed_python" --seed "$python_env"', action)
         smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
         path_export = action.index('>> "$GITHUB_PATH"')
