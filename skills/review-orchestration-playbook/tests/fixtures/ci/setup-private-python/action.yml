@@ -45,7 +45,7 @@ runs:
           exit 1
         fi
 
-        if [[ -z "$PRIVATE_PYTHON_ROOT" || ! -d "$PRIVATE_PYTHON_ROOT" || -z "${GITHUB_PATH:-}" ]]; then
+        if [[ -z "$PRIVATE_PYTHON_ROOT" || ! -d "$PRIVATE_PYTHON_ROOT" || -z "${GITHUB_PATH:-}" || -z "${GITHUB_ENV:-}" ]]; then
           echo "::error::Required GitHub runner paths are unavailable"
           exit 1
         fi
@@ -53,16 +53,16 @@ runs:
         case "${RUNNER_OS:-}:${RUNNER_ARCH:-}" in
           Linux:X64)
             uv_archive="uv-x86_64-unknown-linux-gnu.tar.gz"
-            uv_archive_size="24198195"
+            uv_archive_size="16671812"
             uv_member="uv-x86_64-unknown-linux-gnu/uv"
-            uv_sha256="588f3e360f69ce02b6982aa99f2240e803933a6b7e176ac01617830adf955add"
+            uv_sha256="c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
             checksum_command=(sha256sum)
             ;;
           macOS:ARM64)
             uv_archive="uv-aarch64-apple-darwin.tar.gz"
-            uv_archive_size="20688438"
+            uv_archive_size="14347867"
             uv_member="uv-aarch64-apple-darwin/uv"
-            uv_sha256="1a7adf8dadae3b55853115d13a8bf564d219597ad13824b93b213706933863e5"
+            uv_sha256="81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"
             checksum_command=(shasum -a 256)
             ;;
           *)
@@ -73,16 +73,16 @@ runs:
 
         uv_archive_path="$PRIVATE_PYTHON_ROOT/$uv_archive"
         curl --fail --silent --show-error --location --connect-timeout 15 --max-time 120 --max-filesize 134217728 --proto '=https' --proto-redir '=https' \
-          "https://github.com/astral-sh/uv/releases/download/0.11.18/$uv_archive" \
+          "https://github.com/astral-sh/uv/releases/download/0.13.7/$uv_archive" \
           --output "$uv_archive_path"
         actual_uv_size="$(wc -c < "$uv_archive_path" | tr -d '[:space:]')"
         if [[ "$actual_uv_size" != "$uv_archive_size" ]]; then
-          echo "::error::Downloaded uv 0.11.18 archive size mismatch"
+          echo "::error::Downloaded uv 0.13.7 archive size mismatch"
           exit 1
         fi
         actual_uv_sha256="$("${checksum_command[@]}" "$uv_archive_path" | cut -d ' ' -f 1)"
         if [[ "$actual_uv_sha256" != "$uv_sha256" ]]; then
-          echo "::error::Downloaded uv 0.11.18 archive checksum mismatch"
+          echo "::error::Downloaded uv 0.13.7 archive checksum mismatch"
           exit 1
         fi
 
@@ -93,7 +93,7 @@ runs:
           exit 1
         fi
         uv_version_output="$("$uv_executable" --no-config --version)"
-        if [[ "$uv_version_output" != uv\ 0.11.18* ]]; then
+        if [[ "$uv_version_output" != uv\ 0.13.7* ]]; then
           echo "::error::Unexpected uv version: $uv_version_output"
           exit 1
         fi
@@ -116,6 +116,24 @@ runs:
 
         python_env="$PRIVATE_PYTHON_ROOT/venv"
         "$uv_executable" --no-config venv --no-project --python "$managed_python" --seed "$python_env"
+        certifi_requirements="$PRIVATE_PYTHON_ROOT/certifi-requirements.txt"
+        printf '%s\n' 'certifi==2026.10.23 --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1' \
+          > "$certifi_requirements"
+        "$uv_executable" --no-config pip install --python "$python_env/bin/python3" \
+          --no-deps --only-binary :all: --require-hashes --no-cache \
+          --requirement "$certifi_requirements"
+        certifi_bundle="$("$python_env/bin/python3" -I -c 'import certifi; print(certifi.where())')"
+        case "$certifi_bundle" in
+          "$python_env"/lib/python*/site-packages/certifi/cacert.pem) ;;
+          *)
+            echo "::error::certifi bundle is outside the fresh Python environment"
+            exit 1
+            ;;
+        esac
+        "$python_env/bin/python3" -I -c \
+          'import ssl, sys; context = ssl.create_default_context(cafile=sys.argv[1]); subjects = [dict(rdn) for cert in context.get_ca_certs() for rdn in cert["subject"]]; affected = any(subject.get("commonName") == "emSign ECC Root CA - G3" for subject in subjects); sys.exit("affected emSign ECC Root CA - G3 is present in certifi bundle") if affected else print("certifi bundle loads and excludes affected emSign ECC Root CA - G3")' \
+          "$certifi_bundle"
+        printf 'PIP_CERT=%s\n' "$certifi_bundle" >> "$GITHUB_ENV"
         env -i "$python_env/bin/python3" -I -S -c \
           'import sys; expected = tuple(map(int, sys.argv[1].split("."))); actual = tuple(sys.version_info[:len(expected)]); sys.exit(f"expected Python {sys.argv[1]}, got {sys.version.split()[0]}") if actual != expected else print(f"empty-environment Python smoke test passed: {sys.version.split()[0]}")' \
           "$uv_python_version"

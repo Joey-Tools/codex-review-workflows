@@ -599,23 +599,24 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             'uv_archive="uv-x86_64-unknown-linux-gnu.tar.gz"', action
         )
-        self.assertIn('uv_archive_size="24198195"', action)
+        self.assertIn('uv_archive_size="16671812"', action)
         self.assertIn('uv_member="uv-x86_64-unknown-linux-gnu/uv"', action)
         self.assertIn(
-            'uv_sha256="588f3e360f69ce02b6982aa99f2240e803933a6b7e176ac01617830adf955add"',
+            'uv_sha256="c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"',
             action,
         )
         self.assertIn('uv_archive="uv-aarch64-apple-darwin.tar.gz"', action)
-        self.assertIn('uv_archive_size="20688438"', action)
+        self.assertIn('uv_archive_size="14347867"', action)
         self.assertIn('uv_member="uv-aarch64-apple-darwin/uv"', action)
         self.assertIn(
-            'uv_sha256="1a7adf8dadae3b55853115d13a8bf564d219597ad13824b93b213706933863e5"',
+            'uv_sha256="81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731"',
             action,
         )
         self.assertIn(
-            'https://github.com/astral-sh/uv/releases/download/0.11.18/$uv_archive',
+            'https://github.com/astral-sh/uv/releases/download/0.13.7/$uv_archive',
             action,
         )
+        self.assertIn('uv\\ 0.13.7*', action)
         self.assertIn("--max-time 120", action)
         self.assertIn("--max-filesize 134217728", action)
         self.assertIn("--proto '=https' --proto-redir '=https'", action)
@@ -661,7 +662,43 @@ class RepositoryContractTest(unittest.TestCase):
             '"$managed_python" --seed "$python_env"',
             action,
         )
-        self.assertEqual(action.count('"$uv_executable" --no-config'), 4)
+        self.assertIn(
+            "certifi==2026.10.23 --hash=sha256:"
+            "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1",
+            action,
+        )
+        self.assertIn(
+            '"$uv_executable" --no-config pip install --python '
+            '"$python_env/bin/python3"',
+            action,
+        )
+        self.assertIn(
+            "--no-deps --only-binary :all: --require-hashes --no-cache", action
+        )
+        self.assertIn('--requirement "$certifi_requirements"', action)
+        self.assertIn('certifi_bundle="$("$python_env/bin/python3" -I -c', action)
+        self.assertIn(
+            '"$python_env"/lib/python*/site-packages/certifi/cacert.pem)', action
+        )
+        self.assertIn("ssl.create_default_context(cafile=sys.argv[1])", action)
+        self.assertIn("emSign ECC Root CA - G3", action)
+        self.assertIn(
+            'printf \'PIP_CERT=%s\\n\' "$certifi_bundle" >> "$GITHUB_ENV"', action
+        )
+        self.assertNotIn("SSL_CERT_FILE", action)
+        self.assertNotIn("SSL_CERT_DIR", action)
+        self.assertEqual(action.count('"$uv_executable" --no-config'), 5)
+        certifi_install = action.index('"$uv_executable" --no-config pip install')
+        certifi_validation = action.index(
+            "ssl.create_default_context(cafile=sys.argv[1])"
+        )
+        pip_cert_export = action.index('PIP_CERT=%s\\n')
+        smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
+        path_export = action.index('>> "$GITHUB_PATH"')
+        self.assertLess(certifi_install, certifi_validation)
+        self.assertLess(certifi_validation, pip_cert_export)
+        self.assertLess(pip_cert_export, smoke)
+        self.assertLess(smoke, path_export)
         python_find = action.index('managed_python="$(')
         managed_path_check = action.index('case "$managed_python" in', python_find)
         venv_creation = action.index('"$uv_executable" --no-config venv', python_find)
@@ -732,9 +769,6 @@ class RepositoryContractTest(unittest.TestCase):
                 find_cwd.read_text(encoding="utf-8").strip(), str(private_root)
             )
             self.assertFalse(marker.exists())
-        smoke = action.index('env -i "$python_env/bin/python3" -I -S -c')
-        path_export = action.index('>> "$GITHUB_PATH"')
-        self.assertLess(smoke, path_export)
         self.assertIn("RUNNER_TEMP", action)
         self.assertIn("codex-private-python.XXXXXX", action)
         self.assertNotRegex(action, r"LD_[A-Z0-9_]+")

@@ -391,7 +391,7 @@ jobs:
         id: setup-uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          version: "0.11.18"
+          version: "0.13.7"
           enable-cache: false
       - name: Run deterministic supervisor from read-only install
         env:
@@ -438,8 +438,8 @@ jobs:
           if [[ -z "$trusted_uv" ]] \
             || ! /bin/test -f "$trusted_uv" \
             || /bin/test -L "$trusted_uv" \
-            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
-            echo "::error::Pinned setup-uv executable is not the expected physical uv 0.11.18; retained at $isolated_root"
+            || [[ "$(run_trusted_uv self version --short)" != "0.13.7" ]]; then
+            echo "::error::Pinned setup-uv executable is not the expected physical uv 0.13.7; retained at $isolated_root"
             exit 1
           fi
           trusted_uv_binding="$(/usr/bin/stat -f '%d:%i:%u:%g:%Lp:%z:%m' "$trusted_uv")"
@@ -463,7 +463,7 @@ jobs:
           trusted_uv_postinstall_digest="${trusted_uv_postinstall_digest%% *}"
           if [[ "$trusted_uv_postinstall_binding" != "$trusted_uv_binding" ]] \
             || [[ "$trusted_uv_postinstall_digest" != "$trusted_uv_digest" ]] \
-            || [[ "$(run_trusted_uv self version --short)" != "0.11.18" ]]; then
+            || [[ "$(run_trusted_uv self version --short)" != "0.13.7" ]]; then
             echo "::error::Pinned setup-uv executable changed while installing Python; retained at $isolated_root"
             exit 1
           fi
@@ -524,7 +524,7 @@ jobs:
             || /usr/bin/sudo /bin/test -L "$uv_staging_dir/.gitignore" \
             || [[ "$(/usr/bin/sudo /usr/bin/stat -f '%z' "$uv_staging_dir/.gitignore")" != "1" ]] \
             || [[ "$(/usr/bin/sudo /bin/cat "$uv_staging_dir/.gitignore")" != "*" ]]; then
-            echo "::error::uv staging inventory is not the exact v0.11.18 managed-Python layout; retained at $isolated_root"
+            echo "::error::uv staging inventory is not the exact v0.13.7 managed-Python layout; retained at $isolated_root"
             exit 1
           fi
           staged_runtime_root_physical="$(/usr/bin/sudo /bin/sh -c 'cd "$1" && pwd -P' sh "$staged_runtime_root")"
