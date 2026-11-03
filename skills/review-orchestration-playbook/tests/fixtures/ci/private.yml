@@ -206,7 +206,8 @@ jobs:
 
   linux_isolation_tests:
     name: linux-isolation-tests
-    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # This integration test changes persistent AppArmor state on the runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -390,11 +391,8 @@ jobs:
 
   readonly_install_supervisor_tests:
     name: read-only-install-supervisor (python-3.13)
-    runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-26"]') }}
-    concurrency:
-      group: ${{ vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS != '' && 'private-self-hosted-readonly-install' || format('readonly-install-{0}-{1}', github.run_id, github.run_attempt) }}
-      cancel-in-progress: false
-      queue: max
+    # Failure paths may retain root-owned state until GitHub-hosted runner disposal.
+    runs-on: macos-26
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -410,20 +408,10 @@ jobs:
           enable-cache: false
       - name: Run deterministic supervisor from read-only install
         env:
-          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
-          DEVELOPER_DIR: ${{ runner.environment == 'github-hosted' && '/Applications/Xcode_26.6.app/Contents/Developer' || '' }}
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
           REVIEW_SOURCE_RELATIVE: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
           UV_EXECUTABLE: ${{ steps.setup-uv.outputs.uv-path }}
         run: |
-          if [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "github-hosted" ]]; then
-            :
-          elif [[ "$CODEX_REVIEW_RUNNER_ENVIRONMENT" == "self-hosted" ]]; then
-            DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"
-            export DEVELOPER_DIR
-          else
-            echo "::error::Unsupported runner environment: $CODEX_REVIEW_RUNNER_ENVIRONMENT"
-            exit 1
-          fi
           isolated_root="$(/usr/bin/sudo /usr/bin/mktemp -d /private/codex-review-readonly.XXXXXX)"
           echo "Read-only isolation recovery root: $isolated_root"
           if [[ ! "$isolated_root" =~ ^/private/codex-review-readonly\.[[:alnum:]]{6}$ ]]; then

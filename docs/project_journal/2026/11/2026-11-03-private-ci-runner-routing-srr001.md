@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 
 - The canonical private workflow fixture and contract tests describe the routing variables and retain the original job and matrix structure.
+- The read-only macOS installation job and Linux isolation job retain disposable hosted runners because their side effects require host disposal; functional supervisor coverage remains eligible for the self-hosted macOS pool.
 - `docs/private-ci-runners.md` records the repository-variable contract, intended runner pools, and platform-specific checks.
 - The routing implementation slice is complete for the post-merge target state. Runner provisioning is not complete; no live self-hosted execution is claimed.
 

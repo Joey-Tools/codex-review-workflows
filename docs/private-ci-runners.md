@@ -1,6 +1,6 @@
 # Private CI Runner Routing
 
-The private CI workflow fixture in this repository mirrors `codex-private-workflows` and is covered by its contract tests. Runner routing preserves the existing jobs, test modules, shards, matrices, and hosted coverage while adapting provider-specific runtime setup where needed.
+The private CI workflow fixture in this repository mirrors `codex-private-workflows` and is covered by its contract tests. Runner routing preserves the existing jobs, test modules, shards, and matrices while adapting provider-specific runtime setup. Two isolation jobs retain disposable GitHub-hosted runners.
 
 ## Repository Variables
 
@@ -17,8 +17,9 @@ Runner registration is repository-only. The planned Linux pool has four instance
 
 ## Platform-Specific Checks
 
-- Hosted macOS fingerprint reporting and hosted-only no-child probes continue to run only on GitHub-hosted runners. Functional tests and the real read-only supervisor custody and isolation checks continue on both runner types.
-- The self-hosted macOS path discovers Xcode with `xcode-select -p`. When the read-only macOS job uses the self-hosted pool, workflow concurrency serializes it with `queue: max` because UID allocation is machine-global; the original hosted parallelism is retained.
+- Hosted macOS fingerprint reporting and hosted-only no-child probes continue to run only on GitHub-hosted runners. Functional supervisor tests continue on both runner types; self-hosted macOS discovers Xcode with `xcode-select -p`.
+- `readonly_install_supervisor_tests` stays on hosted `macos-26`: failure and cancellation paths can retain local accounts and immutable root-owned trees until runner disposal.
+- `linux_isolation_tests` stays on hosted `ubuntu-latest` because it changes the global AppArmor user-namespace restriction. Persistent runners retain their existing host policy.
 - The Linux Python 3.9 compatibility job keeps `actions/setup-python` on hosted runners. On self-hosted Ubuntu 26, it uses `uv` to install Python 3.9 and create a seeded per-job virtual environment because the official setup-python artifact is unavailable there.
 
 This routing slice does not include CI optimization. Timing-based optimization belongs in a follow-up PR, and live self-hosted validation requires completed runner provisioning.

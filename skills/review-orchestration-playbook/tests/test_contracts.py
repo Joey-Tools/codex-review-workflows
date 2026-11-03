@@ -370,8 +370,19 @@ class RepositoryContractTest(unittest.TestCase):
         runs_on = re.findall(r"(?m)^    runs-on: (.+)$", workflow)
 
         self.assertEqual(len(runs_on), len(jobs))
-        self.assertTrue(all("fromJSON(" in item for item in runs_on))
         self.assertNotIn("runs-on: ${{ matrix.os }}", workflow)
+        hosted_exceptions = {
+            "linux_isolation_tests": "ubuntu-latest",
+            "readonly_install_supervisor_tests": "macos-26",
+        }
+        for job_name, job in jobs.items():
+            run_line = next(line for line in job.splitlines() if "runs-on:" in line)
+            if job_name in hosted_exceptions:
+                self.assertEqual(
+                    run_line, f"    runs-on: {hosted_exceptions[job_name]}"
+                )
+            else:
+                self.assertIn("fromJSON(", run_line)
         for variable in (
             "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
             "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
@@ -398,14 +409,6 @@ class RepositoryContractTest(unittest.TestCase):
             "independent_supervisor_tests": (
                 "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
                 '["macos-26"]',
-            ),
-            "readonly_install_supervisor_tests": (
-                "CODEX_PRIVATE_MACOS_RUNNER_LABELS",
-                '["macos-26"]',
-            ),
-            "linux_isolation_tests": (
-                "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
-                '["ubuntu-latest"]',
             ),
             "private_overlay_tests": (
                 "CODEX_PRIVATE_LINUX_RUNNER_LABELS",
@@ -460,6 +463,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("exit 1", broker)
 
         readonly = jobs["readonly_install_supervisor_tests"]
+        self.assertIn(
+            "# Failure paths may retain root-owned state until GitHub-hosted runner disposal.",
+            readonly,
+        )
+        self.assertNotIn("concurrency:", readonly)
+        self.assertNotIn("CODEX_PRIVATE_MACOS_RUNNER_LABELS", readonly)
+        self.assertNotIn("runner.environment", readonly)
         readonly_deterministic = re.search(
             r"(?ms)^      - name: Run deterministic supervisor from read-only install\n(?P<body>.*?)(?=^      - |\Z)",
             readonly,
@@ -469,29 +479,20 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("trusted_mac_gate.py", readonly_deterministic.group("body"))
         self.assertIn("sandbox-exec", readonly_deterministic.group("body"))
         self.assertIn("hosted-readonly", readonly_deterministic.group("body"))
-        self.assertIn('== "github-hosted"', readonly_deterministic.group("body"))
-        self.assertIn('== "self-hosted"', readonly_deterministic.group("body"))
-        self.assertIn("xcode-select -p", readonly_deterministic.group("body"))
         self.assertIn(
-            "Unsupported runner environment",
+            "DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer",
             readonly_deterministic.group("body"),
         )
-        self.assertIn("exit 1", readonly_deterministic.group("body"))
-        readonly_concurrency = re.search(
-            r"(?ms)^    concurrency:\n(?P<body>.*?)(?=^    timeout-minutes:)",
-            readonly,
-        )
-        self.assertIsNotNone(readonly_concurrency)
-        concurrency = readonly_concurrency.group("body")
-        self.assertIn("vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS != ''", concurrency)
-        self.assertIn("private-self-hosted-readonly-install", concurrency)
+        linux_isolation = jobs["linux_isolation_tests"]
         self.assertIn(
-            "format('readonly-install-{0}-{1}', github.run_id, github.run_attempt)",
-            concurrency,
+            "# This integration test changes persistent AppArmor state on the runner.",
+            linux_isolation,
         )
-        self.assertIn("cancel-in-progress: false", concurrency)
-        self.assertIn("queue: max", concurrency)
-        self.assertNotIn("runner.", concurrency)
+        self.assertNotIn("CODEX_PRIVATE_LINUX_RUNNER_LABELS", linux_isolation)
+        self.assertIn(
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            linux_isolation,
+        )
 
     def test_private_python39_job_uses_managed_interpreter_only_on_self_hosted(
         self,
