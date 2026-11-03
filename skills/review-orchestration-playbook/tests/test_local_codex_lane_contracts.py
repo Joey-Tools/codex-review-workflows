@@ -2508,11 +2508,10 @@ class LocalCodexLaneContractTest(unittest.TestCase):
             "codex_cli_external_tool_surface: <verified-disabled | writable-or-unknown | not-applicable>",
             "codex_cli_launch_match: <exact-type-preserving | invalid | unknown | not-applicable>",
             "Every clean CLI result, including a `runtime-attested` result, also requires",
-            "For CLI lanes, shared metadata records the resolved binary, exact version output, literal argv submitted at launch, and `codex_cli_external_tool_surface: verified-disabled` only after parent-owned local preflight evidence verifies the effective tool surface",
-            "`features list` must report `apps`, `plugins`, `computer_use`, `browser_use`, `browser_use_external`, `browser_use_full_cdp_access`, `image_generation`, `goals`, `skill_mcp_dependency_install`, `multi_agent`, `multi_agent_v2`, `daemon_auto_start`, and `hooks` all false",
-            "Safe effective-config metadata must also confirm `web_search: disabled`, `agents.enabled: false`, `memories.generate_memories: false`, and empty `notify`",
-            "without starting a thread or turn, and never retain the raw configuration response",
-            "Build one whole-table `mcp_servers` override",
+            "For CLI lanes, shared metadata records the resolved binary, exact version output, literal argv submitted at launch, and `codex_cli_external_tool_surface: verified-disabled` only after parent-owned local preflight evidence verifies the effective configuration gate",
+            "Safe effective-config values must also confirm `web_search: disabled`, `agents.enabled: false`, `memories.generate_memories: false`, and empty `notify`",
+            "do not start a thread, turn, or model session",
+            "Build the whole-table `mcp_servers` override",
             "only when all three exactly match the prelaunch prompt record",
             "Missing or unknown argv/version evidence, a missing required flag, or any mismatch is inconclusive",
         ):
@@ -2544,6 +2543,53 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         )
         self.assertIn("do not use `--ignore-user-config`", local)
         self.assertIn("create a temporary `CODEX_HOME`", _normalized(local))
+
+    def test_cli_metadata_bootstrap_is_version_proven_and_config_read_only(self) -> None:
+        local = _read("local-codex-lane.md")
+        templates = _read("review-prompt-templates.md")
+        combined = _normalized(f"{local}\n{templates}").lower()
+
+        for required in (
+            "standard standalone cli path for `codex-cli 0.166.0`",
+            "`rust-v0.166.0`",
+            "start two fresh processes using the resolved executable's `app-server --listen stdio://` subcommand",
+            "same ordinary user `codex_home`",
+            "all required process-local feature and callback overrides from the `codex exec` argv",
+            "send the minimum `initialize` request without capabilities, then `initialized` and `config/read` with `includelayers=false`",
+            "`includelayers=false`",
+            "the first process omits the `mcp_servers` override",
+            "`result.config.mcp_servers`",
+            "transport-kind presence (`command` or `url`)",
+            "do not add plugin-only or host-only names",
+            "the same top-level name set",
+            "every enabled value false",
+            "the same transport-kind presence",
+            "source-proven recursive merge",
+            "use this exact generated override in the subsequent `codex exec` argv",
+            "do not claim an empty override cleared inherited entries",
+            "unknown or mismatched version/source",
+            "custom provider or extension path",
+            "makes the cli lane `inconclusive`",
+            "never use `codex mcp list`",
+            "do not create a thread or turn",
+            "or call auth, mcp list/get/status, or feature-list apis",
+            "this is not a zero-network guarantee",
+            "not a runtime tool inventory, host-isolation proof",
+            "discard each raw response",
+        ):
+            self.assertIn(required, combined)
+
+        self.assertNotIn("mcp list --json", combined)
+        self.assertNotIn("features list", combined)
+
+        for safe_projection in (
+            "its name",
+            "resolved enabled boolean",
+            "same transport-kind presence",
+            "keep the raw response and transport details transient",
+            "never persist or report urls, commands, arguments, environment values, or credentials",
+        ):
+            self.assertIn(safe_projection, combined)
 
     def test_self_policy_candidate_agents_has_closed_scoped_guidance_admission(
         self,

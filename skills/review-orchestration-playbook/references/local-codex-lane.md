@@ -189,19 +189,98 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   ["/absolute/path/codex", "-a", "never", "-m", "selected_model", "-c", "model_reasoning_effort=\"selected_effort\"", "-C", "/absolute/neutral-root", "-c", "features.apps=false", "-c", "features.plugins=false", "-c", "features.computer_use=false", "-c", "features.browser_use=false", "-c", "features.browser_use_external=false", "-c", "features.browser_use_full_cdp_access=false", "-c", "features.image_generation=false", "-c", "features.goals=false", "-c", "features.skill_mcp_dependency_install=false", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.daemon_auto_start=false", "-c", "agents.enabled=false", "-c", "memories.generate_memories=false", "-c", "web_search=\"disabled\"", "-c", "features.hooks=false", "-c", "notify=[]", "-c", "mcp_servers={\"<configured-name-1>\"={enabled=false},\"<configured-name-2>\"={enabled=false}}", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "-"]
   ```
 
-  Resolve all MCP server names from the user's effective configuration at the
-  neutral root and put every name in one complete `mcp_servers` table override
-  with `enabled=false`; replace the two example names above with the full
-  configured set, never with a guessed subset. Quote each server name as a
-  TOML key inside the whole-table value, so names containing dots remain one
-  key; do not construct dotted `-c mcp_servers.<name>...` paths. Do not treat
-  `mcp_servers={}` as clearing inherited server entries. Verify the effective
-  disabled set with `mcp list --json` under the same normal configuration,
-  root, and feature/MCP overrides; require every listed name disabled and zero
-  enabled servers. If no servers are configured, verify the zero-name result
-  and do not claim that an empty override disabled inherited servers. Record
-  only server names, total count, and enabled count; never retain connection
-  URLs, arguments, environment values, raw configuration, or credentials.
+  Resolve configured MCP declarations from the effective configuration at the
+  neutral root and perform a no-thread configuration read before building
+  the complete `mcp_servers` table override.
+  Construct this sequence only with the source-proven standard standalone
+  CLI path for `codex-cli 0.166.0`, matching OpenAI Codex Rust source tag
+  `rust-v0.166.0` at commit
+  `6ff1e1ca3b30fc8b914720681fcf5fe62e95f856`. Reconfirm the resolved
+  executable and exact version output. The proof covers
+  [initialize](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/request_processors/initialize_processor.rs#L53-L143),
+  [config/read](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/request_processors/config_processor.rs#L111-L137),
+  [effective configuration loading](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/config_manager_service.rs#L130-L175),
+  [response construction](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/config_manager_service.rs#L543-L548),
+  and [MCP request dispatch](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/message_processor.rs#L485-L492)
+  [and explicit MCP RPC handling](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/message_processor.rs#L1761-L1800).
+  Recursive `mcp_servers` merging preserves existing transport
+  configuration when applying `enabled=false`
+  ([merge](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/config/src/merge.rs#L73-L144),
+  [MCP types](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/config/src/mcp_types.rs#L422-L525)).
+
+  The standard standalone CLI proof covers built-in providers with
+  `features.apps=false` and `features.plugins=false`: Apps removes the
+  `codex_apps` registration, the ordinary CLI provider has no cloud
+  contributor, and plugins=false clears executor MCP metadata
+  ([Apps extension](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/ext/mcp/src/lib.rs#L26-L55),
+  [standard extension registration](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server/src/extensions.rs#L104-L105),
+  the standard standalone CLI provider constructor (no cloud contributor),
+  [plugin contributors](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/ext/mcp/src/plugin.rs#L194-L207),
+  [plugin-disabled projection](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/ext/mcp/src/plugin.rs#L440-L459),
+  [core plugin gate](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/core-plugins/src/manager.rs#L783-L786)).
+  An unknown
+  or mismatched version/source, custom provider or extension path, or observed
+  host-side tool injection makes the CLI lane `inconclusive`.
+
+  Start two fresh processes using the resolved executable's
+  `app-server --listen stdio://` subcommand, the same ordinary user
+  `CODEX_HOME`, neutral root, and all required process-local feature and
+  callback overrides from the `codex exec` argv. Send the minimum
+  `initialize` request without capabilities, then `initialized` and
+  `config/read` with `includeLayers=false`. The first
+  process omits the `mcp_servers` override. Do not create a thread or turn,
+  start a model session, or call auth, MCP list/get/status, or feature-list
+  APIs. This source proof excludes MCP client startup and MCP
+  stdio/OAuth discovery for these requests. App-server startup may perform
+  other work, including managed-policy or telemetry activity; this is not a
+  zero-network guarantee.
+
+  Before each process starts, set a finite parent-selected deadline and
+  response-byte ceiling for the initialize/config-read exchange. Terminate
+  the process and classify the attempt as `inconclusive` on timeout, byte
+  ceiling, truncated output, or incomplete response; do not retain raw
+  stdout/stderr as a receipt.
+
+  From the first response, inspect only the thirteen effective feature booleans
+  at `result.config.features`, the selected safe values in `result.config`,
+  and `result.config.mcp_servers` (the flattened fields defined by the
+  [protocol config type](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server-protocol/src/protocol/v2/config.rs#L259-L294)).
+  In transient memory, project each valid
+  top-level entry to its name, transport-kind presence (`command` or `url`),
+  and resolved enabled boolean. Reject a missing, ambiguous, malformed, or
+  unreadable transport/enabled value as `inconclusive`. Top-level config is
+  not a runtime inventory; do not add plugin-only or host-only names. Keep the
+  raw response and transport details transient; never persist or report URLs,
+  commands, arguments, environment values, or credentials.
+
+  For each projected name, build one complete `mcp_servers` override mapping
+  that name to `enabled=false`. Quote names as TOML keys so dots remain part
+  of one name; do not construct dotted `-c mcp_servers.<name>...` paths. Use
+  the source-proven recursive merge and start the second fresh app-server
+  process with the generated MCP override as a process-local `-c` value.
+  Repeat only `initialize`/`initialized`/`config/read`. Require
+  the same top-level name set, every enabled value false, and the same
+  transport-kind presence for each name. Use this exact generated override in
+  the subsequent `codex exec` argv. These are declared configuration values.
+
+  If the first response contains no top-level entries, require the second
+  response to contain none and omit the MCP override in both processes and the
+  `codex exec` argv. Do not claim an empty override cleared inherited
+  entries. Never use `codex mcp list` or an equivalent runtime enumeration:
+  in this source-proven version, `mcp list` calls `compute_auth_statuses`
+  and performs HTTP requests
+  ([implementation](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/cli/src/mcp_cmd.rs#L690-L718),
+  [HTTP/OAuth tests](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/cli/tests/mcp_list.rs#L114-L224)).
+
+  After both reads pass, keep the existing local preflight record: thirteen
+  feature booleans, selected safe configuration values, and MCP
+  names/counts/enabled count. Do not add another receipt schema or include the
+  in-memory transport projection in the prompt or final report. Discard each
+  raw response. The `codex_cli_external_tool_surface: verified-disabled`
+  value summarizes these version-proven CLI configuration checks; it is not
+  a runtime tool inventory, host-isolation claim, or proof of zero network
+  activity. The default clean-context, read-only subagent route remains
+  preferred.
 
   Record the resolved executable, exact version output, and complete literal
   submitted token array in shared metadata; the final report repeats the actual
@@ -216,30 +295,34 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   Do not alter global configuration or use `--ignore-user-config`. If a higher-priority managed
   policy rejects or overrides any setting, classify the launch as blocked
   or inconclusive; do not bypass that policy or create another configuration
-  home. Under the same normal configuration, neutral root, and exact final
-  feature/MCP overrides, verify `features list` reports `apps`, `plugins`,
-  `computer_use`, `browser_use`, `browser_use_external`,
-  `browser_use_full_cdp_access`, `image_generation`, `goals`,
-  `skill_mcp_dependency_install`, `multi_agent`, `multi_agent_v2`,
-  `daemon_auto_start`, and `hooks` all false,
-  and `mcp list --json` reports every configured server disabled with zero
-  enabled servers. Also require safe effective-config metadata to confirm
-  `web_search: disabled`, `agents.enabled: false`,
-  `memories.generate_memories: false`, and an empty
-  `notify` array. A loaded configuration value is execution-level evidence;
-  parser success alone is not a runtime tool-set attestation. A bounded local
-  app-server `config/read` query with `includeLayers=false` can expose these
-  values after `initialize`/`initialized`, using the same personal configuration,
-  neutral root, and review-control overrides. Disable MCP servers and callbacks
-  before that metadata service starts. Never issue thread, turn, or auth API
-  calls, start a model session, or use `debug prompt-input` for this preflight.
-  Project only the allowlisted enum/boolean values and `notify`-empty state in
-  memory; never retain the raw configuration response. Retain only minimal
-  local preflight evidence (selected configuration values, feature states,
-  and MCP names/counts/enabled count); set
-  `codex_cli_external_tool_surface: verified-disabled` only when all required checks
-  pass. If any required check is unknown or fails, or any external write tool
-  remains enabled, classify the attempt as inconclusive.
+  home. In the second process, use the same normal configuration, neutral
+  root, feature and callback overrides, plus the exact final MCP override.
+  Read the thirteen feature values from `result.config.features` and the
+  safe configuration values from `result.config`; require
+  `apps`, `plugins`, `computer_use`, `browser_use`,
+  `browser_use_external`, `browser_use_full_cdp_access`,
+  `image_generation`, `goals`, `skill_mcp_dependency_install`,
+  `multi_agent`, `multi_agent_v2`, `daemon_auto_start`, and `hooks` all
+  false. Require `web_search: disabled`, `agents.enabled: false`,
+  `memories.generate_memories: false`, and an empty `notify` array.
+  Require the same top-level MCP name set with every declared server disabled.
+  If any required value is absent, unreadable, or not the expected effective
+  value, classify the CLI lane as inconclusive. Parser success alone does not
+  verify effective settings.
+
+  This bounded local app-server `config/read` query follows
+  `initialize`/`initialized`, uses `includeLayers=false`, and starts before
+  any thread or model session. Process-local feature and callback controls are
+  active before the service starts. Never issue thread, turn, or auth API
+  calls, or use `debug prompt-input` for this preflight. Project only the
+  allowlisted enum/boolean values and `notify`-empty state in memory; never
+  retain a raw configuration response. Keep the existing minimal local
+  preflight evidence (selected configuration values, feature states, and MCP
+  names/counts/enabled count); set
+  `codex_cli_external_tool_surface: verified-disabled` only when all required
+  checks pass. This value is not host-level isolation or a complete runtime
+  tool inventory. If any required check is unknown or fails, or any external
+  write tool remains enabled, classify the attempt as inconclusive.
   An observed callback has the same blocked/inconclusive outcome.
   Disabling goals also removes persisted-goal mutations and automatic
   continuation from this report-only process.

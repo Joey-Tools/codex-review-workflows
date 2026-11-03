@@ -612,10 +612,13 @@ Read [local-codex-lane.md](local-codex-lane.md).
   disabled MCP dependency installation, nested CLI agents, and daemon startup, exclusion of this
   thread from memory-generation inputs with existing memory reading unchanged,
   disabled hosted web search,
-  `notify=[]`, and a whole-table `mcp_servers` override disabling every
-  configured server. Validate that no MCP server remains enabled with
-  `mcp list --json`; do not alter global configuration or bypass a
-  higher-priority managed policy.
+  `notify=[]`, and the complete `mcp_servers` override produced by the
+  two-read no-thread `config/read` procedure in [Local Codex](local-codex-lane.md).
+  That procedure is accepted only for its source-proven CLI version and
+  standard standalone provider path. It verifies declared effective config;
+  it is not a runtime tool inventory or host-isolation proof. Do not use
+  `mcp list`, `mcp get`, or `mcp status` for this preflight. Do not alter
+  global configuration or bypass a higher-priority managed policy.
   Preserve the neutral launch root and its short pre/post identity, owner, mode,
   access-policy, ACL-grant, and empty-inventory evidence. Trusted personal
   configuration and global guidance are allowed; candidate project controls
@@ -657,11 +660,13 @@ accept the complete invocation. Record `codex_cli_launch_match:
 exact-type-preserving`; for non-CLI adapters, all CLI fields including this
 match are `not-applicable`. Require the final
 `codex_cli_external_tool_surface: verified-disabled`, backed by the exact
-process argv and same-configuration, neutral-root feature/MCP checks plus safe
-effective-config metadata confirming disabled hosted web search, disabled
+process argv and same-configuration, neutral-root feature/MCP config reads
+plus safe effective-config metadata confirming disabled hosted web search, disabled
 `agents.enabled` alongside both `multi_agent` feature variants, disabled
-memory-generation inputs, and empty notifications. Require every configured
-MCP server disabled and zero enabled. For non-CLI
+memory-generation inputs, and empty notifications. Require every declared
+top-level MCP server disabled and zero enabled in the second config read.
+Treat that as effective configuration evidence, not a complete runtime
+inventory or host-level isolation claim. For non-CLI
 adapters, this field is `not-applicable`. A CLI `accepted-pinned-launch` additionally
 requires that the requested model/reasoning were pinned by the accepted argv
 and that the full review finished with a structured terminal event and zero
