@@ -317,16 +317,19 @@ class RepositoryContractTest(unittest.TestCase):
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_blocks(workflow)
         expected_leaf_jobs = {
+            "classify_changes",
+            "source_admission_tests",
             "python-39-compatibility",
             "independent_supervisor_tests",
             "readonly_install_supervisor_tests",
             "review_syntax_tests",
             "review_tests",
             "review_macos_shard_tests",
+            "review_macos_native_tests",
             "project_journal_tests",
-            "private_overlay_sync_tests",
             "linux_isolation_tests",
             "private_overlay_tests",
+            "private_overlay_uninstall_shard_tests",
             "private_overlay_contract_tests",
         }
         self.assertEqual(set(jobs), expected_leaf_jobs | {"test"})
@@ -337,30 +340,6 @@ class RepositoryContractTest(unittest.TestCase):
             re.findall(r"(?m)^      - ([A-Za-z0-9_-]+)$", aggregate)
         )
         self.assertEqual(aggregate_needs, expected_leaf_jobs)
-        expected_results = {
-            "PYTHON_39_RESULT": "python-39-compatibility",
-            "INDEPENDENT_SUPERVISOR_RESULT": "independent_supervisor_tests",
-            "READONLY_INSTALL_SUPERVISOR_RESULT": "readonly_install_supervisor_tests",
-            "REVIEW_SYNTAX_RESULT": "review_syntax_tests",
-            "REVIEW_RESULT": "review_tests",
-            "REVIEW_MACOS_SHARD_RESULT": "review_macos_shard_tests",
-            "PROJECT_JOURNAL_RESULT": "project_journal_tests",
-            "PRIVATE_OVERLAY_SYNC_RESULT": "private_overlay_sync_tests",
-            "LINUX_ISOLATION_RESULT": "linux_isolation_tests",
-            "PRIVATE_OVERLAY_RESULT": "private_overlay_tests",
-            "PRIVATE_OVERLAY_CONTRACT_RESULT": "private_overlay_contract_tests",
-        }
-        actual_results = dict(
-            re.findall(
-                r"(?m)^          ([A-Z0-9_]+): \$\{\{ needs\.([A-Za-z0-9_-]+)\.result \}\}$",
-                aggregate,
-            )
-        )
-        self.assertEqual(actual_results, expected_results)
-        tested_results = set(
-            re.findall(r'(?m)^          test "\$([A-Z0-9_]+)" = "success"$', aggregate)
-        )
-        self.assertEqual(tested_results, set(expected_results))
 
     def test_private_reconciliation_step_has_bounded_budget_and_progress(self) -> None:
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
@@ -441,9 +420,9 @@ class RepositoryContractTest(unittest.TestCase):
         }
         self.assertEqual(jobs_with_apt, {"linux_isolation_tests"})
         integration = jobs["linux_isolation_tests"]
-        self.assertIn("sudo apt-get update", integration)
+        self.assertIn("sudo -n apt-get update", integration)
         self.assertIn(
-            "sudo apt-get install --yes bubblewrap gcc ripgrep socat", integration
+            "sudo -n apt-get install --yes bubblewrap gcc ripgrep socat", integration
         )
 
     def test_private_ci_fixture_runs_the_complete_overlay_module_matrix(self) -> None:
@@ -455,11 +434,16 @@ class RepositoryContractTest(unittest.TestCase):
             "test_codex_personal_sync.py",
             "test_generated_sync_source_lock.py",
             "test_jira_issue_probe.py",
+            "test_macos_ci_fixture_bootstrap.py",
+            "test_macos_ci_readonly_fixture.py",
+            "test_macos_ci_vm_supervisor.py",
             "test_package_builder_safety.py",
             "test_pending_agent_claim_compatibility.py",
             "test_pending_staging_cleanup.py",
             "test_personal_sync_reconciliation_safety.py",
             "test_pr_attribution.py",
+            "test_private_ci_change_classification.py",
+            "test_private_ci_results.py",
             "test_private_macos_sync_controller.py",
             "test_private_overlay_package.py",
             "test_private_overlay_source_lock.py",
@@ -467,7 +451,6 @@ class RepositoryContractTest(unittest.TestCase):
             "test_private_synthetic_catalog.py",
             "test_quarantine_empty_batch_reclaim.py",
             "test_regular_agent_materialization.py",
-            "test_regular_overlay_uninstall_status_regressions.py",
             "test_release_manifest_baseline.py",
             "test_release_retention.py",
             "test_remote_codex_probe.py",
@@ -504,7 +487,10 @@ class RepositoryContractTest(unittest.TestCase):
         )
         jobs = _workflow_job_blocks(workflow)
 
-        overlay_modules = _workflow_matrix_modules(jobs["private_overlay_tests"])
+        overlay_modules = sorted(
+            _workflow_matrix_modules(jobs["private_overlay_tests"])
+            + _workflow_matrix_modules(jobs["private_overlay_uninstall_shard_tests"])
+        )
         overlay_test_files = sorted(
             path.name for path in (REPO_ROOT / "tests").glob("test_*.py")
         )
@@ -552,7 +538,18 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             }
         )
-        self.assertEqual(macos_excluded_modules, macos_shard_modules)
+        self.assertEqual(
+            set(macos_excluded_modules),
+            set(macos_shard_modules)
+            | {
+                "test_claude_provenance.py",
+                "test_claude_refresh_lock.py",
+                "test_state.py",
+                "test_synthetic_tokens.py",
+                "test_validate_claude_stream.py",
+                "test_workspace.py",
+            },
+        )
 
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())

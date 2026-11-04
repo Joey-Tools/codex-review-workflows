@@ -840,6 +840,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 replace(evidence, observations=tuple(drifted_observations))
             )
         )
+        _NativeNoChildProbeDecisionAssertions(self).assert_decisions()
 
     def test_required_live_ci_fails_closed_on_runtime_pin_mismatch(self) -> None:
         runtime = profile.RuntimeFingerprint(
@@ -3802,6 +3803,300 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "unsupported-platform",
             raised.exception.evidence.blockers,
         )
+
+
+class _NativeNoChildProbeDecisionAssertions:
+    def __init__(self, test_case: unittest.TestCase) -> None:
+        self.test_case = test_case
+
+    def _evidence(
+        self,
+        *,
+        failing_observation: tuple[str, str] | None = None,
+    ) -> profile.CompatibilityEvidence:
+        from tests.run_hosted_no_child_fail_closed import (
+            PROBE_ACTIONS,
+            _native_runtime_pin,
+        )
+
+        runtime = profile._runtime_fingerprint()
+        sandbox_exec = profile._authenticate_root_protected_executable(
+            profile.SANDBOX_EXEC
+        ).executable
+        probe_executable = profile._read_executable_identity(
+            profile.python_runtime_executable()
+        )
+        alternate_executable = profile._read_executable_identity("/usr/bin/true")
+        runtime_pin = _native_runtime_pin(runtime, sandbox_exec)
+        parent_nproc = resource.getrlimit(resource.RLIMIT_NPROC)
+        profile_digest = hashlib.sha256(
+            profile.build_seatbelt_profile(probe_executable.path).encode("utf-8")
+        ).hexdigest()
+        observations: list[profile.ProbeObservation] = []
+        for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
+            expected_limit = parent_nproc if layer == "seatbelt" else (0, 0)
+            expected_profile = None if layer == "rlimit" else profile_digest
+            for action_index, action in enumerate(PROBE_ACTIONS):
+                pid = 4000 + layer_index * 100 + action_index
+                if action == "baseline":
+                    outcome, error_number = "observed", None
+                elif layer == "rlimit" and action == "exec":
+                    outcome, error_number = "allowed", None
+                elif layer == "rlimit" and action in {"setsid", "setpgid"}:
+                    outcome, error_number = "denied", errno.EPERM
+                elif layer == "rlimit":
+                    outcome, error_number = "denied", errno.EAGAIN
+                else:
+                    outcome, error_number = "denied", errno.EPERM
+                if failing_observation == (layer, action):
+                    outcome, error_number = "allowed", None
+                observations.append(
+                    profile.ProbeObservation(
+                        layer=layer,
+                        action=action,
+                        outcome=outcome,
+                        error_number=error_number,
+                        child_pid=pid,
+                        child_process_group=pid,
+                        child_session=pid,
+                        child_start_identity=f"darwin-proc-start:{pid}:1",
+                        profile_sha256=expected_profile,
+                        pre_exec_setsid_succeeded=True,
+                        pre_exec_pid=pid,
+                        pre_exec_process_group=pid,
+                        pre_exec_session=pid,
+                        pre_exec_nproc_soft=expected_limit[0],
+                        pre_exec_nproc_hard=expected_limit[1],
+                        nproc_soft=expected_limit[0],
+                        nproc_hard=expected_limit[1],
+                    )
+                )
+        blockers = tuple(
+            dict.fromkeys(
+                profile._probe_blockers(
+                    observations,
+                    parent_nproc=parent_nproc,
+                    profile_sha256=profile_digest,
+                )
+            )
+        )
+        return profile.CompatibilityEvidence(
+            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+            runtime_pin=runtime_pin,
+            runtime=runtime,
+            sandbox_exec=sandbox_exec,
+            probe_executable=probe_executable,
+            alternate_executable=alternate_executable,
+            seatbelt_profile_sha256=profile_digest,
+            parent_nproc_before=parent_nproc,
+            parent_nproc_after=parent_nproc,
+            observations=tuple(observations),
+            blockers=blockers,
+        )
+
+    def assert_decisions(self) -> None:
+        from tests.run_hosted_no_child_fail_closed import (
+            NativeProbeCapabilityUnavailable,
+            NativeProbeValidationError,
+            _native_runtime_pin,
+            _production_gate_result,
+            _validate_native_probe_evidence,
+        )
+
+        case = self.test_case
+        evidence = self._evidence()
+        assert evidence.sandbox_exec is not None
+        pin = _native_runtime_pin(evidence.runtime, evidence.sandbox_exec)
+        case.assertEqual(pin.macos_product_version, evidence.runtime.macos_product_version)
+        case.assertEqual(pin.macos_build_version, evidence.runtime.macos_build_version)
+        case.assertEqual(pin.darwin_release, evidence.runtime.darwin_release)
+        case.assertEqual(
+            (pin.python_major, pin.python_minor),
+            evidence.runtime.python_version[:2],
+        )
+        case.assertEqual(pin.sandbox_exec_sha256, evidence.sandbox_exec.sha256)
+
+        decision = _validate_native_probe_evidence(evidence, machine="arm64")
+
+        case.assertEqual(decision["decision"], "compatible")
+        case.assertEqual(decision["observation_blockers"], [])
+        case.assertGreater(decision["evidence_bytes"], 0)
+        production_result = _production_gate_result(
+            evidence,
+            probe_decision="compatible",
+        )
+        expected_runtime_blockers = tuple(
+            profile._runtime_blockers(
+                evidence.runtime,
+                profile.PINNED_RUNTIME,
+                evidence.sandbox_exec,
+            )
+        )
+        expected_scope = (
+            "native-observation"
+            if evidence.runtime_pin == profile.PINNED_RUNTIME
+            else "hypothetical-production-runtime-pin"
+        )
+        if expected_runtime_blockers:
+            case.assertEqual(
+                production_result,
+                {
+                    "decision": "refused",
+                    "evidence_scope": expected_scope,
+                    "blockers": list(expected_runtime_blockers),
+                    "production_capable": evidence.production_capable,
+                },
+            )
+        else:
+            case.assertEqual(
+                production_result,
+                {
+                    "decision": "accepted",
+                    "evidence_scope": expected_scope,
+                    "blockers": [],
+                    "production_capable": evidence.production_capable,
+                },
+            )
+
+        evidence = self._evidence(failing_observation=("seatbelt", "fork"))
+        decision = _validate_native_probe_evidence(evidence, machine="x86_64")
+
+        case.assertEqual(decision["decision"], "fail-closed")
+        case.assertIn("seatbelt-fork-not-denied", decision["observation_blockers"])
+        case.assertEqual(
+            evidence.blockers,
+            tuple(decision["observation_blockers"]),
+        )
+        production_result = _production_gate_result(
+            evidence,
+            probe_decision="fail-closed",
+        )
+        expected_production_blockers = tuple(
+            dict.fromkeys(
+                (
+                    *evidence.blockers,
+                    *profile._runtime_blockers(
+                        evidence.runtime,
+                        profile.PINNED_RUNTIME,
+                        evidence.sandbox_exec,
+                    ),
+                )
+            )
+        )
+        case.assertEqual(production_result["decision"], "refused")
+        case.assertEqual(
+            production_result["blockers"],
+            list(expected_production_blockers),
+        )
+        case.assertEqual(
+            production_result["evidence_scope"],
+            (
+                "native-observation"
+                if evidence.runtime_pin == profile.PINNED_RUNTIME
+                else "hypothetical-production-runtime-pin"
+            ),
+        )
+
+        evidence = self._evidence()
+        assert evidence.parent_nproc_before is not None
+        malformed_profile_digest = (
+            "e" * 64
+            if evidence.seatbelt_profile_sha256 != "e" * 64
+            else "f" * 64
+        )
+        malformed_profile_observations = tuple(
+            replace(
+                item,
+                profile_sha256=(
+                    None if item.layer == "rlimit" else malformed_profile_digest
+                ),
+            )
+            for item in evidence.observations
+        )
+        malformed_profile_blockers = tuple(
+            dict.fromkeys(
+                profile._probe_blockers(
+                    malformed_profile_observations,
+                    parent_nproc=evidence.parent_nproc_before,
+                    profile_sha256=malformed_profile_digest,
+                )
+            )
+        )
+        cases = (
+            (
+                "missing-observation",
+                replace(evidence, observations=evidence.observations[:-1]),
+                "complete unique 24-observation matrix",
+            ),
+            (
+                "omitted-blocker",
+                replace(
+                    self._evidence(failing_observation=("seatbelt", "fork")),
+                    blockers=(),
+                ),
+                "blocker list does not exactly match",
+            ),
+            (
+                "parent-limit-changed",
+                replace(evidence, parent_nproc_after=(128, 512)),
+                "did not preserve the parent RLIMIT_NPROC",
+            ),
+            (
+                "missing-sandbox-identity",
+                replace(evidence, sandbox_exec=None),
+                "missing a complete authenticated sandbox-exec identity",
+            ),
+            (
+                "malformed-profile-digest",
+                replace(
+                    evidence,
+                    observations=malformed_profile_observations,
+                    seatbelt_profile_sha256=malformed_profile_digest,
+                    blockers=malformed_profile_blockers,
+                ),
+                "refusal does not exactly match",
+            ),
+            (
+                "evidence-too-large",
+                replace(
+                    evidence,
+                    observations=(
+                        replace(evidence.observations[0], detail="x" * 70000),
+                        *evidence.observations[1:],
+                    ),
+                ),
+                "exceeds its bounded output limit",
+            ),
+        )
+        for name, malformed, message in cases:
+            with case.subTest(name=name), case.assertRaisesRegex(
+                NativeProbeValidationError, message
+            ):
+                _validate_native_probe_evidence(malformed, machine="arm64")
+
+        evidence = self._evidence()
+        unsupported_cases = (
+            (
+                "platform",
+                replace(evidence.runtime, platform="linux", system="Linux"),
+                "arm64",
+            ),
+            ("architecture", evidence.runtime, "ppc64"),
+            (
+                "python-minor",
+                replace(evidence.runtime, python_version=(3, 14, 0)),
+                "arm64",
+            ),
+            ("root", replace(evidence.runtime, effective_uid=0), "arm64"),
+        )
+        for name, runtime, machine in unsupported_cases:
+            with case.subTest(name=name), case.assertRaises(
+                NativeProbeCapabilityUnavailable
+            ):
+                _validate_native_probe_evidence(
+                    replace(evidence, runtime=runtime),
+                    machine=machine,
+                )
 
 
 class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
