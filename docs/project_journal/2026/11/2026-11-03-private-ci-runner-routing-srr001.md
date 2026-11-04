@@ -3,9 +3,9 @@ id: 20261103-srr001
 title: Private CI Self-Hosted Runner Routing
 status: completed
 created: 2026-11-03
-updated: 2026-11-03
+updated: 2026-11-04
 branch: wip/self-hosted-routing
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/148
 supersedes: []
 superseded_by:
 ---
@@ -20,7 +20,7 @@ superseded_by:
 
 - `CODEX_PRIVATE_LINUX_RUNNER_LABELS` and `CODEX_PRIVATE_MACOS_RUNNER_LABELS` route eligible jobs through JSON label arrays; empty values retain the existing per-job hosted labels.
 - Python jobs keep their existing `actions/setup-python@v5` steps and requested versions. Matrix contents and test coverage are unchanged.
-- The contract tests preserve the workflow fixture, routing variables, and hosted fallbacks.
+- Existing contract tests remain; runner routing is validated by actual CI execution. Cleanup of existing tests that only inspect YAML text is deferred.
 
 ## Next Steps
 
