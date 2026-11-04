@@ -9569,6 +9569,7 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                 "PYTHONHOME": str(hostile),
                 "PYTHONPATH": str(hostile),
                 "PYTHONUSERBASE": str(hostile),
+                "CODEX_REVIEW_NATIVE_READONLY_CI": "caller-controlled",
             }
             cases = (("live", ("live",), "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"),)
             for label, arguments, expected_key in cases:
@@ -9593,6 +9594,10 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                         },
                     )
                     self.assertIn(expected_key, result["environment"])
+                    self.assertNotIn(
+                        "CODEX_REVIEW_NATIVE_READONLY_CI",
+                        result["environment"],
+                    )
                     self.assertNotEqual(result["environment"]["HOME"], str(hostile))
                     self.assertNotIn(str(hostile), result["sys_path"])
                     self.assertNotIn(str(root), result["sys_path"])
@@ -9604,6 +9609,39 @@ class TrustedMacGateBootstrapTests(unittest.TestCase):
                     self.assertEqual(result["tests_package_path"], [])
                     self.assertFalse(marker.exists())
                     self.assertFalse(tuple(root.rglob("__pycache__")))
+
+        gate = self._load_gate_module()
+        hosted_environment = {"CODEX_REVIEW_BOUND_GIT_TMPDIR": "/private/tmp/bound"}
+        for mode, expected_marker in (
+            ("hosted-readonly", None),
+            ("native-readonly-ci", "1"),
+        ):
+            with (
+                self.subTest(dispatch_mode=mode),
+                mock.patch.object(
+                    gate,
+                    "_validate_hosted_git_toolchain",
+                    return_value=hosted_environment,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CODEX_REVIEW_NATIVE_READONLY_CI": "caller-controlled",
+                        "UNTRUSTED_GATE_ENV": "discard-me",
+                    },
+                    clear=True,
+                ),
+            ):
+                module = gate._configure_environment(mode, ["synthetic-receipt"])
+                self.assertEqual(
+                    module,
+                    "tests.run_readonly_install_deterministic_supervisor",
+                )
+                self.assertEqual(
+                    os.environ.get("CODEX_REVIEW_NATIVE_READONLY_CI"),
+                    expected_marker,
+                )
+                self.assertNotIn("UNTRUSTED_GATE_ENV", os.environ)
 
     def test_hosted_git_receipt_is_closed_and_binds_runtime_environment(self) -> None:
         gate = self._load_gate_module()
@@ -11044,6 +11082,155 @@ class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
                 expected_argv,
             )
 
+    @staticmethod
+    def _native_probe_summary(
+        *,
+        production_supported: bool,
+        observation_blocker: str | None = None,
+        duplicate_case: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        production_pin = runner.no_child_profile.PINNED_RUNTIME.to_json()
+        if production_supported:
+            runtime = {
+                "platform": "darwin",
+                "system": "Darwin",
+                "macos_product_version": production_pin["macos_product_version"],
+                "macos_build_version": production_pin["macos_build_version"],
+                "darwin_release": production_pin["darwin_release"],
+                "python_version": [3, 13, 9],
+                "python_executable": "/usr/bin/python3",
+                "effective_uid": 501,
+            }
+            runtime_pin = production_pin
+            sandbox_digest = production_pin["sandbox_exec_sha256"]
+        else:
+            runtime = {
+                "platform": "darwin",
+                "system": "Darwin",
+                "macos_product_version": "26.6.2",
+                "macos_build_version": "25G83",
+                "darwin_release": "25.6.0",
+                "python_version": [3, 13, 9],
+                "python_executable": "/usr/bin/python3",
+                "effective_uid": 501,
+            }
+            sandbox_digest = "a" * 64
+            runtime_pin = {
+                "macos_product_version": runtime["macos_product_version"],
+                "macos_build_version": runtime["macos_build_version"],
+                "darwin_release": runtime["darwin_release"],
+                "sandbox_exec_sha256": sandbox_digest,
+                "python_major": 3,
+                "python_minor": 13,
+                "seatbelt_profile_version": production_pin["seatbelt_profile_version"],
+            }
+
+        observations = []
+        for layer in runner.NATIVE_PROBE_LAYERS:
+            for action in runner.NATIVE_PROBE_ACTIONS:
+                outcome = (
+                    "observed"
+                    if action == "baseline"
+                    else "allowed"
+                    if layer == "rlimit" and action == "exec"
+                    else "denied"
+                )
+                if observation_blocker == "seatbelt-fork-not-denied" and (
+                    layer,
+                    action,
+                ) == ("seatbelt", "fork"):
+                    outcome = "allowed"
+                observations.append(
+                    {
+                        "layer": layer,
+                        "action": action,
+                        "outcome": outcome,
+                        "error_number": None,
+                        "detail": "synthetic",
+                        "child_pid": 101,
+                        "child_process_group": 101,
+                        "child_session": 101,
+                        "child_start_identity": "synthetic-start",
+                        "profile_sha256": None,
+                        "pre_exec_setsid_succeeded": True,
+                        "pre_exec_pid": 101,
+                        "pre_exec_process_group": 101,
+                        "pre_exec_session": 101,
+                        "pre_exec_nproc_soft": 0,
+                        "pre_exec_nproc_hard": 0,
+                        "nproc_soft": 0,
+                        "nproc_hard": 0,
+                    }
+                )
+        if duplicate_case:
+            observations[-1]["action"] = observations[0]["action"]
+
+        observation_blockers = (
+            [observation_blocker] if observation_blocker is not None else []
+        )
+        evidence = {
+            "schema_version": 1,
+            "runtime_pin": runtime_pin,
+            "runtime": runtime,
+            "sandbox_exec": {
+                "path": "/usr/bin/sandbox-exec",
+                "uid": 0,
+                "sha256": sandbox_digest,
+            },
+            "probe_executable": {},
+            "alternate_executable": {},
+            "seatbelt_profile_sha256": "b" * 64,
+            "parent_nproc_before": [10, 10],
+            "parent_nproc_after": [10, 10],
+            "observations": observations,
+            "blockers": observation_blockers,
+            "compatible": not observation_blockers,
+            "production_capable": production_supported and not observation_blockers,
+        }
+        production_blockers = list(observation_blockers)
+        if not production_supported:
+            production_blockers.extend(
+                (
+                    "unapproved-macos-product-version",
+                    "unapproved-macos-build-version",
+                    "unapproved-darwin-release",
+                    "sandbox-exec-digest-mismatch",
+                )
+            )
+        production_gate = {
+            "decision": "accepted"
+            if production_supported and not observation_blockers
+            else "refused",
+            "evidence_scope": (
+                "native-observation"
+                if production_supported
+                else "hypothetical-production-runtime-pin"
+            ),
+            "blockers": production_blockers,
+            "production_capable": evidence["production_capable"],
+        }
+        summary = {
+            "architecture": "arm64",
+            "decision": "compatible" if not observation_blockers else "fail-closed",
+            "evidence_bytes": 0,
+            "mode": "native-ci",
+            "observation_blockers": observation_blockers,
+            "probe_evidence": evidence,
+            "production_gate": production_gate,
+            "runtime_pin_scope": "execution-local-observation-only",
+            "supported_python": "3.13",
+        }
+        summary["evidence_bytes"] = len(
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        stdout = json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n"
+        return subprocess.CompletedProcess(
+            args=("native-probe",),
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        )
+
     def test_exact_production_profile_argv_success_record_and_closure(self) -> None:
         closure = self._closure()
         result = self._command_result(closure=closure)
@@ -11106,6 +11293,251 @@ class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
             self.assertTrue(proof.started)
             self.assertTrue(proof.proven)
             self.assertTrue(proof.destructive_cleanup_authorized)
+
+        supported_probe = self._native_probe_summary(production_supported=True)
+        supported_decision, supported_projection = (
+            runner._validate_native_readonly_probe_output(supported_probe)
+        )
+        self.assertEqual(supported_decision, "production-compatible")
+        self.assertIsNone(supported_projection)
+
+        refused_probe = self._native_probe_summary(
+            production_supported=False,
+            observation_blocker="seatbelt-fork-not-denied",
+        )
+        refused_decision, refused_projection = (
+            runner._validate_native_readonly_probe_output(refused_probe)
+        )
+        self.assertEqual(refused_decision, "expected-production-refusal")
+        self.assertIsNotNone(refused_projection)
+        assert refused_projection is not None
+        self.assertEqual(
+            refused_projection["production_gate_evidence_scope"],
+            "hypothetical-production-runtime-pin",
+        )
+        self.assertEqual(refused_projection["positive_production_launches"], 0)
+        self.assertEqual(refused_projection["positive_test_count"], 0)
+        self.assertEqual(refused_projection["native_observation_count"], 24)
+        with self.assertRaisesRegex(RuntimeError, "exact 24-case order"):
+            runner._validate_native_readonly_probe_output(
+                self._native_probe_summary(
+                    production_supported=False,
+                    duplicate_case=True,
+                )
+            )
+
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            _runtime_parent,
+        ):
+            refusal_proof = runner.ChildProcessClosureProof()
+
+            def finish_native_refusal(
+                **kwargs: object,
+            ) -> tuple[
+                subprocess.CompletedProcess[str],
+                str,
+                dict[str, object],
+            ]:
+                active_proof = kwargs["closure_proof"]
+                assert isinstance(active_proof, runner.ChildProcessClosureProof)
+                active_proof.started = True
+                active_proof.proven = True
+                active_proof.destructive_cleanup_authorized = True
+                assert refused_projection is not None
+                return refused_probe, "expected-production-refusal", refused_projection
+
+            prepare = mock.Mock()
+            run_command = mock.Mock()
+            with (
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_native_readonly_probe",
+                    side_effect=finish_native_refusal,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    side_effect=AssertionError(
+                        "unsupported runtime must not select a production profile"
+                    ),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    prepare,
+                ),
+                mock.patch.object(runner, "run_bounded_command", run_command),
+            ):
+                completed = runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    native_readonly_ci=True,
+                    closure_proof=refusal_proof,
+                )
+            self.assertIs(completed, refused_probe)
+            self.assertTrue(refusal_proof.proven)
+            self.assertTrue(refusal_proof.destructive_cleanup_authorized)
+            self.assertEqual(refusal_proof.runtime_profile, "native-observation-only")
+            prepare.assert_not_called()
+            run_command.assert_not_called()
+
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            _runtime_parent,
+        ):
+            positive_proof = runner.ChildProcessClosureProof()
+            target = mock.Mock(path="/trusted/python3.13")
+            prepared = mock.Mock(sandboxed_target=target)
+            run_result = self._command_result(closure=self._closure())
+            with (
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_native_readonly_probe",
+                    return_value=(supported_probe, "production-compatible", None),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=(
+                        "production-current",
+                        runner.no_child_profile.PINNED_RUNTIME,
+                    ),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_bound_child_signals",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=prepared,
+                ) as prepare,
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    return_value=run_result,
+                ) as run_command,
+            ):
+                completed = runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    native_readonly_ci=True,
+                    closure_proof=positive_proof,
+                )
+            self.assertEqual(completed.stdout, runner.NO_CHILD_SUCCESS_RECORD + "\n")
+            self.assertEqual(positive_proof.runtime_profile, "production-current")
+            self.assertIsNone(positive_proof.native_readonly_ci)
+            prepare.assert_called_once()
+            run_command.assert_called_once()
+
+        with self._bound_roots() as (
+            installed_root,
+            install_binding,
+            runtime_binding,
+            _runtime_parent,
+        ):
+            second_child_proof = runner.ChildProcessClosureProof()
+            target = mock.Mock(path="/trusted/python3.13")
+            prepared = mock.Mock(sandboxed_target=target)
+            signal_scope = mock.Mock()
+            second_child_error = RuntimeError("second production child failed")
+
+            def finish_native_before_production_child(
+                **kwargs: object,
+            ) -> tuple[subprocess.CompletedProcess[str], str, None]:
+                active_proof = kwargs["closure_proof"]
+                assert isinstance(active_proof, runner.ChildProcessClosureProof)
+                active_proof.started = True
+                active_proof.proven = True
+                active_proof.destructive_cleanup_authorized = True
+                return supported_probe, "production-compatible", None
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "attest_writable_root",
+                    return_value=mock.sentinel.writable_runtime,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_run_native_readonly_probe",
+                    side_effect=finish_native_before_production_child,
+                ),
+                mock.patch.object(
+                    runner,
+                    "_select_no_child_runtime_profile",
+                    return_value=(
+                        "production-current",
+                        runner.no_child_profile.PINNED_RUNTIME,
+                    ),
+                ),
+                mock.patch.object(
+                    runner,
+                    "_bound_child_signals",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    runner,
+                    "prepare_sandboxed_python_no_child_profile",
+                    return_value=prepared,
+                ) as prepare,
+                mock.patch.object(
+                    runner,
+                    "begin_bound_signal_deferral",
+                    return_value=signal_scope,
+                ),
+                mock.patch.object(runner, "checkpoint_bound_signal_interrupt"),
+                mock.patch.object(
+                    runner,
+                    "run_bounded_command",
+                    side_effect=second_child_error,
+                ) as run_command,
+                mock.patch.object(
+                    runner,
+                    "bounded_command_process_closure",
+                    return_value=self._closure(closure_proven=False),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "second production child failed",
+                ),
+            ):
+                runner._run_no_child_test_suite(
+                    installed_root=installed_root,
+                    install_container_binding=install_binding,
+                    runtime_parent_binding=runtime_binding,
+                    native_readonly_ci=True,
+                    closure_proof=second_child_proof,
+                )
+
+            self.assertTrue(second_child_proof.started)
+            self.assertFalse(second_child_proof.proven)
+            self.assertFalse(second_child_proof.destructive_cleanup_authorized)
+            self.assertEqual(
+                second_child_proof.runtime_profile,
+                "production-current",
+            )
+            signal_scope.finish.assert_called_once_with(deliver=False)
+            prepare.assert_called_once()
+            run_command.assert_called_once()
 
     def test_result_rejects_unauthenticated_or_nonclosed_closure(self) -> None:
         closures = (

@@ -41,6 +41,7 @@ PROHIBITED_SUFFIXES = (".pyc", ".pyo", ".so", ".dylib", ".dll", ".pyd")
 MODE_MODULES = {
     "hosted-readonly": "tests.run_readonly_install_deterministic_supervisor",
     "live": "tests.run_required_no_child_profile",
+    "native-readonly-ci": "tests.run_readonly_install_deterministic_supervisor",
     "readonly": "tests.run_readonly_install_deterministic_supervisor",
 }
 
@@ -1420,12 +1421,14 @@ def _configure_environment(mode: str, arguments: list[str]) -> str:
         environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"] = trusted_mac_environment[
             "CODEX_REVIEW_BOUND_GIT_TMPDIR"
         ]
-    elif mode == "hosted-readonly":
+    elif mode in {"hosted-readonly", "native-readonly-ci"}:
         hosted_environment = _validate_hosted_git_toolchain(arguments)
         environment.update(hosted_environment)
         environment["CODEX_REVIEW_TEST_RUNTIME_PARENT"] = hosted_environment[
             "CODEX_REVIEW_BOUND_GIT_TMPDIR"
         ]
+        if mode == "native-readonly-ci":
+            environment["CODEX_REVIEW_NATIVE_READONLY_CI"] = "1"
     else:
         raise RuntimeError("trusted gate mode is unsupported")
     os.environ.clear()
