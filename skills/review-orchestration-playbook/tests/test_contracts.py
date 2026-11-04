@@ -409,7 +409,11 @@ class RepositoryContractTest(unittest.TestCase):
         workflow = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_blocks(workflow)
         macos_shards = jobs["review_macos_shard_tests"]
-        self.assertIn("    runs-on: macos-latest", macos_shards)
+        self.assertIn(
+            'runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '
+            '\'["macos-latest"]\') }}',
+            macos_shards,
+        )
         self.assertIn("python3 -B scripts/run_unittest_shard.py", macos_shards)
         self.assertIn('--shard-index "${{ matrix.shard }}"', macos_shards)
         self.assertIn('--shard-count "${{ matrix.shard_count }}"', macos_shards)
