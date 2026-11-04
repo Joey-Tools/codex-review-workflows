@@ -11140,6 +11140,11 @@ class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
                     action,
                 ) == ("seatbelt", "fork"):
                     outcome = "allowed"
+                if observation_blocker == "rlimit-posix_spawn-not-denied" and (
+                    layer,
+                    action,
+                ) == ("rlimit", "posix_spawn"):
+                    outcome = "allowed"
                 observations.append(
                     {
                         "layer": layer,
@@ -11318,6 +11323,33 @@ class NoChildSuiteContractTests(_RunnerFilesystemTestCase):
         self.assertEqual(refused_projection["positive_production_launches"], 0)
         self.assertEqual(refused_projection["positive_test_count"], 0)
         self.assertEqual(refused_projection["native_observation_count"], 24)
+        underscore_blocker_probe = self._native_probe_summary(
+            production_supported=False,
+            observation_blocker="rlimit-posix_spawn-not-denied",
+        )
+        underscore_blocker_summary = json.loads(underscore_blocker_probe.stdout)
+        posix_spawn_observation = next(
+            item
+            for item in underscore_blocker_summary["probe_evidence"]["observations"]
+            if (item["layer"], item["action"]) == ("rlimit", "posix_spawn")
+        )
+        self.assertEqual(posix_spawn_observation["outcome"], "allowed")
+        self.assertEqual(
+            underscore_blocker_summary["probe_evidence"]["blockers"],
+            ["rlimit-posix_spawn-not-denied"],
+        )
+        underscore_decision, underscore_projection = (
+            runner._validate_native_readonly_probe_output(underscore_blocker_probe)
+        )
+        self.assertEqual(underscore_decision, "expected-production-refusal")
+        self.assertIsNotNone(underscore_projection)
+        assert underscore_projection is not None
+        self.assertIn(
+            "rlimit-posix_spawn-not-denied",
+            underscore_projection["observation_blockers"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "blockers are malformed"):
+            runner._native_blocker_codes(["invalid/path"], label="test blockers")
         with self.assertRaisesRegex(RuntimeError, "exact 24-case order"):
             runner._validate_native_readonly_probe_output(
                 self._native_probe_summary(

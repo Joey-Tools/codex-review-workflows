@@ -5083,7 +5083,7 @@ def _native_blocker_codes(value: object, *, label: str) -> list[str]:
         or len(item) > 160
         or not item.isascii()
         or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
             for character in item
         )
         for item in value
