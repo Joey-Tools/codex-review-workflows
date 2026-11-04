@@ -324,7 +324,7 @@ jobs:
     needs: classify_changes
     if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
     name: linux-isolation-tests
-    # Native toolchain discovery requires working isolation without changing host policy.
+    # Persistent hosts provide isolation; disposable hosted runners retain namespace setup.
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
@@ -347,6 +347,12 @@ jobs:
             command -v apt-get >/dev/null
             sudo -n apt-get update
             sudo -n apt-get install --yes bubblewrap gcc ripgrep socat
+          fi
+      - name: Prepare namespaces on disposable hosted runner
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Run real Linux isolation integration test
         env:
