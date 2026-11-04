@@ -97,7 +97,7 @@ jobs:
 
   review_syntax_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: review-syntax (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -131,7 +131,7 @@ jobs:
 
   review_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: review-tests (${{ matrix.os }}, ${{ matrix.module }})
     strategy:
       fail-fast: false
@@ -202,7 +202,7 @@ jobs:
 
   review_macos_shard_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: review-macos-shards (${{ matrix.module }}, shard ${{ matrix.shard }}/${{ matrix.shard_count }})
     strategy:
       fail-fast: false
@@ -257,7 +257,7 @@ jobs:
 
   review_macos_native_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: review-macos-native
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-latest"]') }}
     steps:
@@ -293,7 +293,7 @@ jobs:
 
   project_journal_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: project-journal-tests (${{ matrix.os }}, ${{ matrix.module }})
     strategy:
       fail-fast: false
@@ -322,7 +322,7 @@ jobs:
 
   linux_isolation_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: linux-isolation-tests
     # Persistent hosts provide isolation; disposable hosted runners retain namespace setup.
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
@@ -365,7 +365,7 @@ jobs:
 
   private_overlay_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: private-overlay-tests (${{ matrix.module }})
     strategy:
       fail-fast: false
@@ -420,7 +420,7 @@ jobs:
   private_overlay_uninstall_shard_tests:
     name: private-overlay-uninstall-shards (${{ matrix.shard }}/4)
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -453,7 +453,7 @@ jobs:
 
   private_overlay_contract_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: private-overlay-contract-tests
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-latest"]') }}
     steps:
@@ -488,7 +488,7 @@ jobs:
 
   independent_supervisor_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: independent-supervisor (python-3.13)
     # Probe native isolation and preserve broker byte reproduction on either provider.
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_RUNNER_LABELS || '["macos-26"]') }}
@@ -546,7 +546,7 @@ jobs:
 
   readonly_install_supervisor_tests:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     name: read-only-install-supervisor (python-3.13)
     # Failures may retain root-owned state; a self-hosted slot must discard its guest.
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_MACOS_ISOLATED_RUNNER_LABELS || '["macos-26"]') }}
@@ -568,6 +568,7 @@ jobs:
           set -eo pipefail
           bootstrap_result="$(mktemp "$RUNNER_TEMP/codex-fixture-bootstrap.XXXXXX")"
           trap '/bin/rm -f "$bootstrap_result"' EXIT
+          bootstrap_status=0
           /usr/bin/sudo -n /usr/bin/env -i \
             GITHUB_ACTIONS=true \
             RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
@@ -575,7 +576,9 @@ jobs:
             SUDO_UID="$(/usr/bin/id -u)" SUDO_GID="$(/usr/bin/id -g)" \
             /usr/bin/python3 -I -B -S "$GITHUB_WORKSPACE/scripts/bootstrap_macos_ci_fixture.py" \
             --ephemeral-bootstrap --workspace-root "$GITHUB_WORKSPACE" \
-            | /usr/bin/tee "$bootstrap_result" > /dev/null
+            | /usr/bin/tee "$bootstrap_result" > /dev/null || bootstrap_status=$?
+          /bin/cat "$bootstrap_result"
+          test "$bootstrap_status" = 0
           lease_id="$(python3 -B -c 'import json, re, sys; result = json.load(open(sys.argv[1])); lease = result.get("lease_id", ""); assert result.get("schema") == "codex.macos-ci-fixture-bootstrap.v1" and result.get("status") == "installed" and result.get("mode") == "ephemeral-bootstrap" and re.fullmatch("[0-9a-f]{32}", lease); print(lease)' "$bootstrap_result")"
           printf 'CODEX_CI_VM_LEASE_ID=%s\n' "$lease_id" >> "$GITHUB_ENV"
       - name: Run deterministic supervisor from read-only install
@@ -617,7 +620,7 @@ jobs:
 
   python-39-compatibility:
     needs: classify_changes
-    if: ${{ needs.classify_changes.outputs.runtime_matrix_required != 'false' }}
+    if: ${{ always() && !cancelled() && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.runtime_matrix_required != 'false') }}
     # ubuntu-slim supports private repositories and caps jobs at 15 minutes.
     runs-on: ${{ fromJSON(vars.CODEX_PRIVATE_LINUX_RUNNER_LABELS || '["ubuntu-slim"]') }}
     timeout-minutes: 15

@@ -3808,6 +3808,45 @@ class NoChildProfileUnitTests(unittest.TestCase):
 class _NativeNoChildProbeDecisionAssertions:
     def __init__(self, test_case: unittest.TestCase) -> None:
         self.test_case = test_case
+        self._temporary_directories = contextlib.ExitStack()
+        self.test_case.addCleanup(self._temporary_directories.close)
+        self._executable_fixtures: tuple[
+            profile.ExecutableIdentity,
+            profile.ExecutableIdentity,
+            str,
+        ] | None = None
+
+    def _runner_owned_executable_fixtures(
+        self,
+    ) -> tuple[
+        profile.ExecutableIdentity,
+        profile.ExecutableIdentity,
+        str,
+    ]:
+        if self._executable_fixtures is None:
+            root = self._temporary_directories.enter_context(
+                owned_temporary_directory("native-no-child-decision-")
+            )
+            root.chmod(0o700)
+            synthetic_python = root / "synthetic-python"
+            synthetic_alternate = root / "synthetic-alternate"
+            shutil.copyfile(profile.python_runtime_executable(), synthetic_python)
+            shutil.copyfile("/usr/bin/true", synthetic_alternate)
+            synthetic_python.chmod(0o755)
+            synthetic_alternate.chmod(0o755)
+            probe_executable = profile._read_executable_identity(synthetic_python)
+            alternate_executable = profile._read_executable_identity(
+                synthetic_alternate
+            )
+            profile_digest = hashlib.sha256(
+                profile.build_seatbelt_profile(probe_executable.path).encode("utf-8")
+            ).hexdigest()
+            self._executable_fixtures = (
+                probe_executable,
+                alternate_executable,
+                profile_digest,
+            )
+        return self._executable_fixtures
 
     def _evidence(
         self,
@@ -3823,15 +3862,13 @@ class _NativeNoChildProbeDecisionAssertions:
         sandbox_exec = profile._authenticate_root_protected_executable(
             profile.SANDBOX_EXEC
         ).executable
-        probe_executable = profile._read_executable_identity(
-            profile.python_runtime_executable()
-        )
-        alternate_executable = profile._read_executable_identity("/usr/bin/true")
         runtime_pin = _native_runtime_pin(runtime, sandbox_exec)
+        (
+            probe_executable,
+            alternate_executable,
+            profile_digest,
+        ) = self._runner_owned_executable_fixtures()
         parent_nproc = resource.getrlimit(resource.RLIMIT_NPROC)
-        profile_digest = hashlib.sha256(
-            profile.build_seatbelt_profile(probe_executable.path).encode("utf-8")
-        ).hexdigest()
         observations: list[profile.ProbeObservation] = []
         for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
             expected_limit = parent_nproc if layer == "seatbelt" else (0, 0)
