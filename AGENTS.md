@@ -1,13 +1,5 @@
 # Codex Review Workflows Guidelines
 
-## CI Maintenance Preferences
-
-- CI serves three product goals: usable skills, instructions, agent configuration, and scripts; reliable installation and updates; and correct source synchronization, packaging, and releases.
-- Security and compatibility checks should protect a concrete behavior within those goals. Prefer focused behavioral coverage and the smallest meaningful platform matrix; avoid duplicate full suites and tests that only restate workflow YAML or documentation.
-- Root-owned read-only copies and temporary-account execution qualify a special test environment. They are not default requirements for reviewer functionality or installer correctness. Preserve normal reviewer and production isolation regressions independently of that harness.
-
-## Delivery Guidelines
-
 - For authorized CI diagnostics, follow the risk-based [rerun guidance](docs/ci-reruns.md); do not impose automatic provider-recovery contracts on ordinary test reruns.
 
 - Use `$agile-delivery-workflow` only when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, or scout work.

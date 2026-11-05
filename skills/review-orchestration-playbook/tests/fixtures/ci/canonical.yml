@@ -106,7 +106,7 @@ jobs:
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          python3 -m tests.run_hosted_no_child_fail_closed --native-ci
+          python3 -m tests.run_hosted_no_child_fail_closed
       - name: Run deterministic independent supervisor tests
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:

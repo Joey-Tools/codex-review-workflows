@@ -861,7 +861,6 @@ def _run_no_child_test_suite(
         try:
             checkpoint_bound_signal_interrupt(force=True)
             proof.started = True
-            proof.proven = False
             proof.destructive_cleanup_authorized = False
             try:
                 result = run_bounded_command(
