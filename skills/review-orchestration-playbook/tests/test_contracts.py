@@ -321,7 +321,6 @@ class RepositoryContractTest(unittest.TestCase):
             "source_admission_tests",
             "python-39-compatibility",
             "independent_supervisor_tests",
-            "readonly_install_supervisor_tests",
             "review_syntax_tests",
             "review_tests",
             "review_macos_shard_tests",

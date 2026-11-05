@@ -87,34 +87,10 @@ RUNNER_ENVIRONMENT_ENV = "CODEX_REVIEW_RUNNER_ENVIRONMENT"
 RUNNER_ARCH_ENV = "CODEX_REVIEW_RUNNER_ARCH"
 EXPECTED_HEAD_ENV = "CODEX_REVIEW_EXPECTED_HEAD_SHA"
 DEDICATED_ACCOUNT_CUSTODY_ENV = "CODEX_REVIEW_DEDICATED_ACCOUNT_CUSTODY_SHA256"
-NATIVE_READONLY_CI_ENV = "CODEX_REVIEW_NATIVE_READONLY_CI"
 READONLY_INSTALL_PARENT = pathlib.Path("/private/tmp")
 CHILD_TIMEOUT_SECONDS = 600.0
 CHILD_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
 CHILD_STDERR_LIMIT_BYTES = 8 * 1024 * 1024
-NATIVE_PROBE_OUTPUT_LIMIT_BYTES = 128 * 1024
-NATIVE_PROBE_STDERR_LIMIT_BYTES = 16 * 1024
-NATIVE_PROBE_EVIDENCE_LIMIT_BYTES = 64 * 1024
-NATIVE_PROBE_LAYERS = ("rlimit", "seatbelt", "combined")
-NATIVE_PROBE_ACTIONS = (
-    "baseline",
-    "fork",
-    "posix_spawn",
-    "popen",
-    "double_fork",
-    "setsid",
-    "setpgid",
-    "exec",
-)
-NATIVE_PROBE_OUTCOMES = frozenset({"observed", "denied", "allowed", "ambiguous"})
-NATIVE_PROBE_CHILD_CODE = (
-    "import runpy,sys\n"
-    "sys.path.insert(0,sys.argv[1])\n"
-    "sys.argv=['tests.run_hosted_no_child_fail_closed','--native-ci']\n"
-    "runpy.run_module(\n"
-    " 'tests.run_hosted_no_child_fail_closed',\n"
-    " run_name='__main__', alter_sys=True)\n"
-)
 
 
 def _create_bound_owned_private_runtime_directory(
@@ -444,7 +420,6 @@ class ChildProcessClosureProof:
     proven: bool = False
     destructive_cleanup_authorized: bool = True
     runtime_profile: str | None = None
-    native_readonly_ci: dict[str, object] | None = None
 
 
 class ChildOutputLimitExceeded(OverflowError):
@@ -823,7 +798,6 @@ def _run_no_child_test_suite(
     installed_root: pathlib.Path,
     install_container_binding: _DirectoryParentBinding,
     runtime_parent_binding: _DirectoryParentBinding,
-    native_readonly_ci: bool = False,
     timeout: float = CHILD_TIMEOUT_SECONDS,
     stdout_limit: int = CHILD_STDOUT_LIMIT_BYTES,
     stderr_limit: int = CHILD_STDERR_LIMIT_BYTES,
@@ -854,25 +828,6 @@ def _run_no_child_test_suite(
         runtime_parent,
         directory_fd=runtime_parent_binding.fd,
     )
-    if native_readonly_ci:
-        proof.runtime_profile = "native-observation-only"
-        native_completed, classification, projection = _run_native_readonly_probe(
-            installed_root=installed_root,
-            runtime_parent_binding=runtime_parent_binding,
-            timeout=timeout,
-            stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit,
-            secondary_failures=diagnostics,
-            closure_proof=proof,
-            lifecycle_fence=lifecycle_fence,
-        )
-        if classification == "expected-production-refusal":
-            assert projection is not None
-            proof.native_readonly_ci = projection
-            return native_completed
-        if classification != "production-compatible" or projection is not None:
-            raise RuntimeError("native-readonly CI classification is invalid")
-
     with _bound_child_signals(diagnostics):
         if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
             raise ChildRunInterrupted(lifecycle_fence.received_signal)
@@ -5076,383 +5031,6 @@ def _retained_for_unproven_child_closure(
     )
 
 
-def _native_blocker_codes(value: object, *, label: str) -> list[str]:
-    if not isinstance(value, list) or any(
-        not isinstance(item, str)
-        or not item
-        or len(item) > 160
-        or not item.isascii()
-        or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
-            for character in item
-        )
-        for item in value
-    ):
-        raise RuntimeError(f"native no-child probe {label} are malformed")
-    if len(value) != len(set(value)):
-        raise RuntimeError(f"native no-child probe {label} contain duplicates")
-    return value
-
-
-def _validate_native_readonly_probe_output(
-    completed: subprocess.CompletedProcess[str],
-) -> tuple[str, dict[str, object] | None]:
-    if completed.returncode != 0:
-        detail = _bounded_failure_text(completed.stderr, limit=1_024)
-        raise RuntimeError(
-            "native no-child observation probe failed: "
-            f"returncode={completed.returncode}; stderr={detail}"
-        )
-    if completed.stderr:
-        raise RuntimeError("native no-child observation probe wrote unexpected stderr")
-    raw_output = completed.stdout.encode("utf-8")
-    if len(raw_output) > NATIVE_PROBE_OUTPUT_LIMIT_BYTES:
-        raise RuntimeError(
-            "native no-child observation probe exceeded its output bound"
-        )
-    if not completed.stdout.endswith("\n") or completed.stdout.count("\n") != 1:
-        raise RuntimeError(
-            "native no-child observation probe did not emit one JSON record"
-        )
-    try:
-        summary = json.loads(completed.stdout)
-    except (json.JSONDecodeError, RecursionError) as error:
-        raise RuntimeError(
-            "native no-child observation summary is malformed JSON"
-        ) from error
-    if not isinstance(summary, dict) or set(summary) != {
-        "architecture",
-        "decision",
-        "evidence_bytes",
-        "mode",
-        "observation_blockers",
-        "probe_evidence",
-        "production_gate",
-        "runtime_pin_scope",
-        "supported_python",
-    }:
-        raise RuntimeError("native no-child observation summary schema is invalid")
-    if (
-        json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n"
-        != completed.stdout
-    ):
-        raise RuntimeError("native no-child observation summary is not canonical JSON")
-    if (
-        summary["mode"] != "native-ci"
-        or summary["runtime_pin_scope"] != "execution-local-observation-only"
-        or not isinstance(summary["decision"], str)
-        or summary["decision"] not in {"compatible", "fail-closed"}
-        or type(summary["evidence_bytes"]) is not int
-        or not isinstance(summary["supported_python"], str)
-        or not isinstance(summary["architecture"], str)
-    ):
-        raise RuntimeError("native no-child observation summary metadata is invalid")
-
-    evidence = summary["probe_evidence"]
-    expected_evidence_keys = {
-        "schema_version",
-        "runtime_pin",
-        "runtime",
-        "sandbox_exec",
-        "probe_executable",
-        "alternate_executable",
-        "seatbelt_profile_sha256",
-        "parent_nproc_before",
-        "parent_nproc_after",
-        "observations",
-        "blockers",
-        "compatible",
-        "production_capable",
-    }
-    if not isinstance(evidence, dict) or set(evidence) != expected_evidence_keys:
-        raise RuntimeError("native no-child raw evidence schema is invalid")
-    try:
-        evidence_bytes = len(
-            json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
-    except (TypeError, ValueError, UnicodeError) as error:
-        raise RuntimeError(
-            "native no-child raw evidence is not serializable"
-        ) from error
-    if (
-        evidence_bytes > NATIVE_PROBE_EVIDENCE_LIMIT_BYTES
-        or summary["evidence_bytes"] != evidence_bytes
-    ):
-        raise RuntimeError("native no-child raw evidence byte count is invalid")
-
-    runtime = evidence["runtime"]
-    if not isinstance(runtime, dict) or set(runtime) != {
-        "platform",
-        "system",
-        "macos_product_version",
-        "macos_build_version",
-        "darwin_release",
-        "python_version",
-        "python_executable",
-        "effective_uid",
-    }:
-        raise RuntimeError("native no-child runtime fingerprint schema is invalid")
-    python_version = runtime["python_version"]
-    if (
-        runtime["platform"] != "darwin"
-        or runtime["system"] != "Darwin"
-        or not isinstance(runtime["macos_product_version"], str)
-        or not runtime["macos_product_version"]
-        or not isinstance(runtime["macos_build_version"], str)
-        or not runtime["macos_build_version"]
-        or not isinstance(runtime["darwin_release"], str)
-        or not runtime["darwin_release"]
-        or not isinstance(python_version, list)
-        or len(python_version) != 3
-        or any(type(part) is not int for part in python_version)
-        or python_version[2] < 0
-        or python_version[:2] != [3, 13]
-        or type(runtime["effective_uid"]) is not int
-        or runtime["effective_uid"] <= 0
-        or summary["supported_python"] != f"{python_version[0]}.{python_version[1]}"
-        or summary["architecture"] not in {"arm64", "x86_64"}
-    ):
-        raise RuntimeError("native no-child runtime fingerprint is unsupported")
-
-    runtime_pin = evidence["runtime_pin"]
-    sandbox_exec = evidence["sandbox_exec"]
-    if not isinstance(runtime_pin, dict) or set(runtime_pin) != {
-        "macos_product_version",
-        "macos_build_version",
-        "darwin_release",
-        "sandbox_exec_sha256",
-        "python_major",
-        "python_minor",
-        "seatbelt_profile_version",
-    }:
-        raise RuntimeError("native no-child observation pin schema is invalid")
-    if not isinstance(sandbox_exec, dict) or not isinstance(
-        sandbox_exec.get("sha256"), str
-    ):
-        raise RuntimeError("native no-child sandbox identity is invalid")
-    sandbox_digest = sandbox_exec["sha256"]
-    if (
-        sandbox_exec.get("path") != "/usr/bin/sandbox-exec"
-        or sandbox_exec.get("uid") != 0
-        or len(sandbox_digest) != 64
-        or any(character not in "0123456789abcdef" for character in sandbox_digest)
-    ):
-        raise RuntimeError("native no-child sandbox identity is not authenticated")
-    if (
-        runtime_pin["macos_product_version"] != runtime["macos_product_version"]
-        or runtime_pin["macos_build_version"] != runtime["macos_build_version"]
-        or runtime_pin["darwin_release"] != runtime["darwin_release"]
-        or runtime_pin["sandbox_exec_sha256"] != sandbox_exec["sha256"]
-        or runtime_pin["python_major"] != python_version[0]
-        or runtime_pin["python_minor"] != python_version[1]
-    ):
-        raise RuntimeError("native no-child observation pin does not match its runtime")
-
-    observations = evidence["observations"]
-    observation_keys = {
-        "layer",
-        "action",
-        "outcome",
-        "error_number",
-        "detail",
-        "child_pid",
-        "child_process_group",
-        "child_session",
-        "child_start_identity",
-        "profile_sha256",
-        "pre_exec_setsid_succeeded",
-        "pre_exec_pid",
-        "pre_exec_process_group",
-        "pre_exec_session",
-        "pre_exec_nproc_soft",
-        "pre_exec_nproc_hard",
-        "nproc_soft",
-        "nproc_hard",
-    }
-    expected_cases = [
-        (layer, action)
-        for layer in NATIVE_PROBE_LAYERS
-        for action in NATIVE_PROBE_ACTIONS
-    ]
-    if not isinstance(observations, list) or len(observations) != len(expected_cases):
-        raise RuntimeError("native no-child probe matrix is incomplete")
-    observed_cases: list[tuple[str, str]] = []
-    compact_observations: list[list[str]] = []
-    for item in observations:
-        if (
-            not isinstance(item, dict)
-            or set(item) != observation_keys
-            or not isinstance(item["layer"], str)
-            or not isinstance(item["action"], str)
-            or not isinstance(item["outcome"], str)
-            or item["outcome"] not in NATIVE_PROBE_OUTCOMES
-        ):
-            raise RuntimeError(
-                "native no-child probe matrix contains malformed evidence"
-            )
-        observed_cases.append((item["layer"], item["action"]))
-        compact_observations.append(
-            [f"{item['layer']}.{item['action']}", item["outcome"]]
-        )
-    if observed_cases != expected_cases:
-        raise RuntimeError(
-            "native no-child probe matrix is not the exact 24-case order"
-        )
-
-    observation_blockers = _native_blocker_codes(
-        summary["observation_blockers"],
-        label="observation blockers",
-    )
-    evidence_blockers = _native_blocker_codes(
-        evidence["blockers"],
-        label="raw evidence blockers",
-    )
-    if (
-        observation_blockers != evidence_blockers
-        or type(evidence["compatible"]) is not bool
-        or evidence["compatible"] != (not observation_blockers)
-        or summary["decision"]
-        != ("compatible" if not observation_blockers else "fail-closed")
-        or type(evidence["production_capable"]) is not bool
-    ):
-        raise RuntimeError("native no-child observation blockers are inconsistent")
-
-    production_gate = summary["production_gate"]
-    if not isinstance(production_gate, dict) or set(production_gate) != {
-        "decision",
-        "evidence_scope",
-        "blockers",
-        "production_capable",
-    }:
-        raise RuntimeError("native no-child production gate summary schema is invalid")
-    production_blockers = _native_blocker_codes(
-        production_gate["blockers"],
-        label="production gate blockers",
-    )
-    if (
-        not isinstance(production_gate["decision"], str)
-        or not isinstance(production_gate["evidence_scope"], str)
-        or type(production_gate["production_capable"]) is not bool
-        or production_gate["production_capable"] is not evidence["production_capable"]
-    ):
-        raise RuntimeError("native no-child production capability flags disagree")
-
-    projection: dict[str, object] | None = None
-    if production_gate["decision"] == "accepted":
-        if (
-            production_gate["evidence_scope"] != "native-observation"
-            or production_blockers
-            or evidence["production_capable"] is not True
-            or summary["decision"] != "compatible"
-            or runtime_pin != no_child_profile.PINNED_RUNTIME.to_json()
-        ):
-            raise RuntimeError(
-                "native no-child production gate accepted an unexpected runtime"
-            )
-        classification = "production-compatible"
-    elif production_gate["decision"] == "refused":
-        if (
-            production_gate["evidence_scope"] != "hypothetical-production-runtime-pin"
-            or not production_blockers
-            or evidence["production_capable"] is not False
-            or runtime_pin == no_child_profile.PINNED_RUNTIME.to_json()
-        ):
-            raise RuntimeError(
-                "native no-child production refusal is not an unsupported-runtime refusal"
-            )
-        projection = {
-            "mode": "native-readonly-ci",
-            "validation_scope": "native-observation-and-expected-production-refusal",
-            "runtime": {
-                "architecture": summary["architecture"],
-                "macos_product_version": runtime["macos_product_version"],
-                "macos_build_version": runtime["macos_build_version"],
-                "darwin_release": runtime["darwin_release"],
-                "python_version": python_version,
-            },
-            "runtime_pin_scope": summary["runtime_pin_scope"],
-            "native_probe_decision": summary["decision"],
-            "native_observation_count": len(observations),
-            "native_observations": compact_observations,
-            "observation_blockers": observation_blockers,
-            "production_gate_outcome": "expected-refusal",
-            "production_gate_evidence_scope": production_gate["evidence_scope"],
-            "production_gate_blockers": production_blockers,
-            "production_capable": False,
-            "positive_production_launches": 0,
-            "positive_test_count": 0,
-        }
-        if (
-            len(
-                json.dumps(projection, sort_keys=True, separators=(",", ":")).encode(
-                    "ascii"
-                )
-            )
-            > 3_072
-        ):
-            raise RuntimeError(
-                "native-readonly CI summary exceeds its projection bound"
-            )
-        classification = "expected-production-refusal"
-    else:
-        raise RuntimeError("native no-child production gate decision is unsupported")
-    return classification, projection
-
-
-def _run_native_readonly_probe(
-    *,
-    installed_root: pathlib.Path,
-    runtime_parent_binding: _DirectoryParentBinding,
-    timeout: float,
-    stdout_limit: int,
-    stderr_limit: int,
-    secondary_failures: list[SecondaryFailure],
-    closure_proof: ChildProcessClosureProof,
-    lifecycle_fence: LifecycleSignalFence | None,
-) -> tuple[subprocess.CompletedProcess[str], str, dict[str, object] | None]:
-    runtime_parent_binding.revalidate()
-    if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
-        raise ChildRunInterrupted(lifecycle_fence.received_signal)
-    runtime_parent = runtime_parent_binding.path
-    environment = {
-        name: os.environ[name]
-        for name in ("HOME", "LANG", "LC_ALL", "LOGNAME", "USER")
-        if name in os.environ
-    }
-    environment.update(
-        {
-            "PATH": "/usr/bin:/bin",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "TMPDIR": str(runtime_parent),
-            EXPLICIT_RUNTIME_PARENT_ENV: str(runtime_parent),
-        }
-    )
-    argv = (
-        sys.executable,
-        "-I",
-        "-B",
-        "-S",
-        "-c",
-        NATIVE_PROBE_CHILD_CODE,
-        str(installed_root),
-    )
-    completed = _run_bounded_child(
-        argv,
-        cwd=runtime_parent,
-        environment=environment,
-        timeout=timeout,
-        stdout_limit=min(stdout_limit, NATIVE_PROBE_OUTPUT_LIMIT_BYTES),
-        stderr_limit=min(stderr_limit, NATIVE_PROBE_STDERR_LIMIT_BYTES),
-        secondary_failures=secondary_failures,
-        closure_proof=closure_proof,
-        require_isolated_account=True,
-    )
-    if lifecycle_fence is not None and lifecycle_fence.received_signal is not None:
-        raise ChildRunInterrupted(lifecycle_fence.received_signal)
-    classification, projection = _validate_native_readonly_probe_output(completed)
-    return completed, classification, projection
-
-
 def _run_main(
     lifecycle_fence: LifecycleSignalFence,
     *,
@@ -5489,16 +5067,11 @@ def _run_main(
     source_tree_binding: SourceTreeBinding | SourceCheckoutBinding | None = None
     source_head_bound = False
     source_manifest_sha256: str | None = None
-    native_marker = os.environ.get(NATIVE_READONLY_CI_ENV)
-    native_readonly_ci = False
     trusted_source_requested = bool(os.environ.get(EXPECTED_HEAD_ENV))
     source_manifest_before: str | None = None
     snapshot_budget = TreeSnapshotBudget.create()
     stage = "source-head-binding" if trusted_source_requested else "install-container"
     try:
-        if native_marker not in {None, "1"}:
-            raise RuntimeError("native-readonly CI marker is malformed")
-        native_readonly_ci = native_marker == "1"
         if trusted_source_requested:
             source_binding = _bind_source_checkout(
                 source_root,
@@ -5568,13 +5141,12 @@ def _run_main(
         if lifecycle_fence.received_signal is not None:
             raise ChildRunInterrupted(lifecycle_fence.received_signal)
         stage = "child-run"
-        if trusted_source_requested or native_readonly_ci:
+        if trusted_source_requested:
             child_process_closure = "pending"
             completed = _run_no_child_test_suite(
                 installed_root=installed_root,
                 install_container_binding=install_container_binding,
                 runtime_parent_binding=runtime_parent_binding,
-                native_readonly_ci=native_readonly_ci,
                 secondary_failures=secondary_failures,
                 closure_proof=closure_proof,
                 lifecycle_fence=lifecycle_fence,
@@ -6222,8 +5794,6 @@ def _run_main(
             "source_manifest_sha256": source_manifest_sha256,
             "timed_out": timeout_error is not None,
         }
-        if closure_proof.native_readonly_ci is not None:
-            summary["native_readonly_ci"] = closure_proof.native_readonly_ci
 
         primary_failed = primary_status != "complete"
         diagnostic_lines: list[str] = []
