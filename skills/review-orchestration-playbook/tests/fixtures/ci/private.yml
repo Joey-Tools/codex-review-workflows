@@ -376,9 +376,6 @@ jobs:
           - test_codex_personal_sync.py
           - test_generated_sync_source_lock.py
           - test_jira_issue_probe.py
-          - test_macos_ci_fixture_bootstrap.py
-          - test_macos_ci_readonly_fixture.py
-          - test_macos_ci_vm_supervisor.py
           - test_package_builder_safety.py
           - test_pending_agent_claim_compatibility.py
           - test_pending_staging_cleanup.py
