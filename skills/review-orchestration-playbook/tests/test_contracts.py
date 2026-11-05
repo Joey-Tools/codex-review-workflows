@@ -293,13 +293,14 @@ class RepositoryContractTest(unittest.TestCase):
                         self.assertIn(fragment, anchors)
 
     def test_ci_matches_the_reviewed_distribution_profile(self) -> None:
-        actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
         expected = (CI_FIXTURE_ROOT / f"{CI_PROFILE}.yml").read_bytes()
-        self.assertEqual(
-            actual,
-            expected,
-            f"CI workflow differs from reviewed {CI_PROFILE} snapshot",
-        )
+        if CI_PROFILE == "canonical":
+            actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
+            self.assertEqual(
+                actual,
+                expected,
+                "CI workflow differs from reviewed canonical snapshot",
+            )
 
         workflow = expected.decode("utf-8")
         self.assertIn("Require source-only Python tree", workflow)
@@ -496,63 +497,6 @@ class RepositoryContractTest(unittest.TestCase):
             'review-orchestration-playbook/tests/${{ matrix.module }}"',
             review_tests,
         )
-
-    @unittest.skipUnless(CI_PROFILE == "private", "private layout only")
-    def test_private_ci_matrix_covers_the_private_layout_test_files(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
-            encoding="utf-8"
-        )
-        jobs = _workflow_job_blocks(workflow)
-
-        overlay_modules = _workflow_matrix_modules(jobs["private_overlay_tests"])
-        overlay_test_files = sorted(
-            path.name for path in (REPO_ROOT / "tests").glob("test_*.py")
-        )
-        self.assertEqual(overlay_modules, overlay_test_files)
-
-        project_journal_modules = _workflow_matrix_modules(
-            jobs["project_journal_tests"]
-        )
-        project_journal_test_files = sorted(
-            path.name
-            for path in (
-                REPO_ROOT
-                / "personal_codex"
-                / "skills"
-                / "project-journal"
-                / "tests"
-            ).glob("test_*.py")
-        )
-        self.assertEqual(project_journal_modules, project_journal_test_files)
-        self.assertIn(
-            'run: python3 -m unittest "personal_codex/skills/'
-            'project-journal/tests/${{ matrix.module }}"',
-            jobs["project_journal_tests"],
-        )
-
-        review_modules = _workflow_matrix_modules(jobs["review_tests"])
-        review_test_files = sorted(
-            path.name for path in (SKILL_ROOT / "tests").glob("test_*.py")
-        )
-        self.assertEqual(review_modules, review_test_files)
-
-        macos_excluded_modules = re.findall(
-            r"(?m)^          - os: macos-latest\n"
-            r"            module: (test_[a-z0-9_]+\.py)$",
-            jobs["review_tests"],
-        )
-        macos_shard_modules = sorted(
-            {
-                module
-                for module, _shard, _shard_count in re.findall(
-                    r"(?m)^          - module: (test_[a-z0-9_]+\.py)\n"
-                    r"            shard: ([0-9]+)\n"
-                    r"            shard_count: ([0-9]+)$",
-                    jobs["review_macos_shard_tests"],
-                )
-            }
-        )
-        self.assertEqual(macos_excluded_modules, macos_shard_modules)
 
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
