@@ -323,6 +323,13 @@ not this Git validator alone, owns enforcement against reviewer writes.
 
 ## Clean And Safe Checkout
 
+The head checkout inventory, materializer, and index parser admit at most
+200,000 tracked entries. The object/checkout logical-byte, aggregate path-byte,
+compressed-pack, symlink, source-identity, and clean-index safeguards remain
+independent gates. A larger entry allowance does not imply that a tree fits its
+other budgets. The same finite entry limit applies to workspace preparation,
+validation, and materialization.
+
 Immediately before launch, validation rejects:
 
 - staged, modified, deleted, untracked, or ignored worktree content;
