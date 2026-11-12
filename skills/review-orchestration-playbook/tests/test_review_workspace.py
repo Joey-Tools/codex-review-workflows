@@ -25,6 +25,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime import review_workspace as workspace_runtime  # noqa: E402
 from review_runtime.named_lane import main as named_lane_main  # noqa: E402
 from review_runtime.review_workspace import (  # noqa: E402
@@ -273,6 +274,52 @@ class ReviewWorkspaceTest(unittest.TestCase):
             workspace_runtime.RANGE_OBJECT_LOGICAL_BYTES_LIMIT,
             2 * 1024 * 1024 * 1024,
         )
+
+    def test_checkout_metadata_above_old_entry_cap_stays_bounded(self) -> None:
+        oid = b"a" * 40
+        for count in (100_001, 200_000, 200_001):
+            with self.subTest(entries=count):
+                payload = b"".join(
+                    b"100644 blob " + oid + b" 1\titems/p%06d\0" % index
+                    for index in range(count)
+                )
+                with mock.patch.object(workspace_runtime, "_run_git", return_value=payload):
+                    if count <= 200_000:
+                        workspace_runtime._preflight_checkout(
+                            self.repo, "b" * 40, mock.sentinel.control_binding
+                        )
+                    else:
+                        with self.assertRaises(ReviewWorkspaceError) as caught:
+                            workspace_runtime._preflight_checkout(
+                                self.repo, "b" * 40, mock.sentinel.control_binding
+                            )
+                        self.assertEqual(caught.exception.reason, "checkout-entry-limit")
+                        self.assertEqual(caught.exception.details["observed"], 200_001)
+                        self.assertEqual(caught.exception.details["limit"], 200_000)
+
+    def test_materializer_checkout_above_old_entry_cap_stays_bounded(self) -> None:
+        oid = b"a" * 40
+        metadata = {oid: (b"blob", 1)}
+        for count in (100_001, 200_000, 200_001):
+            with self.subTest(entries=count):
+                payload = b"".join(
+                    b"100644 blob " + oid + b"\titems/p%06d\0" % index
+                    for index in range(count)
+                )
+                with mock.patch.object(
+                    named_lane_runtime, "_materializer_git_capture", return_value=payload
+                ):
+                    if count <= 200_000:
+                        named_lane_runtime._materializer_validate_checkout_manifest(
+                            self.repo, "b" * 40, metadata, pathlib.Path("git"), {}, self.root
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            named_lane_runtime.NamedLaneGuardError, "entry-count limit"
+                        ):
+                            named_lane_runtime._materializer_validate_checkout_manifest(
+                                self.repo, "b" * 40, metadata, pathlib.Path("git"), {}, self.root
+                            )
 
     def test_public_cli_exposes_only_the_new_workspace_lifecycle(self) -> None:
         guard = SCRIPTS / "named_lane_guard"

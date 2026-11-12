@@ -65,6 +65,14 @@ GITHUB_HOSTED_RUNTIME_PINS = {
             "abc5bb136d6b5cce8fa85d789f78e3326c51ca60cae637b2064adfb67a1dcd9a"
         ),
     ),
+    "github-macos-26-arm64-26.7.2-25G332": profile.RuntimePin(
+        macos_product_version="26.7.2",
+        macos_build_version="25G332",
+        darwin_release="25.6.0",
+        sandbox_exec_sha256=(
+            "449b1b7456d11ca74b653edf1785c7a912393ae7192fb99cca5806943f75d872"
+        ),
+    ),
 }
 
 
@@ -899,6 +907,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 "github-macos-26-arm64-26.4-25E246",
                 "github-macos-26-arm64-26.5.2-25F84",
                 "github-macos-26-arm64-26.6.2-25G83",
+                "github-macos-26-arm64-26.7.2-25G332",
             },
         )
         self.assertEqual(pin.macos_product_version, "26.4")
@@ -918,6 +927,15 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
         )
         self.assertEqual(current, profile.PINNED_RUNTIME)
+        updated = GITHUB_HOSTED_RUNTIME_PINS["github-macos-26-arm64-26.7.2-25G332"]
+        self.assertEqual(updated.macos_product_version, "26.7.2")
+        self.assertEqual(updated.macos_build_version, "25G332")
+        self.assertEqual(updated.darwin_release, "25.6.0")
+        self.assertEqual(
+            updated.sandbox_exec_sha256,
+            "449b1b7456d11ca74b653edf1785c7a912393ae7192fb99cca5806943f75d872",
+        )
+        self.assertNotEqual(updated, profile.PINNED_RUNTIME)
 
     def test_hosted_runtime_selector_requires_an_exact_reviewed_match(self) -> None:
         from tests.run_hosted_no_child_fail_closed import (
@@ -947,6 +965,16 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 (3, 13, 0),
             ),
             (None, "26.6", "25G100", "25.6.0", (3, 13, 0)),
+            (
+                "github-macos-26-arm64-26.7.2-25G332",
+                "26.7.2",
+                "25G332",
+                "25.6.0",
+                (3, 13, 17),
+            ),
+            (None, "26.7.2", "25G333", "25.6.0", (3, 13, 17)),
+            (None, "26.7.2", "25G332", "25.7.0", (3, 13, 17)),
+            (None, "26.7.2", "25G332", "25.6.0", (3, 14, 0)),
             (None, "26.5.2", "25F84", "25.5.0", (3, 14, 0)),
         )
         for expected_name, product, build, darwin, python_version in cases:
