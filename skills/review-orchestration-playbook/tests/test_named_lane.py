@@ -11609,8 +11609,8 @@ raise AssertionError("terminal publisher returned with an active mask owner")
 
         self.assertEqual(result.head_sha, head)
         expected = named_lane_runtime._checkout_tree_output_limit(len(head))
-        self.assertEqual(expected, 72_708_864)
-        self.assertEqual(named_lane_runtime._checkout_tree_output_limit(64), 75_108_864)
+        self.assertEqual(expected, 78_308_864)
+        self.assertEqual(named_lane_runtime._checkout_tree_output_limit(64), 83_108_864)
         for subcommand in ("ls-tree", "ls-files", "status"):
             matching = [
                 kwargs

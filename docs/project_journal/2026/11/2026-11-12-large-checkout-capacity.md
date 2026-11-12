@@ -26,5 +26,10 @@ existing materializer hard-cap test and its seven rejection cases. A real
 larger-checkout engineering preparation also completed with the other bounds
 unchanged.
 
+The materializer's exact path-output envelope remains derived from the entry
+ceiling and object-id width. Its regression assertions bind 78,308,864 bytes
+for SHA-1 and 83,108,864 bytes for SHA-256; the targeted envelope and existing
+hard-cap tests pass with those expectations.
+
 The change adjusts finite capacity only. It does not waive review, change
 receipt schemas, bypass clean-workspace checks or execute checked-out sources.
