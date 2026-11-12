@@ -28,6 +28,7 @@ EXPECTED_HOSTED_ROLLOUT_CODESIGN_SHA256="214d455584d19abc0d74d02b9cbc7d3da6bdcb0
 EXPECTED_HOSTED_LEGACY_CODESIGN_SHA256="06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337"
 EXPECTED_HOSTED_OS_VERSION="26.6.2"
 EXPECTED_HOSTED_OS_BUILD="25G83"
+EXPECTED_HOSTED_UPDATE_CODESIGN_SHA256="b0fe72653748587b7db6cf5e40f81ae79bcdf424bd1aa11534c4a919cec8d4da"
 EXPECTED_HOSTED_UPDATE_OS_VERSION="26.7.2"
 EXPECTED_HOSTED_UPDATE_OS_BUILD="25G332"
 EXPECTED_HOSTED_ROLLOUT_OS_VERSION="26.5.2"
@@ -91,9 +92,8 @@ select_hosted_codesign_sha256() {
   os_build="$("${probe_environment[@]}" /usr/bin/sw_vers -buildVersion)"
   case "$os_version:$os_build" in
     "$EXPECTED_HOSTED_UPDATE_OS_VERSION:$EXPECTED_HOSTED_UPDATE_OS_BUILD")
-      # Require the previously reviewed codesign binary until an actual hosted
-      # observation and independent review justify a different exact digest.
-      printf '%s\n' "$EXPECTED_HOSTED_CODESIGN_SHA256"
+      # Observed on the exact hosted 26.7.2 / 25G332 runner.
+      printf '%s\n' "$EXPECTED_HOSTED_UPDATE_CODESIGN_SHA256"
       ;;
     "$EXPECTED_HOSTED_OS_VERSION:$EXPECTED_HOSTED_OS_BUILD")
       printf '%s\n' "$EXPECTED_HOSTED_CODESIGN_SHA256"
