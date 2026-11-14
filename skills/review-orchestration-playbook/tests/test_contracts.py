@@ -174,6 +174,7 @@ def _active_policy_paths() -> tuple[pathlib.Path, ...]:
     paths = [
         POLICY_SCOPE_ROOT / "AGENTS.md",
         POLICY_SCOPE_ROOT / "agents/reviewer.toml",
+        SKILL_ROOT / "agents/reviewer-audited.toml",
         POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
         SKILL_ROOT / "SKILL.md",
         SKILL_ROOT / "agents/openai.yaml",
@@ -188,6 +189,7 @@ def _active_policy_paths() -> tuple[pathlib.Path, ...]:
         REFERENCES / "github-codex-producer-and-recovery.md",
         REFERENCES / "review-prompt-templates.md",
         REFERENCES / "review-workspace.md",
+        REFERENCES / "routine-local-review.md",
     ]
     if CI_PROFILE == "canonical":
         paths.append(REPO_ROOT / "README.md")
@@ -1034,7 +1036,7 @@ class RepositoryContractTest(unittest.TestCase):
             "freeze the resulting `merge_base..new_head`", normalized_freshness
         )
         self.assertIn(
-            "a new head invalidates old-head positive evidence",
+            "a new head requires a new local aggregate",
             normalized_skill,
         )
         self.assertIn(
@@ -1057,7 +1059,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertNotIn("invalidates all old-head evidence", normalized_skill)
         self.assertIn(
-            "a changed head invalidates every head-bound positive/pass/clean result",
+            "a changed head invalidates every head-bound positive/pass/clean aggregate result",
             _normalize(readiness),
         )
 
@@ -1225,13 +1227,13 @@ class RepositoryContractTest(unittest.TestCase):
             landing_step,
         )
         self.assertIn("only accept the exact `head_sha`", acceptance_step)
-        self.assertIn("invalidates the prior exact-head result", acceptance_step)
+        self.assertIn("requires a new current-head acceptance record", acceptance_step)
         self.assertIn(
-            "rerun the full local validation and documentation checks",
+            "unknown dependencies require re-review",
             acceptance_step,
         )
         self.assertIn(
-            "repeat every requested local review lane",
+            "never relabel an old-head result as current-head clean",
             acceptance_step,
         )
         self.assertNotIn(
@@ -1274,8 +1276,8 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, instructions)
         self.assertIn("do not orchestrate another named review", instructions.lower())
-        self.assertIn("Check the supplied adapter and requested control metadata for presence and valid form", instructions)
-        self.assertIn("The parent verifies actual launch, context, execution, and launch evidence", instructions)
+        self.assertIn("The parent verifies actual launch, context, execution", instructions)
+        self.assertIn("Do not reproduce control arrays", instructions)
         self.assertIn("Do not choose, launch, delegate, retry, or switch reviewers", instructions)
         self.assertNotIn("Use a clean-context subagent", instructions)
         self.assertNotIn("Prefer this dedicated reviewer role", instructions)
@@ -1285,7 +1287,7 @@ class RepositoryContractTest(unittest.TestCase):
         prompts = _read("references/review-prompt-templates.md")
         local = _read("references/local-codex-lane.md")
         workspace = _read("references/review-workspace.md")
-        with (POLICY_SCOPE_ROOT / "agents/reviewer.toml").open("rb") as handle:
+        with (SKILL_ROOT / "agents/reviewer-audited.toml").open("rb") as handle:
             role = tomllib.load(handle)["developer_instructions"]
 
         for document in (contracts, prompts, local, workspace, role):
@@ -1585,7 +1587,7 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
         self.assertIn(
-            "Compare the complete Git DAG",
+            "Keep the complete Git DAG",
             _read("SKILL.md"),
         )
         self.assertIn("promisor: bool", runtime)

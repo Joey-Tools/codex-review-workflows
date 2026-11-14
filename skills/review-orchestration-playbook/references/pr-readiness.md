@@ -25,7 +25,11 @@ authorized local fallback, local required plus available remote, or remote-only
 wait/retry. Capability observations and historical review never pass a gate.
 A session choice cannot remove a repository-required remote check, approval,
 or unresolved finding; current-head evidence remains mandatory for every
-required lane. New head alone invalidates reviews, not service capability.
+required remote lane. A new head invalidates the previous aggregate review
+decision, not service capability. Routine local units may retain supporting
+evidence through dependency checks and current-head integration as defined in
+[Routine Local Review](routine-local-review.md); no old provider result is
+relabeled as current-head evidence.
 
 ## Authorization And Selection
 
@@ -98,7 +102,9 @@ For example, a head-bound check or local review of an unchanged
 advances, while a merge-group check or test declared base-sensitive must be
 reacquired. A changed merge base changes the local range and invalidates its
 range-bound positive reviews and validations. A changed head invalidates every
-head-bound positive/pass/clean result and the complete local range. An
+head-bound positive/pass/clean aggregate result. Routine local revalidation
+may combine dependency-checked retained units with a new current-head
+integration review; this is a new aggregate, never a stale-head pass. An
 applicable negative provider finding remains a separate blocker until typed
 resolution or an accepted later corrective artifact; it is not an item in the
 planner's positive evidence array. A retained head-only provider result still
@@ -440,7 +446,7 @@ head and unique merge base are byte-for-byte unchanged.
 
 | Change | Invalidation |
 | --- | --- |
-| Head changes | All local reviews, head-bound provider evidence, tests tied to the old head, CI, conversations affected by the diff, and final reread |
+| Head changes | Rebuild the local aggregate decision using affected-unit review plus current-head integration in routine local mode; audited local mode repeats its required lane. Reacquire head-bound provider evidence and CI, reassess affected tests/conversations, and repeat the final reread. |
 | Target `baseRefName` changes, even when its OID is unchanged | Re-read PR scope, lifecycle, rules, required checks, and final state. In routine mode, revalidate only evidence that depends on the target ref or whose governing rule changed. In strict mode, invalidate all readiness evidence except a separately reread head-only provider result. |
 | Target `baseRefOid` changes while head and unique merge base stay the same | Re-read PR scope and final state. In routine mode, preserve evidence tied only to the unchanged head/range; reacquire base-sensitive tests, merge-group/status results, or other evidence selected by the classifier. Strict mode keeps its full base-change invalidation. |
 | Unique merge base changes while head stays the same | Apply the range-origin provenance gate before selecting the new range. Invalidate range-bound local reviews and validations and other evidence declared dependent on the merge base; preserve unaffected head-only evidence after its required reread. Strict mode keeps its full base-change invalidation. |
@@ -489,7 +495,8 @@ When any substantive gate fails:
 7. Repeat until every gate is simultaneously true.
 
 If resolving a finding changes code, that commit creates a new head and the
-full invalidation and fresh-review rules apply. Do not manufacture an empty
+invalidation rules above apply, including dependency-based routine local
+revalidation. Do not manufacture an empty
 commit for a resolution-only state change.
 
 ### Authoritative Automatic Recovery

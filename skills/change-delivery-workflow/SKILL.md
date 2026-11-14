@@ -44,7 +44,7 @@ that review is already clean.
 - Use one runtime/toolchain version unless the user, repo policy, or the compatibility work itself requires a finite multi-version set.
 - Select a single version from the first applicable authority: explicit user instruction, repo-local instruction, repo version-selection configuration, the normal repo runner, then the highest compatible installed version. A selected source that is conflicting, ambiguous, or incompatible is a blocker; do not silently fall through to a lower-priority source.
 - For a required multi-version set, use the first applicable finite authority: explicit instruction, repo policy, declared supported-version set, then CI matrix. Isolate version-sensitive checkout artifacts, caches, ports, and mutable machine state, or run serially when isolation is not proved.
-- Fix failures from the earliest affected step and rerun the affected validation. Report every gate that could not run and its residual risk.
+- Fix failures from the earliest affected step and rerun the affected validation. Do not repeat unrelated builds or tests solely because a new commit exists. Report every gate that could not run and its residual risk.
 
 4. Update durable documentation.
 - Follow the repository's project-journal, state, TODO, changelog, and user-documentation conventions.
@@ -54,11 +54,11 @@ that review is already clean.
 - Complete every intended squash, amend, or other landing transformation before the final frozen review. The resulting signed and attributed commit must be the exact head intended for the next push or PR handoff.
 - Ensure the landing candidate is represented by committed Git objects and record an immutable `base_sha..head_sha`; do not hand a live working tree or prebuilt diff to formal review.
 - Load the authoritative active `$review-orchestration-playbook` and give it the repository, delivery destination, explicit review requests, and frozen endpoints. That playbook alone selects the required local or remote lanes, adapters, workspace, prompt, and evidence contract. Do not add a local lane when its remote-only route omits one.
-- If review finds an issue, fix it in a new checkpoint commit and return to validation and documentation. Complete any desired landing transformation, freeze that new exact head, and repeat every required review lane.
+- If review finds an issue, fix it in a new checkpoint commit and return to affected validation and documentation. Complete any desired landing transformation, freeze the new exact head, and revalidate required lanes under their selected routine or audited profile.
 
 6. Accept the reviewed landing head.
 - Only accept the exact `head_sha` for which implementation, validation, documentation, and the selected required review lanes are clean. Do not create another commit after that review and still describe the new head as reviewed.
-- Any post-review operation that creates a new commit or changes the head—including squash, amend, a base-refresh merge commit, or a documentation, attribution, or metadata-only commit—invalidates the prior exact-head result. Rerun the full local validation and documentation checks, freeze the new range, and repeat every requested local review lane and required remote lane before accepting that head. Omitted local lanes stay omitted; do not turn this invalidation rule into a new local-review requirement.
+- Any post-review operation that creates a new commit requires a new current-head acceptance record. For routine local review, retain unaffected unit evidence under its original SHA only after checking its source, interface, convention, build/configuration, base, and control dependencies. Revalidate affected units and perform a current-head integration review per required independent processor; unknown dependencies require re-review. Run tests appropriate to the delta rather than automatically repeating every unrelated gate. Never relabel an old-head result as current-head clean. Explicit audited local review and required remote providers keep their owning contracts; remote review and CI still bind the actual current head. Omitted local lanes stay omitted.
 - Keep the reviewed landing commit focused and follow repository signing and attribution policy.
 - Do not push a local-gate-only task without separate authorization.
 - When PR readiness was requested and its target authorization preflight passes, continue with `$review-orchestration-playbook` for push/PR operations, CI and comment repair, the requested review shape, and the terminal readiness or merge outcome.

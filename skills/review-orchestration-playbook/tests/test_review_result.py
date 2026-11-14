@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 import subprocess
@@ -11,6 +12,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime.review_result import classify_review_result  # noqa: E402
+from review_runtime.routine_review import classify, revalidation_plan  # noqa: E402
 
 
 class ReviewResultDispositionTest(unittest.TestCase):
@@ -167,6 +169,156 @@ class ReviewResultDispositionTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stdout, b"")
         self.assertIn(b"raw_result must be valid UTF-8", completed.stderr)
+
+
+
+def assessment() -> dict:
+    return {
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "code_outcome": "clean",
+        "terminal_received": True,
+        "scope_complete": True,
+        "boundary_intact": True,
+        "source_unchanged": True,
+        "evidence_complete": True,
+        "unresolved_execution_error": False,
+        "diagnostics": [],
+    }
+
+
+def unit() -> dict:
+    return {
+        "base_sha": "a" * 40,
+        "head_sha": "c" * 40,
+        "reviewed_paths": ["src/client.cpp"],
+        "dependency_paths": ["include/session.h", "AGENTS.md"],
+        "changed_paths": ["docs/example.md"],
+        "prior_clean": True,
+        "dependencies_complete": True,
+        "base_unchanged": True,
+        "control_policy_unchanged": True,
+    }
+
+
+class RoutineReviewTest(unittest.TestCase):
+    def test_recovered_read_and_transport_warnings_preserve_clean_review(self) -> None:
+        record = assessment()
+        record["diagnostics"] = [
+            "Initial grep syntax failed; corrected query returned complete context.",
+            "Stream reconnected; complete terminal message was retained.",
+            "Equivalent read-only command form independently checked by parent.",
+        ]
+        result = classify(record)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["execution_status"], "complete-with-warnings")
+
+    def test_real_evidence_gap_or_failed_transport_cannot_pass(self) -> None:
+        for key, value in (
+            ("terminal_received", False),
+            ("scope_complete", False),
+            ("evidence_complete", False),
+            ("unresolved_execution_error", True),
+        ):
+            with self.subTest(key=key):
+                record = assessment()
+                record[key] = value
+                self.assertFalse(classify(record)["accepted"])
+
+    def test_source_replacement_and_boundary_failure_remain_invalid(self) -> None:
+        for key in ("boundary_intact", "source_unchanged"):
+            with self.subTest(key=key):
+                record = assessment()
+                record[key] = False
+                result = classify(record)
+                self.assertFalse(result["accepted"])
+                self.assertEqual(result["execution_status"], "invalid")
+
+    def test_findings_survive_an_incomplete_execution(self) -> None:
+        record = assessment()
+        record.update(code_outcome="findings", scope_complete=False, evidence_complete=False)
+        result = classify(record)
+        self.assertEqual(result["code_outcome"], "findings")
+        self.assertEqual(result["execution_status"], "incomplete")
+        self.assertFalse(result["accepted"])
+
+    def test_no_findings_on_partial_scope_is_not_approval(self) -> None:
+        record = assessment()
+        record.update(code_outcome="incomplete", scope_complete=False)
+        self.assertFalse(classify(record)["accepted"])
+
+    def test_parent_records_are_not_mutated(self) -> None:
+        for function, record in ((classify, assessment()), (revalidation_plan, unit())):
+            before = copy.deepcopy(record)
+            function(record)
+            self.assertEqual(record, before)
+
+    def test_unrelated_documentation_change_retains_unit_only(self) -> None:
+        result = revalidation_plan(unit())
+        self.assertEqual(result["action"], "retain-unit-evidence")
+        self.assertTrue(result["current_head_integration_required"])
+        self.assertFalse(result["current_head_approved"])
+
+    def test_source_dependency_and_convention_changes_require_review(self) -> None:
+        for path in ("src/client.cpp", "include/session.h", "AGENTS.md"):
+            with self.subTest(path=path):
+                record = unit()
+                record["changed_paths"] = [path]
+                result = revalidation_plan(record)
+                self.assertEqual(result["action"], "review-unit")
+                self.assertEqual(result["affected_paths"], [path])
+
+    def test_rename_accounts_for_removed_and_added_names(self) -> None:
+        record = unit()
+        record["changed_paths"] = ["src/client.cpp", "src/client_mac.cpp"]
+        self.assertEqual(revalidation_plan(record)["action"], "review-unit")
+
+    def test_unknown_dependencies_changed_base_or_policy_force_review(self) -> None:
+        for key in (
+            "prior_clean", "dependencies_complete", "base_unchanged", "control_policy_unchanged"
+        ):
+            with self.subTest(key=key):
+                record = unit()
+                record[key] = False
+                self.assertEqual(revalidation_plan(record)["action"], "review-unit")
+
+    def test_sha256_object_ids_are_supported(self) -> None:
+        record = assessment()
+        record.update(base_sha="a" * 64, head_sha="b" * 64)
+        self.assertTrue(classify(record)["accepted"])
+
+    def test_invalid_scope_or_boolean_is_rejected(self) -> None:
+        for key, value in (("head_sha", "HEAD"), ("scope_complete", 1), ("boundary_intact", "true")):
+            with self.subTest(key=key):
+                record = assessment()
+                record[key] = value
+                with self.assertRaises(ValueError):
+                    classify(record)
+
+    def test_invalid_dependency_paths_cannot_enable_reuse(self) -> None:
+        for path in ("/etc/config", "../src/client.cpp", "src//client.cpp", "src/./client.cpp"):
+            with self.subTest(path=path):
+                record = unit()
+                record["dependency_paths"] = [path]
+                with self.assertRaises(ValueError):
+                    revalidation_plan(record)
+
+    def test_real_cli_uses_parent_input_and_returns_separate_dispositions(self) -> None:
+        script = SCRIPTS / "review_runtime" / "routine_review.py"
+        for operation, record in (("classify", assessment()), ("revalidate", unit())):
+            with self.subTest(operation=operation):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(script), operation],
+                    input=json.dumps(record).encode(),
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                output = json.loads(result.stdout)
+                if operation == "classify":
+                    self.assertTrue(output["accepted"])
+                else:
+                    self.assertFalse(output["current_head_approved"])
 
 
 if __name__ == "__main__":

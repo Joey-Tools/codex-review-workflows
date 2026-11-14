@@ -1,5 +1,7 @@
 # Canonical Claude Code Lane
 
+> Processor independence, opt-in, and runtime isolation are shared. Routine local review uses the compact task and parent disposition in [Routine Local Review](routine-local-review.md). The exact model-facing projection, echo, command-form, and sentinel requirements below apply only to an explicitly selected audited profile; required machine runtime inputs remain parent-owned.
+
 A named double or triple adds one actual Claude Code process. It is independent of the Codex lane and runs in a different validated workspace over the same frozen range.
 
 Launch only after explicit user opt-in. An unambiguous named double/triple

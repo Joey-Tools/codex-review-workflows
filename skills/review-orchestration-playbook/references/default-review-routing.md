@@ -41,8 +41,10 @@ defaults to double/triple.
 Record the request, route, selected provider, explicit opt-ins, frozen scope,
 and required lanes before launch. Explicitly requested local review remains
 required even when a remote provider is available. If a new head is created,
-rerun every required lane for that head, not lanes omitted by the selected
-route. Local build, tests, documentation, and secret admission are not review
+revalidate each required lane, not lanes omitted by the selected route.
+Routine local review uses affected-unit plus current-head integration review;
+required remote providers reacquire actual current-head evidence.
+Local build, tests, documentation, and secret admission are not review
 lanes and remain required as applicable.
 
 ### Remote Review Availability
