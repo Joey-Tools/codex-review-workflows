@@ -1,5 +1,7 @@
 # Review Workspace
 
+> Workspace preparation and validation are shared. In routine local review, retain these machine receipts in the parent; do not copy the later audited projection/command-prefix receipt requirements into the model task. See [Routine Local Review](routine-local-review.md).
+
 A named local reviewer runs in an independent, clean, detached Git workspace. This contract protects three properties:
 
 1. the model-visible checkout is generated only from committed tracked state at `head_sha`;

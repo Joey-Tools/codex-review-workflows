@@ -1,5 +1,7 @@
 # Local Codex Lane
 
+> Audited profile only. Routine local review uses [Routine Local Review](routine-local-review.md) and the compact reviewer role. Select this exact-proof contract explicitly; a failed query does not escalate the profile. Use reviewer-audited (or a generic/CLI adapter with these audited instructions) for this profile.
+
 The named local Codex lane is one logical, fresh-context review of the frozen committed range. Prefer an eligible clean-context subagent; use the CLI when none is available, candidate project controls are known to activate unsuppressed, or external write tools cannot be constrained.
 
 ## Lane Identity

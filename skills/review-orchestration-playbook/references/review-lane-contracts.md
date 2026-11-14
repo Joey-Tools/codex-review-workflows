@@ -1,5 +1,7 @@
 # Review Lane Contracts
 
+> Shape counting and authorization remain shared. The exact local projection, command-prefix, report, and per-parent proof contracts below describe the explicitly selected audited profile. Routine local review instead uses [Routine Local Review](routine-local-review.md), while retaining independent processors, immutable scope, read-only execution, and trusted self-policy control.
+
 This file defines shared scope, independence, counting, outcomes, and rerun rules. Adapter mechanics live in the lane-specific references.
 
 ## Canonical Shapes

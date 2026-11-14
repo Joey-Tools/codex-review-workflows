@@ -1,5 +1,7 @@
 # Review Prompt Templates
 
+> These are the explicitly selected audited-profile templates. Routine local review uses the compact task in [Routine Local Review](routine-local-review.md); keep machine arrays and receipt validation in the parent rather than requesting a reviewer echo.
+
 Use one shared findings contract for both local lanes. Adapt transport fields to the selected runtime, but do not weaken scope, freshness, independence, or read-only constraints.
 
 ## Construction Rules

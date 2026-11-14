@@ -1,5 +1,7 @@
 # Codex Review Workflows Guidelines
 
+- Routine local review is the default: keep machine proofs in the parent, judge recoverable reads by their effect, and re-review affected dependencies plus current-head integration. Select the audited exact-projection profile only explicitly; use the playbook's routine reference for the complete rule.
+
 - For authorized CI diagnostics, follow the risk-based [rerun guidance](docs/ci-reruns.md); do not impose automatic provider-recovery contracts on ordinary test reruns.
 
 - Use `$agile-delivery-workflow` only when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, or scout work.
