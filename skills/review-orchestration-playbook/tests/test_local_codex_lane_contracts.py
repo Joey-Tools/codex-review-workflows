@@ -11,7 +11,7 @@ SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = SKILL_ROOT.parents[1]
 REFERENCES = SKILL_ROOT / "references"
 # These tests retain the explicitly selected audited projection contract.
-ROLE_PATH = REPO_ROOT / "agents" / "reviewer-audited.toml"
+ROLE_PATH = SKILL_ROOT / "agents" / "reviewer-audited.toml"
 REQUIRED_SELF_POLICY_SUBJECT_PATHS = [
     "AGENTS.md",
     "skills/review-orchestration-playbook/SKILL.md",

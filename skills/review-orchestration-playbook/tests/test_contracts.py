@@ -174,7 +174,7 @@ def _active_policy_paths() -> tuple[pathlib.Path, ...]:
     paths = [
         POLICY_SCOPE_ROOT / "AGENTS.md",
         POLICY_SCOPE_ROOT / "agents/reviewer.toml",
-        POLICY_SCOPE_ROOT / "agents/reviewer-audited.toml",
+        SKILL_ROOT / "agents/reviewer-audited.toml",
         POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
         SKILL_ROOT / "SKILL.md",
         SKILL_ROOT / "agents/openai.yaml",
@@ -1287,7 +1287,7 @@ class RepositoryContractTest(unittest.TestCase):
         prompts = _read("references/review-prompt-templates.md")
         local = _read("references/local-codex-lane.md")
         workspace = _read("references/review-workspace.md")
-        with (POLICY_SCOPE_ROOT / "agents/reviewer-audited.toml").open("rb") as handle:
+        with (SKILL_ROOT / "agents/reviewer-audited.toml").open("rb") as handle:
             role = tomllib.load(handle)["developer_instructions"]
 
         for document in (contracts, prompts, local, workspace, role):

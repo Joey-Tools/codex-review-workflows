@@ -36,7 +36,7 @@ Routine local review is the default for every named shape. It uses a short
 semantic task, parent-owned machine records, recoverable read/transport
 diagnostics, and dependency-based unit revalidation with a current-head
 integration check. The detailed exact-projection audited profile and
-`reviewer-audited` role are explicit opt-ins. See
+`agents/reviewer-audited.toml` template packaged with the skill are explicit opt-ins. See
 [Routine Local Review](skills/review-orchestration-playbook/references/routine-local-review.md).
 The stdlib `review_runtime/routine_review.py` helper separates code conclusions
 from execution status and plans local unit revalidation; it never launches a

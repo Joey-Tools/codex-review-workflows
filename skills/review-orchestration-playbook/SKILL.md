@@ -64,7 +64,8 @@ with explicit user authorization.
 - Local Codex: read [Local Codex](references/local-codex-lane.md) and
   [Prompt Templates](references/review-prompt-templates.md) only for an explicitly
   audited profile. Otherwise use Routine Local Review and the compact
-  `reviewer` role; audited review uses `reviewer-audited`. Prefer a clean-context,
+  `reviewer` role; audited adapters use the packaged
+  `agents/reviewer-audited.toml` template. Prefer a clean-context,
   read-only subagent; otherwise use a fresh non-resumed CLI for unsuppressed candidate controls or external write tools.
   Default to `gpt-6.1-sol` at model-default reasoning, currently `medium`, not
   the parent's effort. A generic subagent with the same boundaries is also
