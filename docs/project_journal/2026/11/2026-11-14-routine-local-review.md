@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-14
 updated: 2026-11-14
 branch: wip/review-policy-relaxation
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/151
 supersedes: []
 superseded_by:
 ---
