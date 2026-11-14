@@ -98,8 +98,9 @@ add a parent-imposed output budget or ask the model to fit a final-report quota.
 Respect explicit user quotas and available storage.
 
 Existing trusted adapter capacities remain real constraints, not harmless
-warnings: the current Claude launcher caps aggregate output at 64 MiB and its
-stream validator caps a record at 8 MiB. Disclose those capacities before a
+warnings: the current Claude launcher caps captured aggregate output at 64 MiB;
+its validator accepts at most 8 MiB for the entire stream, 1 MiB per JSONL
+line, and 10,000 lines. Disclose those distinct capacities before a
 Claude launch and choose coherent units/read sizes accordingly. This profile
 does not provide an unlimited Claude capture/parser implementation or silently
 relax its trusted runtime. A capacity stop means necessary evidence was not

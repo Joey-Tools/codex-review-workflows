@@ -26,7 +26,7 @@ superseded_by:
 - The previous exact-projection role remains available as reviewer-audited.
 - The parent-side routine_review module separates code outcome, execution status, and acceptance, and plans dependency-based unit revalidation. It consumes independently verified parent observations; it does not establish a sandbox or approve a new head.
 - Existing audited guard and remote readiness algorithms remain intact. A new aggregate local decision is required after every head change.
-- Existing trusted adapter capacities remain explicit: Claude's 64 MiB aggregate output and 8 MiB record limits are unchanged and must be disclosed before launch. Routine mode removes extra parent/model-report budgets; it does not claim an unlimited Claude capture implementation.
+- Existing trusted adapter capacities remain explicit: Claude capture caps aggregate output at 64 MiB; validation accepts at most 8 MiB total, 1 MiB per JSONL line, and 10,000 lines. These distinct limits must be disclosed before launch. Routine mode removes extra parent/model-report budgets; it does not claim an unlimited Claude capture implementation.
 
 ## Evidence
 
