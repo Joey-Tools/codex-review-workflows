@@ -92,10 +92,19 @@ Never infer safety from a command name alone.
 
 Retry a failed read locally or obtain the missing context with another safe
 read. A line-window overrun is an output-handling issue unless it actually
-loses necessary evidence. Capture complete model output to task files and
-use bounded reads for display. Do not impose an extra producer output cap by
-default; respect explicit user quotas and available storage, report an actual
-capture failure, and never describe truncated evidence as complete.
+loses necessary evidence. Capture complete model output to task files where
+the selected adapter supports it, and use bounded reads for display. Do not
+add a parent-imposed output budget or ask the model to fit a final-report quota.
+Respect explicit user quotas and available storage.
+
+Existing trusted adapter capacities remain real constraints, not harmless
+warnings: the current Claude launcher caps aggregate output at 64 MiB and its
+stream validator caps a record at 8 MiB. Disclose those capacities before a
+Claude launch and choose coherent units/read sizes accordingly. This profile
+does not provide an unlimited Claude capture/parser implementation or silently
+relax its trusted runtime. A capacity stop means necessary evidence was not
+accepted; retain it as incomplete and choose a smaller unit or a separately
+validated adapter-capacity change. Never relabel truncated evidence as complete.
 
 A recovered connection warning does not invalidate a complete, attributable
 terminal result. An unresolved stream error, missing terminal result, scope
