@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import errno
 import hashlib
 import json
 import os
@@ -107,6 +108,36 @@ def _snapshot_identity(manifest: dict[str, Any]) -> str:
     ).encode("ascii")).hexdigest()
 
 
+def _require_deleted_leaf(root_fd: int, path: str, present: set[str]) -> None:
+    """A deleted Git leaf may become a directory or lie below a new file."""
+    with ExitStack() as stack:
+        parent = root_fd
+        parts = path.split("/")
+        for index, part in enumerate(parts[:-1]):
+            try:
+                descriptor = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                if error.errno not in (errno.ENOTDIR, errno.ELOOP):
+                    raise
+                metadata = os.stat(part, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISREG(metadata.st_mode) and "/".join(parts[:index + 1]) in present:
+                    return
+                raise
+            stack.callback(os.close, descriptor)
+            parent = descriptor
+        try:
+            metadata = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(metadata.st_mode):
+            return
+        raise ValueError(f"declared deletion is present or unsupported: {path}")
+
+
 def capture_snapshot(record: dict[str, Any], source: Path, output: Path) -> dict[str, Any]:
     """Capture caller-selected final file content; never read or write Git state."""
     if os.name != "posix":
@@ -146,11 +177,8 @@ def capture_snapshot(record: dict[str, Any], source: Path, output: Path) -> dict
         # entry changes as source mutation. Failed reads remain failed reads.
         for entry in manifest["entries"]:
             if entry.get("deleted"):
-                try:
-                    _read_snapshot_path(root_fd, entry["path"], SNAPSHOT_BYTES)
-                except FileNotFoundError:
-                    continue
-                raise ValueError(f"declared deletion is present: {entry['path']}")
+                _require_deleted_leaf(root_fd, entry["path"], paths)
+                continue
             payload, mode = _read_snapshot_path(root_fd, entry["path"], SNAPSHOT_BYTES)
             if mode != entry["mode"] or hashlib.sha256(payload).hexdigest() != entry["sha256"]:
                 raise ValueError(f"source content changed during capture: {entry['path']}")
@@ -184,15 +212,13 @@ def validate_snapshot(output: Path, expected_id: str) -> dict[str, Any]:
         if len({entry["path"] for entry in entries}) != len(entries):
             raise ValueError("duplicate snapshot paths")
         remaining = SNAPSHOT_BYTES
+        present = {"files/" + entry["path"] for entry in entries if entry.get("deleted") is not True}
         for entry in entries:
             if entry.get("deleted") is True:
                 if set(entry) != {"path", "deleted"}:
                     raise ValueError("invalid deletion entry")
-                try:
-                    _read_snapshot_path(root_fd, "files/" + entry["path"], SNAPSHOT_BYTES)
-                except FileNotFoundError:
-                    continue
-                raise ValueError("deleted snapshot path is present")
+                _require_deleted_leaf(root_fd, "files/" + entry["path"], present)
+                continue
             if set(entry) != {"path", "mode", "size", "sha256"}:
                 raise ValueError("invalid snapshot file entry")
             payload, mode = _read_snapshot_path(root_fd, "files/" + entry["path"], remaining)

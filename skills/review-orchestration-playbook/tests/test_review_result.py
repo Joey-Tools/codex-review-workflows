@@ -525,6 +525,33 @@ class RoutineSnapshotTest(unittest.TestCase):
         self.assertEqual(validated.returncode, 0, validated.stderr)
         self.assertTrue(json.loads(validated.stdout)["snapshot_valid"])
 
+    def test_file_directory_transitions_capture_and_validate_deleted_git_leaves(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                source = self.root / ("reverse" if reverse else "forward")
+                source.mkdir()
+                if reverse:
+                    (source / "a").write_bytes(b"new file")
+                    paths, deleted = ["a"], ["a/b"]
+                else:
+                    (source / "a").mkdir()
+                    (source / "a/b").write_bytes(b"new child")
+                    paths, deleted = ["a/b"], ["a"]
+                output = self.root / ("reverse-packet" if reverse else "forward-packet")
+                record = {**self.record, "paths": paths, "deleted_paths": deleted}
+                receipt = routine_review.capture_snapshot(record, source, output)
+                self.assertTrue(routine_review.validate_snapshot(output, receipt["snapshot_id"])["snapshot_valid"])
+
+    def test_deleted_leaf_does_not_hide_symlink_or_access_failure(self) -> None:
+        (self.source / "linked").symlink_to(self.root, target_is_directory=True)
+        root_fd = os.open(self.source, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, root_fd)
+        with self.assertRaises(OSError):
+            routine_review._require_deleted_leaf(root_fd, "linked/missing", {"linked"})
+        with mock.patch.object(routine_review.os, "stat", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                routine_review._require_deleted_leaf(root_fd, "missing", set())
+
 
 if __name__ == "__main__":
     unittest.main()
