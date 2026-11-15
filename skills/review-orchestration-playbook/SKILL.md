@@ -32,15 +32,15 @@ Record the selected provider and requested/effective lanes.
 ## Freeze Scope Before Review
 
 Use [Routine Local Review](references/routine-local-review.md) by default:
-compact prompts, parent-owned proofs, recoverable diagnostics, and dependency-based
-revalidation. Exact audited projections/commands/reports require explicit selection.
-Named single/double/triple selects processors, not the audited profile.
-Freeze a committed `base_sha..head_sha`; preserve the caller's range and parent-owned origin.
+compact prompts, parent-owned proofs, recoverable diagnostics, and dependency-based revalidation.
+Exact audited projections/commands/reports require explicit selection; named shapes select processors only.
+For commit or PR review, freeze a committed `base_sha..head_sha`; preserve the caller's range and parent-owned origin.
+Explicit uncommitted local review uses the routine reference's frozen snapshot; it cannot satisfy PR readiness or a remote lane.
 Keep the complete Git DAG, including merges and side history, available.
 Inspect endpoint differences and necessary context; inspect intermediate parents
 when a concrete risk warrants it rather than requiring an exhaustive history audit.
-A new head requires a new local aggregate from affected-unit and integration
-review; retain only dependency-checked supporting evidence under its original SHA.
+A new head requires a new local aggregate from affected-unit and integration review;
+retain only dependency-checked supporting evidence under its original SHA.
 Required remote review still binds the actual current head.
 For whole-PR coverage, read
 [PR Range And Invalidation](references/pr-readiness.md#freeze-the-whole-pr-range)
@@ -48,18 +48,18 @@ and bind exact head, target ref, base tip, and unique merge base.
 Recheck scope after base changes and revalidate affected evidence. Track queue
 synthetic SHAs separately. Audited shared scope is in
 [Shared Scope](references/review-lane-contracts.md#frozen-range).
-Do not create commits or include dirty/untracked state under report-only authority.
+Report-only authority never creates commits. Explicit uncommitted review permits tracked snapshots; untracked files require separate user selection.
 
 ## Run Local Lanes
 
 Use separate clean, detached, read-only workspaces with committed tracked
-state and independent Git storage. Give reviewers the frozen endpoints and
-applicable guidance, not a prepared diff or another reviewer's conclusions.
-Prepare and validate through the trusted
-[workspace helper](references/review-workspace.md), including ordinary
-candidate-guidance selection. Keep machine receipts in the parent, without
-requiring the reviewer to echo them. Clean up terminal workspaces unless retained
-with explicit user authorization.
+state and independent Git storage. Routine snapshot review adds a validated packet
+beside the unchanged clean baseline, with no live-source access or head claim.
+Give reviewers frozen scope and applicable guidance, not another reviewer's conclusions.
+Commit review uses direct frozen Git objects; snapshot review follows the routine reference.
+Prepare committed state through the trusted [workspace helper](references/review-workspace.md),
+including candidate-guidance selection. Keep receipts in the parent without reviewer echo.
+Clean up terminal workspaces unless retained with explicit user authorization.
 
 - Local Codex: read [Local Codex](references/local-codex-lane.md) and
   [Prompt Templates](references/review-prompt-templates.md) only for an explicitly

@@ -1,6 +1,6 @@
 # Review Workspace
 
-> Workspace preparation and validation are shared. In routine local review, retain these machine receipts in the parent; do not copy the later audited projection/command-prefix receipt requirements into the model task. See [Routine Local Review](routine-local-review.md).
+> This helper prepares committed baselines and commit-bound review workspaces. In routine local review, retain its machine receipts in the parent; do not copy the later audited projection/command-prefix receipt requirements into the model task. Explicit uncommitted review adds the separate frozen snapshot packet described in [Routine Local Review](routine-local-review.md); it does not change this helper's committed-state contract.
 
 A named local reviewer runs in an independent, clean, detached Git workspace. This contract protects three properties:
 
