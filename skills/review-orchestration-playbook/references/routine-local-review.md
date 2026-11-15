@@ -13,11 +13,62 @@ identity, current-head evidence, CI, merge policy, or external-mutation consent.
 
 ## Parent preparation
 
-Freeze committed base/head object IDs and assign a small, coherent review
+For commit review, freeze committed base/head object IDs and assign a small, coherent review
 unit. Prepare and validate a clean, independent, detached read-only workspace;
 the trusted workspace helper remains the preferred preparation mechanism.
 Keep preparation receipts and control-data verification in the parent record.
 They are machine records, not text the reviewer must reproduce.
+
+### Explicit uncommitted local review
+
+When the user asks to review uncommitted tracked changes, capture their final
+worktree content in a separate packet; do not create a project commit or change
+the source refs/index. A bare named shape still defaults to committed scope.
+Use the clean-workspace helper for the independent committed baseline and
+history. Keep that baseline unchanged and supply the packet beside it. The
+retired supplied-diff/WIP execution entrypoints are not re-enabled.
+
+The parent derives the changed paths with trusted read-only Git, including both
+rename names and deletions. Include staged and unstaged tracked changes in their
+final worktree state, plus necessary context. Untracked paths require separate
+explicit user selection; never capture the whole untracked inventory by default.
+Freeze `base_sha` and observed `source_head_sha`, check HEAD and scope around
+capture, and retain the rationale for included paths and omitted material scope.
+
+Pass a parent-owned JSON record with `base_sha`, `source_head_sha`, `paths`
+(present final files), and `deleted_paths` to the trusted helper:
+
+```text
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py snapshot --source <source-checkout> --output <new-task-packet> < snapshot-input.json
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py validate-snapshot --output <task-packet> --snapshot-id <saved-parent-snapshot-id>
+```
+
+The helper only reads explicitly listed regular files and verifies selected
+content and executable mode twice. It does not discover changes, inspect Git
+state, or prove whole-repository coverage. It records deletions and content
+digests and writes only outside the source checkout. No synthetic commit is
+created. Timestamp changes, directory-entry churn, and same-content replacement
+do not alter the protected property. Symlinks/special files, failed reads,
+content changes, and a 256 MiB capture-capacity stop remain incomplete. This is
+not an atomic filesystem snapshot or protection against same-UID tampering.
+
+Keep the returned snapshot ID independently in the parent record. Validate it
+before and after the read-only reviewer invocation. Compare selected final
+files and deletions against the frozen baseline; reviewers may use a derived
+diff for navigation while retaining direct access to both source versions.
+Never execute candidate packet files or load their controls. Additional context
+must come from the frozen baseline or another explicitly captured packet, not
+the live source. A selected processor whose adapter only accepts committed
+scope remains unsupported for snapshots; report that gap instead of fabricating
+a named-lane pass.
+
+For disposition, set `scope_kind: snapshot`, `base_sha`, `source_head_sha`, and
+`snapshot_id`; omit `head_sha`. `source_unchanged` then refers to the retained
+packet, not subsequent edits in the original checkout. Acceptance covers only
+the recorded snapshot. The helper returns `merge_approval: false`, and snapshot
+changes require a new capture and review. Commit-bound PR gates, audited
+adapters, required remote lanes, and CI still bind the real current commit.
+Remove task packets after terminal use unless retention was authorized.
 
 Launch a fresh reviewer with the selected model and effort. Prefer the
 read-only reviewer role or an eligible zero-inherited-turn generic subagent.

@@ -85,17 +85,23 @@ Named consent does not authorize:
   or
 - changing the repository, PR, range, or provider without renewed scope.
 
-An explicitly requested WIP-content diagnostic must separately identify the
-staged, unstaged, and untracked content it will send. Ordinary named review
-uses committed tracked content from an independent clean workspace.
+An explicitly requested uncommitted local review authorizes a frozen snapshot
+of the named repository's scoped tracked changes for the selected local
+processor. Record the included staged/unstaged scope; separately selected
+untracked files require explicit user authorization. A bare named shape does
+not add dirty or untracked content. Use an independent clean baseline and a
+validated snapshot packet; do not send the live source checkout. Snapshot
+evidence remains report-only and cannot satisfy a commit-bound PR gate.
 
 ## Provider Boundaries
 
 - Local Codex subagent and Codex CLI adapters send the same scoped content to
   OpenAI and are consent-equivalent.
 - Claude Code receives the same frozen committed range in its own independent
-  clean workspace. An API key, local login, or sandbox choice does not widen
-  the repository scope.
+  clean workspace. Snapshot scope additionally requires an authorized adapter
+  that can enforce the packet boundary; existing committed-only adapters do
+  not become snapshot-capable through prose. An API key, local login, or
+  sandbox choice does not widen the repository scope.
 - GitHub Codex operates only on the selected existing `github.com` PR. GitHub
   Enterprise and other hosts are unsupported unless a later explicit contract
   adds them.

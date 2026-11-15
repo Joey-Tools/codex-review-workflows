@@ -49,6 +49,7 @@ that review is already clean.
 4. Update durable documentation.
 - Follow the repository's project-journal, state, TODO, changelog, and user-documentation conventions.
 - In a squash-merge repository, describe the stable post-merge outcome in tracked journal entries; keep transient review/merge status in the PR.
+- For exported skills, agents, or helpers with known distribution consumers, check the frozen candidate against those consumers before source landing. Use the consumer-owned preflight from its configured checkout; include newly intended export paths and retain the candidate SHA and consumer contract digest. Check export roots, exact inventories, and installation link kinds. Resolve known incompatibility before landing; an unavailable consumer is a stated validation gap. Structural compatibility does not replace review, package tests, or release verification. Keep consumer-specific inventories and commands in the consumer repository.
 
 5. Form the landing shape, freeze, and hand off review.
 - Complete every intended squash, amend, or other landing transformation before the final frozen review. The resulting signed and attributed commit must be the exact head intended for the next push or PR handoff.

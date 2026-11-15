@@ -42,6 +42,13 @@ The stdlib `review_runtime/routine_review.py` helper separates code conclusions
 from execution status and plans local unit revalidation; it never launches a
 reviewer or supplies new-head approval.
 
+An explicitly requested uncommitted local review can use a parent-owned frozen
+snapshot beside the independent committed baseline. The same helper captures
+only selected final files and deletions without changing source Git state,
+then validates the retained snapshot identity before and after review.
+Untracked files require explicit selection. Snapshot acceptance is report-only;
+PR review and CI remain bound to the actual commit head.
+
 ## Included Skills
 
 - [`review-orchestration-playbook`](skills/review-orchestration-playbook/SKILL.md)
