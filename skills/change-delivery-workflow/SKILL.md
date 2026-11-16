@@ -55,7 +55,7 @@ that review is already clean.
 - Complete every intended squash, amend, or other landing transformation before the final frozen review. The resulting signed and attributed commit must be the exact head intended for the next push or PR handoff.
 - Ensure the landing candidate is represented by committed Git objects and record an immutable `base_sha..head_sha`; do not hand a live working tree or prebuilt diff to formal review.
 - Load the authoritative active `$review-orchestration-playbook` and give it the repository, delivery destination, explicit review requests, and frozen endpoints. That playbook alone selects the required local or remote lanes, adapters, workspace, prompt, and evidence contract. Do not add a local lane when its remote-only route omits one.
-- If review finds an issue, fix it in a new checkpoint commit and return to affected validation and documentation. Complete any desired landing transformation, freeze the new exact head, and revalidate required lanes under their selected routine or audited profile.
+- Assess received findings with `$review-response` before repair. If review finds an issue, fix it in a new checkpoint commit and return to affected validation and documentation. Complete any desired landing transformation, freeze the new exact head, and revalidate required lanes under their selected routine or audited profile.
 
 6. Accept the reviewed landing head.
 - Only accept the exact `head_sha` for which implementation, validation, documentation, and the selected required review lanes are clean. Do not create another commit after that review and still describe the new head as reviewed.

@@ -176,6 +176,8 @@ def _active_policy_paths() -> tuple[pathlib.Path, ...]:
         POLICY_SCOPE_ROOT / "agents/reviewer.toml",
         SKILL_ROOT / "agents/reviewer-audited.toml",
         POLICY_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
+        POLICY_SCOPE_ROOT / "skills/code-review/SKILL.md",
+        POLICY_SCOPE_ROOT / "skills/review-response/SKILL.md",
         SKILL_ROOT / "SKILL.md",
         SKILL_ROOT / "agents/openai.yaml",
         REFERENCES / "canonical-claude-lane.md",
