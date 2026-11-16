@@ -51,8 +51,14 @@ PR review and CI remain bound to the actual commit head.
 
 ## Included Skills
 
+- [`code-review`](skills/code-review/SKILL.md) owns one read-only reviewer task:
+  inspect the assigned frozen change, report evidence-backed findings, and stop.
+- [`review-response`](skills/review-response/SKILL.md) belongs to the review
+  recipient: verify findings, accept or rebut them, and make proportionate
+  authorized repairs. It neither starts reviewers nor supplies merge approval.
 - [`review-orchestration-playbook`](skills/review-orchestration-playbook/SKILL.md)
-  owns named review shapes, PR readiness, retry/recovery, and result reporting.
+  owns review selection, named shapes, evidence, PR readiness, and recovery.
+  It gives reviewers and recipients their separate role instructions.
 - [`change-delivery-workflow`](skills/change-delivery-workflow/SKILL.md) owns the
   local implementation, validation, documentation, review-handoff, and commit
   gate.
