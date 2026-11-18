@@ -70,7 +70,8 @@ changes require a new capture and review. Commit-bound PR gates, audited
 adapters, required remote lanes, and CI still bind the real current commit.
 Remove task packets after terminal use unless retention was authorized.
 
-Launch a fresh reviewer with the selected model and effort. Prefer the
+Apply [Routine Local Startup And Recovery](default-review-routing.md#routine-local-startup-and-recovery)
+before launching a fresh reviewer. Prefer the
 read-only reviewer role or an eligible zero-inherited-turn generic subagent.
 Use a neutral-root fresh CLI with process-local external write tools disabled
 when the host cannot enforce the subagent boundary. Preserve normal trusted

@@ -158,6 +158,34 @@ Another Claude model or effort requires explicit selection. Authentication,
 entitlement failure, a strong parent, or cost reduction does not authorize a
 different model, provider, or local Copilot CLI fallback.
 
+### Routine Local Startup And Recovery
+
+Set model, reasoning, Daybreak, and execution adapter together for each launch;
+do not inherit the parent's selections. Preserve explicit user choices.
+
+| Configuration | Model | Reasoning | Daybreak |
+| --- | --- | --- | --- |
+| Default | `gpt-6.1-sol` | `medium` | Off |
+| User-authorized fallback | `gpt-6-sol` | `medium` | On |
+
+The fallback requires the user's authorization; an authorized Luna or other
+selection remains separate. Use per-launch controls, without changing global
+configuration or authentication. If a subagent cannot set the required
+Daybreak state, use a fresh CLI that can, retaining the selected read-only
+boundary and frozen scope.
+
+Recover from the actual failure reason. A model/Daybreak incompatibility calls
+for correcting that pair; a still-unavailable primary may use the authorized
+fallback. Fix local MCP/configuration or permission errors at the execution
+entrypoint before retrying. A finding is not a launch failure. Confirm that an
+uncertain prior attempt has ended before starting another.
+
+Reuse a successful configuration within the same task across new heads;
+reconsider it after user selection, relevant configuration, or availability
+changes. Keep the actual adapter, model, reasoning, Daybreak state, and any
+fallback reason in the parent task record. No extra model probe or new receipt
+schema is required.
+
 ### Native GitHub Copilot Code Review
 
 This route uses GitHub's PR review service, not Copilot CLI, IDE review,
