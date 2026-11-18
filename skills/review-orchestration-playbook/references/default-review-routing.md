@@ -139,10 +139,9 @@ receipts. `required-remote` remains a blocker until its own gate passes.
 
 ### Local Model and Reasoning Consent
 
-The default local reviewer is `gpt-6.1-sol` at model-default reasoning. The
-currently documented default is `medium`; pin that level in the installed
-role/CLI launch so a stronger parent or ambient configuration cannot silently
-elevate it. Record intent separately from runtime evidence.
+The default local reviewer is `gpt-6.1-sol` at `high` reasoning. Pin that level
+in the installed role/CLI launch instead of inheriting the parent's or ambient
+settings. Record intent separately from runtime evidence.
 
 Another model or reasoning override requires explicit user opt-in.
 Authorizing GPT-6 Luna, up to Max, for workers can also authorize it for local
@@ -165,8 +164,8 @@ do not inherit the parent's selections. Preserve explicit user choices.
 
 | Configuration | Model | Reasoning | Daybreak |
 | --- | --- | --- | --- |
-| Default | `gpt-6.1-sol` | `medium` | Off |
-| User-authorized fallback | `gpt-6-sol` | `medium` | On |
+| Default | `gpt-6.1-sol` | `high` | Off |
+| User-authorized fallback | `gpt-6-sol` | `high` | On |
 
 The fallback requires the user's authorization; an authorized Luna or other
 selection remains separate. Use per-launch controls, without changing global

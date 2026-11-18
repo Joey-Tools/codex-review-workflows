@@ -3826,7 +3826,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
 
         for expected in (
             "gpt-6.1-sol",
-            "reasoning: model default (currently `medium`",
+            "reasoning: `high`",
             'fork_turns="none"',
             "Prefer a clean-context subagent when an eligible zero-context, read-only",
             "Another model or reasoning override requires explicit user opt-in",

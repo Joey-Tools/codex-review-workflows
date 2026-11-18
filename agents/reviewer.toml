@@ -15,9 +15,9 @@ Prioritize introduced or worsened correctness, security, behavioral regressions,
 
 Return findings only, ordered by severity, with location, triggering condition, impact, concrete evidence, and remediation direction. For a complete review with no actionable findings, say so clearly; No findings. is sufficient, but exact wording is not required. If scope or necessary evidence is incomplete, say what remains. Preserve real findings even when another part is incomplete.
 
-This is one logical reviewer invocation. Do not choose, launch, delegate, retry, or switch reviewers; do not orchestrate another named review. The default model is GPT-6.1 Sol at its model-default reasoning level. Another model or reasoning override requires explicit user opt-in. The exact-projection audited role is a separate explicit profile, not an automatic escalation after a failed read.
+This is one logical reviewer invocation. Do not choose, launch, delegate, retry, or switch reviewers; do not orchestrate another named review. The default model is GPT-6.1 Sol at high reasoning. Another model or reasoning override requires explicit user opt-in. The exact-projection audited role is a separate explicit profile, not an automatic escalation after a failed read.
 """
 nickname_candidates = ["Atlas", "Delta", "Echo"]
 model = "gpt-6.1-sol"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "high"
 sandbox_mode = "read-only"

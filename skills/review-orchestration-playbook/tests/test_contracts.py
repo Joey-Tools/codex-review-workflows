@@ -527,7 +527,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("cli", normalized)
             self.assertIn("peer", normalized)
             self.assertIn("gpt-6.1-sol", normalized)
-            self.assertIn("medium", normalized)
+            self.assertIn("high", normalized)
             self.assertIn("internal delegation", normalized)
         self.assertIn("Prefer a clean-context subagent when an eligible", local)
         self.assertIn(
@@ -1258,13 +1258,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("secret-delta admission is independent of review", contracts)
         self.assertIn("never supplies a reviewer result", contracts)
 
-    def test_reviewer_role_requests_sol_model_default_and_read_only_findings(self) -> None:
+    def test_reviewer_role_requests_sol_high_and_read_only_findings(self) -> None:
         role_path = POLICY_SCOPE_ROOT / "agents/reviewer.toml"
         with role_path.open("rb") as handle:
             role = tomllib.load(handle)
 
         self.assertEqual(role["model"], "gpt-6.1-sol")
-        self.assertEqual(role["model_reasoning_effort"], "medium")
+        self.assertEqual(role["model_reasoning_effort"], "high")
         self.assertEqual(role["sandbox_mode"], "read-only")
         instructions = role["developer_instructions"]
         for anchor in (
