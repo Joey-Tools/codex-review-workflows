@@ -71,11 +71,11 @@ Clean up terminal workspaces unless retained with explicit user authorization.
   `reviewer` role; audited adapters use the packaged
   `agents/reviewer-audited.toml` template. Prefer a clean-context,
   read-only subagent; otherwise use a fresh non-resumed CLI for unsuppressed candidate controls or external write tools.
-  Default to `gpt-6.1-sol` at model-default reasoning, currently `medium`, not
-  the parent's effort. A generic subagent with the same boundaries is also
-  eligible. Another model/effort requires explicit opt-in;
-  worker allocation alone does not authorize a reviewer override. Record the
-  actual launch type, requested and effective adapter, model and reasoning.
+  Follow [Local Model and Reasoning Consent](references/default-review-routing.md#local-model-and-reasoning-consent)
+  and, for routine review, [Startup And Recovery](references/default-review-routing.md#routine-local-startup-and-recovery).
+  The default is `gpt-6.1-sol` / `medium`, not the parent's effort. A generic
+  subagent with the same boundaries is also eligible. Other model/effort
+  selections require explicit opt-in; worker allocation alone is insufficient.
 - Claude: read [Claude Code](references/canonical-claude-lane.md) only after
   explicit opt-in. Default to Opus 5.5 at `high` effort. Use an actual
   fresh independent Claude process; another Codex process, Copilot or a
