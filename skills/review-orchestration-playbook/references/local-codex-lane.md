@@ -287,7 +287,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
   Record the resolved executable, exact version output, and complete literal
   submitted token array in shared metadata; the final report repeats the actual
   values and requires exact match. Defaults remain `gpt-6.1-sol` and
-  model-default reasoning (`medium`); record any separately authorized
+  `high` reasoning; record any separately authorized
   override exactly as selected. The `-c` values disable Apps, plugins,
   computer use, browser use, image generation, persisted goals, automatic MCP
   dependency installation, nested agent launches, automatic daemon startup,
@@ -541,7 +541,7 @@ failure.
 The intended installed profile is:
 
 - model: `gpt-6.1-sol`;
-- reasoning: model default (currently `medium`, pinned to avoid inherited overrides);
+- reasoning: `high`, pinned to avoid inherited overrides;
 - context: fresh;
 - access: read-only;
 - output: findings only.
@@ -576,9 +576,7 @@ triggers latest-model discovery.
 
 The low-level `isolated_review` Codex CLI and independent app-server helpers
 pin `gpt-6.1-sol` at `high` reasoning and do not select a fallback model.
-An explicit runtime rejection remains blocked or inconclusive. These helpers
-do not change the named local reviewer role or its peer CLI adapter, which
-retain the model-default `medium` profile described above.
+An explicit runtime rejection remains blocked or inconclusive.
 
 The low-level Claude Code helper pins `claude-opus-5-5` at `high`; an
 explicitly authorized Copilot CLI helper pins `claude-opus-5.5` at `high`.

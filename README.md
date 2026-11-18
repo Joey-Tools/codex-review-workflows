@@ -19,7 +19,7 @@ PR-bound remote support requires an explicit session choice: local fallback,
 local required plus available remote, or remote-only wait/retry. See the
 [routing contract](skills/review-orchestration-playbook/references/default-review-routing.md#default-review-routing);
 historical capability is not current-head pass and no choice waives required
-checks. Local review defaults to GPT-6.1 Sol at model-default reasoning;
+checks. Local review defaults to GPT-6.1 Sol at `high` reasoning;
 alternative models/efforts require explicit opt-in. A user may authorize GPT-6
 Luna, up to Max, for work and local review. Claude is never a generic workflow
 default; when explicitly requested, it defaults to Opus 5.5. Named double/triple
