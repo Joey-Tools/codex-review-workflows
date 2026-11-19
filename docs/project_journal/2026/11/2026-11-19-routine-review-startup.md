@@ -39,7 +39,9 @@ the parent's selected regular tracked context. The audited helper is unchanged.
 - Focused tests cover independent sparse preparation, retained Git context,
   live-source independence, content/mode revalidation and process-local profiles.
 - Native review fixes cover relative CLI paths, frozen heads retained only by
-  PR refs, and raw-blob checkout under tracked CRLF attributes. These use the
+  PR refs, raw-blob validation under CRLF/UTF-16 attributes, and relative output
+  directories. Raw content/index checks and untracked-file detection avoid
+  working-tree attribute conversion. These use the
   existing test module and do not add CI jobs or model probes.
 - A real no-model configuration invocation confirms the installed Codex CLI's
   effective primary profile and MCP shutdown.

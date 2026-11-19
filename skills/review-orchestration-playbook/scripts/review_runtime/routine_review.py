@@ -489,8 +489,8 @@ def validate(record: dict) -> None:
         if blob_identity(root / name, record["object_format"]) != expected:
             raise ValueError(f"selected content or executable mode changed: {name}")
     git(root, "diff-index", "--cached", "--quiet", record["head"], "--")
-    if git(root, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise ValueError("workspace contains modified or untracked content")
+    if git(root, "ls-files", "--others", "--exclude-standard", "-z"):
+        raise ValueError("workspace contains untracked content")
 
 
 def read_config(prefix: list[str], neutral: Path) -> dict:
@@ -589,6 +589,7 @@ def configuration(codex: str, neutral: Path, model: str) -> dict:
 
 def run_review(workspace: dict, config: dict, output: Path, prompt: str) -> int:
     validate(workspace)
+    output = output.resolve()
     output.mkdir(mode=0o700)
     argv = config["launch_prefix"] + ["exec", "--sandbox", "read-only",
             "--skip-git-repo-check", "--json", "-o", str(output / "final.txt"), "-"]

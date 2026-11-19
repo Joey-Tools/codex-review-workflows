@@ -11980,6 +11980,10 @@ class RoutineCodexTest(unittest.TestCase):
         selected.chmod(selected.stat().st_mode | 0o111)
         with self.assertRaisesRegex(ValueError, "content or executable mode"):
             routine_codex_runtime.validate(record)
+        selected.chmod(0o644)
+        (selected.parent / "unexpected.txt").write_text("untracked\n")
+        with self.assertRaisesRegex(ValueError, "untracked content"):
+            routine_codex_runtime.validate(record)
 
     def test_preparation_transfers_head_retained_only_by_a_pr_ref(self):
         routine_codex_runtime.git(self.source, "update-ref", "refs/pull/1/head", self.head)
@@ -11989,7 +11993,7 @@ class RoutineCodexTest(unittest.TestCase):
         self.assertEqual((pathlib.Path(record["worktree"]) / "selected.txt").read_bytes(), b"head\n")
 
     def test_preparation_materializes_raw_blobs_despite_checkout_attributes(self):
-        (self.source / ".gitattributes").write_text("selected.txt text eol=crlf\n")
+        (self.source / ".gitattributes").write_text("selected.txt text eol=crlf working-tree-encoding=UTF-16\n")
         routine_codex_runtime.git(self.source, "add", ".gitattributes")
         routine_codex_runtime.git(self.source, "-c", "commit.gpgsign=false", "commit", "-qm", "attributes")
         self.head = routine_codex_runtime.git(self.source, "rev-parse", "HEAD").decode().strip()
@@ -12001,7 +12005,9 @@ class RoutineCodexTest(unittest.TestCase):
         record = self.prepare()
         executable = self.root / "fixture_cli.py"
         executable.write_text(
-            "import sys\n"
+            "import pathlib, sys\n"
+            "if not pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).is_absolute():\n"
+            "    raise SystemExit(3)\n"
             "sys.stdout.write('review output\\n' * 300)\n"
             "sys.stderr.write('startup diagnostic\\n')\n"
             "raise SystemExit(7)\n"
@@ -12010,7 +12016,8 @@ class RoutineCodexTest(unittest.TestCase):
                   "neutral_root": str(self.root), "selected_model": "fixture-no-model",
                   "selected_reasoning": "high", "daybreak": False}
         output = self.root / "output"
-        self.assertEqual(routine_codex_runtime.run_review(record, config, output, "review"), 7)
+        relative_output = pathlib.Path(os.path.relpath(output))
+        self.assertEqual(routine_codex_runtime.run_review(record, config, relative_output, "review"), 7)
         captured = (output / "stream.jsonl").read_text()
         self.assertEqual(captured.count("review output\n"), 300)
         self.assertIn("startup diagnostic\n", captured)
