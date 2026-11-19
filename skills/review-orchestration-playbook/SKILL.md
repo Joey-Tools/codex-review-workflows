@@ -56,13 +56,14 @@ Report-only authority never creates commits. Explicit uncommitted review permits
 
 ## Run Local Lanes
 
-Use separate clean, detached, read-only workspaces with committed tracked state
-and independent Git storage. Routine snapshots add a validated packet beside
-the unchanged clean baseline, without live-source access or a head claim.
+Use clean, detached, read-only workspaces with independent Git storage.
+Routine snapshots add a validated packet beside the committed baseline,
+without live-source access or a head claim.
 Give reviewers frozen scope and applicable guidance, not another reviewer's conclusions.
 Commit review uses direct frozen Git objects; snapshot review follows the routine reference.
-Prepare committed state through the trusted [workspace helper](references/review-workspace.md),
-including candidate-guidance selection. Keep receipts in the parent without reviewer echo.
+Use the released [routine helper](references/routine-local-review.md#reusable-routine-preparation-and-startup)
+for routine state; the [audited helper](references/review-workspace.md) retains its contract.
+Keep candidate-guidance selection and receipts in the parent without reviewer echo.
 Clean up terminal workspaces unless retained with explicit user authorization.
 
 - Local Codex: read [Local Codex](references/local-codex-lane.md) and

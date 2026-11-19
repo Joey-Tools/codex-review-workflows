@@ -27,6 +27,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime import review_workspace as workspace_runtime  # noqa: E402
+from review_runtime import routine_codex as routine_codex_runtime  # noqa: E402
 from review_runtime.named_lane import main as named_lane_main  # noqa: E402
 from review_runtime.review_workspace import (  # noqa: E402
     RangeIncomplete,
@@ -11920,6 +11921,97 @@ class ReviewWorkspaceTest(unittest.TestCase):
             prepare_workspace(self.repo, destination, self.commits[2], head)
         self.assertEqual(caught.exception.reason, "symlink-escape")
         self.assertFalse(destination.exists())
+
+
+class RoutineCodexTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        routine_codex_runtime.git(self.source, "init", "-q")
+        routine_codex_runtime.git(self.source, "config", "user.name", "Fixture Author")
+        routine_codex_runtime.git(self.source, "config", "user.email", "fixture@example.invalid")
+        (self.source / "selected.txt").write_text("base\n")
+        (self.source / "asset.bin").write_bytes(b"unrelated asset" * 2048)
+        routine_codex_runtime.git(self.source, "add", ".")
+        routine_codex_runtime.git(self.source, "-c", "commit.gpgsign=false", "commit", "-qm", "base")
+        self.base = routine_codex_runtime.git(self.source, "rev-parse", "HEAD").decode().strip()
+        (self.source / "selected.txt").write_text("head\n")
+        routine_codex_runtime.git(self.source, "add", ".")
+        routine_codex_runtime.git(self.source, "-c", "commit.gpgsign=false", "commit", "-qm", "head")
+        self.head = routine_codex_runtime.git(self.source, "rev-parse", "HEAD").decode().strip()
+
+    def prepare(self):
+        return routine_codex_runtime.prepare(self.source, self.root / "review", self.base, self.head,
+                               ["selected.txt"])
+
+    def test_selected_checkout_keeps_independent_history_and_unmaterialized_context(self):
+        record = self.prepare()
+        review = pathlib.Path(record["worktree"])
+        self.assertEqual((review / "selected.txt").read_text(), "head\n")
+        self.assertFalse((review / "asset.bin").exists())
+        self.assertFalse((review / ".git/objects/info/alternates").exists())
+        self.assertEqual(routine_codex_runtime.git(review, "show", self.base + ":selected.txt"), b"base\n")
+        self.assertEqual(routine_codex_runtime.git(review, "show", self.head + ":asset.bin"),
+                         (self.source / "asset.bin").read_bytes())
+        (self.source / "selected.txt").write_text("later live edit\n")
+        routine_codex_runtime.validate(record)
+        self.assertEqual(routine_codex_runtime.git(review, "remote"), b"")
+
+    def test_revalidation_ignores_timestamp_churn_but_detects_content_and_mode_changes(self):
+        record = self.prepare()
+        selected = pathlib.Path(record["worktree"]) / "selected.txt"
+        metadata = selected.stat()
+        os.utime(selected, (metadata.st_atime + 1, metadata.st_mtime + 1))
+        routine_codex_runtime.validate(record)
+        selected.write_text("different\n")
+        with self.assertRaisesRegex(ValueError, "content or executable mode"):
+            routine_codex_runtime.validate(record)
+        selected.write_text("head\n")
+        selected.chmod(selected.stat().st_mode | 0o111)
+        with self.assertRaisesRegex(ValueError, "content or executable mode"):
+            routine_codex_runtime.validate(record)
+
+    def test_failed_cli_retains_complete_output_and_failure_for_parent_disposition(self):
+        record = self.prepare()
+        executable = self.root / "fixture_cli.py"
+        executable.write_text(
+            "import sys\n"
+            "sys.stdout.write('review output\\n' * 300)\n"
+            "sys.stderr.write('startup diagnostic\\n')\n"
+            "raise SystemExit(7)\n"
+        )
+        config = {"launch_prefix": [sys.executable, str(executable)],
+                  "neutral_root": str(self.root), "selected_model": "fixture-no-model",
+                  "selected_reasoning": "high", "daybreak": False}
+        output = self.root / "output"
+        self.assertEqual(routine_codex_runtime.run_review(record, config, output, "review"), 7)
+        captured = (output / "stream.jsonl").read_text()
+        self.assertEqual(captured.count("review output\n"), 300)
+        self.assertIn("startup diagnostic\n", captured)
+        self.assertEqual(json.loads((output / "exit.json").read_text())["returncode"], 7)
+        self.assertFalse((output / "final.txt").exists())
+
+    def test_configuration_pins_high_and_disables_inherited_external_servers(self):
+        for model, daybreak in routine_codex_runtime.PROFILES.items():
+            with self.subTest(model=model):
+                features = {name: False for name in routine_codex_runtime.FEATURES}
+                features["cli_daybreak"] = daybreak
+                first = {"model": model, "model_reasoning_effort": "high",
+                         "model_provider": "openai", "features": features,
+                         "mcp_servers": {"inherited": {"enabled": True}}}
+                second = dict(first, mcp_servers={"inherited": {"enabled": False}})
+                with mock.patch.object(routine_codex_runtime, "read_config", side_effect=[first, second]) as probe:
+                    with mock.patch.object(routine_codex_runtime.shutil, "which", return_value="/trusted/codex"):
+                        with mock.patch.object(routine_codex_runtime.subprocess, "check_output", return_value="codex-cli fixture\n"):
+                            record = routine_codex_runtime.configuration("codex", self.root / "neutral", model)
+                self.assertEqual(probe.call_count, 2)
+                self.assertEqual(record["model_threads_started"], 0)
+                self.assertEqual(record["selected_reasoning"], "high")
+                self.assertEqual(record["daybreak"], daybreak)
+                self.assertIn('mcp_servers={"inherited"={enabled=false}}', record["launch_prefix"])
 
 
 if __name__ == "__main__":

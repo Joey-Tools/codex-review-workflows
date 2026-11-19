@@ -42,6 +42,13 @@ The stdlib `review_runtime/routine_review.py` helper separates code conclusions
 from execution status and plans local unit revalidation; it never launches a
 reviewer or supplies new-head approval.
 
+The stdlib `review_runtime/routine_codex.py` entrypoint prepares an independent
+Git copy with only explicitly selected tracked files checked out, verifies the
+effective Sol/High/Daybreak configuration without a model request, and launches
+one fresh read-only CLI review with complete output capture. Reuse its successful
+configuration across heads in the same task; the parent still selects affected
+units, reviews the integration delta and owns acceptance.
+
 An explicitly requested uncommitted local review can use a parent-owned frozen
 snapshot beside the independent committed baseline. The same helper captures
 only selected final files and deletions without changing source Git state,
