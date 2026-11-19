@@ -27,7 +27,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime import review_workspace as workspace_runtime  # noqa: E402
-from review_runtime import routine_codex as routine_codex_runtime  # noqa: E402
+from review_runtime import routine_review as routine_codex_runtime  # noqa: E402
 from review_runtime.named_lane import main as named_lane_main  # noqa: E402
 from review_runtime.review_workspace import (  # noqa: E402
     RangeIncomplete,
@@ -11944,8 +11944,15 @@ class RoutineCodexTest(unittest.TestCase):
         self.head = routine_codex_runtime.git(self.source, "rev-parse", "HEAD").decode().strip()
 
     def prepare(self):
-        return routine_codex_runtime.prepare(self.source, self.root / "review", self.base, self.head,
-                               ["selected.txt"])
+        paths = self.root / "paths.json"
+        paths.write_text(json.dumps(["selected.txt"]))
+        record = self.root / "workspace.json"
+        self.assertEqual(routine_codex_runtime.main([
+            "prepare", "--source", str(self.source), "--worktree", str(self.root / "review"),
+            "--base", self.base, "--head", self.head, "--paths-json", str(paths),
+            "--record", str(record),
+        ]), 0)
+        return json.loads(record.read_text())
 
     def test_selected_checkout_keeps_independent_history_and_unmaterialized_context(self):
         record = self.prepare()

@@ -22,7 +22,7 @@ They are machine records, not text the reviewer must reproduce.
 
 ### Reusable routine preparation and startup
 
-Use the installed/released `scripts/review_runtime/routine_codex.py` instead of
+On macOS/Linux, use the installed/released `scripts/review_runtime/routine_review.py` instead of
 writing a task-local launcher. `prepare` makes an independent local Git clone,
 keeps the locally available committed history and materializes only the parent's
 explicit regular tracked file list. Include the assigned changes and necessary
@@ -31,9 +31,9 @@ Resolve path-scoped guidance before launch. A sparse tree is not an authorizatio
 to omit necessary review coverage or inspect live source.
 
 ```text
-python3 <trusted-skill>/scripts/review_runtime/routine_codex.py prepare --source <source> --worktree <new-workspace> --base <base> --head <head> --paths-json <tracked-path-array.json> --record <workspace.json>
-python3 <trusted-skill>/scripts/review_runtime/routine_codex.py config --codex <codex-executable> --neutral-root <outside-candidate-root> --record <config.json>
-python3 <trusted-skill>/scripts/review_runtime/routine_codex.py run --workspace-record <workspace.json> --config-record <config.json> --output <new-output-directory> --prompt-file <parent-prompt.txt>
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py prepare --source <source> --worktree <new-workspace> --base <base> --head <head> --paths-json <tracked-path-array.json> --record <workspace.json>
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py config --codex <codex-executable> --neutral-root <outside-candidate-root> --record <config.json>
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py run --workspace-record <workspace.json> --config-record <config.json> --output <new-output-directory> --prompt-file <parent-prompt.txt>
 ```
 
 `config` reads effective settings without creating a model thread, disables
