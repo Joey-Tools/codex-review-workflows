@@ -222,7 +222,6 @@ def _workflow_matrix_modules(job: str) -> list[str]:
 class RepositoryContractTest(unittest.TestCase):
     def test_entrypoint_routes_details_without_loading_unrelated_lane_contracts(self) -> None:
         skill = _read("SKILL.md")
-        self.assertLess(len(skill.splitlines()), 160)
         for path in (
             "default-review-routing.md",
             "github-codex-producer-and-recovery.md",

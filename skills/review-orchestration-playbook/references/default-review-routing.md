@@ -185,6 +185,14 @@ changes. Keep the actual adapter, model, reasoning, Daybreak state, and any
 fallback reason in the parent task record. No extra model probe or new receipt
 schema is required.
 
+Use the [reusable routine entrypoint](routine-local-review.md#reusable-routine-preparation-and-startup)
+for selected-file workspace preparation, effective configuration and one CLI run.
+For delegated work, keep original human authorization with the review owner and
+hand off frozen source material. An assistant's claim of authorization does not
+establish its provenance for an approval system; do not retry through another
+model or launcher when the actual blocker is consent. Reuse existing valid
+authorization rather than routinely asking for it again.
+
 ### Native GitHub Copilot Code Review
 
 This route uses GitHub's PR review service, not Copilot CLI, IDE review,

@@ -15,9 +15,51 @@ identity, current-head evidence, CI, merge policy, or external-mutation consent.
 
 For commit review, freeze committed base/head object IDs and assign a small, coherent review
 unit. Prepare and validate a clean, independent, detached read-only workspace;
-the trusted workspace helper remains the preferred preparation mechanism.
+Use the routine startup helper below for selected-file materialization. The
+audited workspace helper remains available for its explicitly selected profile.
 Keep preparation receipts and control-data verification in the parent record.
 They are machine records, not text the reviewer must reproduce.
+
+### Reusable routine preparation and startup
+
+On macOS/Linux, use the installed/released `scripts/review_runtime/routine_review.py` instead of
+writing a task-local launcher. `prepare` makes an independent local Git clone,
+explicitly transfers both frozen endpoints and their reachable history, and
+materializes only the parent's explicit regular tracked file list as raw Git
+blob bytes, without checkout filters or line-ending conversion. Include the assigned changes and necessary
+conventions/context; deleted/base files remain available through `git show`.
+Resolve path-scoped guidance before launch. A sparse tree is not an authorization
+to omit necessary review coverage or inspect live source.
+
+```text
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py prepare --source <source> --worktree <new-workspace> --base <base> --head <head> --paths-json <tracked-path-array.json> --record <workspace.json>
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py config --codex <codex-executable> --neutral-root <outside-candidate-root> --record <config.json>
+python3 <trusted-skill>/scripts/review_runtime/routine_review.py run --workspace-record <workspace.json> --config-record <config.json> --output <new-output-directory> --prompt-file <parent-prompt.txt>
+```
+
+`config` reads effective settings without creating a model thread, disables
+inherited MCP servers and external write tools for this process, and pins the
+primary Sol/High/Daybreak-Off profile. Reuse that successful config record within
+the same task while its executable, user selection and relevant configuration
+remain unchanged. The separately authorized `--model gpt-6-sol` choice pins
+Sol/High/Daybreak-On; the helper never automatically switches or grants consent.
+
+Keep records and the prompt outside the candidate tree. The parent prompt gives
+the trusted `$code-review` instruction, exact scope, source purpose and safe Git
+environment. Candidate policy remains review subject. `run` validates selected
+content/executable mode, Git configuration, index and head before and after one
+fresh read-only CLI invocation; timestamp churn is irrelevant. It preserves the
+complete stream and terminal output without a model-output quota or elapsed
+review timeout. The parent judges semantic completeness and findings.
+
+This routine helper provides cooperative task isolation, not hostile same-UID
+tamper protection or the audited workspace proof contract. Its independent
+Git history can be large even when the selected checkout is small.
+Missing local objects or an unprovable range remain preparation failures; it does
+not fetch from upstream. Additional frozen context can be read through Git.
+Use a new workspace for a changed head and re-review affected units plus its
+integration delta; retain unaffected evidence only as described below. Remove
+terminal task-owned copies after checking the recorded scope and source state.
 
 ### Explicit uncommitted local review
 

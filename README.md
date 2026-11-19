@@ -38,9 +38,16 @@ diagnostics, and dependency-based unit revalidation with a current-head
 integration check. The detailed exact-projection audited profile and
 `agents/reviewer-audited.toml` template packaged with the skill are explicit opt-ins. See
 [Routine Local Review](skills/review-orchestration-playbook/references/routine-local-review.md).
-The stdlib `review_runtime/routine_review.py` helper separates code conclusions
-from execution status and plans local unit revalidation; it never launches a
-reviewer or supplies new-head approval.
+The stdlib `review_runtime/routine_review.py` classify/revalidate commands
+separate code conclusions from execution status and plan local unit revalidation;
+they never launch a reviewer or supply new-head approval.
+
+The stdlib `review_runtime/routine_review.py` entrypoint prepares an independent
+Git copy with only explicitly selected tracked files checked out, verifies the
+effective Sol/High/Daybreak configuration without a model request, and launches
+one fresh read-only CLI review with complete output capture. Reuse its successful
+configuration across heads in the same task; the parent still selects affected
+units, reviews the integration delta and owns acceptance.
 
 An explicitly requested uncommitted local review can use a parent-owned frozen
 snapshot beside the independent committed baseline. The same helper captures
