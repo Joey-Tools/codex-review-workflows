@@ -450,6 +450,7 @@ def prepare(source: Path, worktree: Path, base: str, head: str, paths: list[str]
          "--no-hardlinks", "--no-checkout", str(source), str(worktree)],
         env=git_environment(), check=True,
     )
+    git(worktree, "fetch", "--no-tags", "--no-write-fetch-head", str(source), base, head)
     git(worktree, "remote", "remove", "origin")
     git(worktree, "update-ref", "--no-deref", "HEAD", head)
     git(worktree, "read-tree", head)
@@ -457,7 +458,11 @@ def prepare(source: Path, worktree: Path, base: str, head: str, paths: list[str]
     git(worktree, "update-index", "--skip-worktree", "-z", "--stdin", data=all_paths)
     selected = b"".join(path.encode() + b"\x00" for path in paths)
     git(worktree, "update-index", "--no-skip-worktree", "-z", "--stdin", data=selected)
-    git(worktree, "checkout-index", "--stdin", "-z", data=selected)
+    for name, (mode, oid) in entries.items():
+        target = worktree / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(git(worktree, "cat-file", "blob", oid))
+        target.chmod(0o755 if mode == "100755" else 0o644)
     record = {
         "worktree": str(worktree), "base": base, "head": head,
         "object_format": git(worktree, "rev-parse", "--show-object-format").decode().strip(),
@@ -550,6 +555,7 @@ def configuration(codex: str, neutral: Path, model: str) -> dict:
     codex = shutil.which(codex)
     if codex is None:
         raise ValueError("Codex executable not found")
+    codex = str(Path(codex).resolve())
     neutral = neutral.resolve()
     neutral.mkdir(mode=0o700, parents=True, exist_ok=True)
     prefix = [codex, "-a", "never", "-m", model, "-c", 'model_provider="openai"',

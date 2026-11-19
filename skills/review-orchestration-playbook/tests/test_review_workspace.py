@@ -11981,6 +11981,22 @@ class RoutineCodexTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content or executable mode"):
             routine_codex_runtime.validate(record)
 
+    def test_preparation_transfers_head_retained_only_by_a_pr_ref(self):
+        routine_codex_runtime.git(self.source, "update-ref", "refs/pull/1/head", self.head)
+        routine_codex_runtime.git(self.source, "update-ref", "HEAD", self.base)
+        record = self.prepare()
+        self.assertEqual(record["head"], self.head)
+        self.assertEqual((pathlib.Path(record["worktree"]) / "selected.txt").read_bytes(), b"head\n")
+
+    def test_preparation_materializes_raw_blobs_despite_checkout_attributes(self):
+        (self.source / ".gitattributes").write_text("selected.txt text eol=crlf\n")
+        routine_codex_runtime.git(self.source, "add", ".gitattributes")
+        routine_codex_runtime.git(self.source, "-c", "commit.gpgsign=false", "commit", "-qm", "attributes")
+        self.head = routine_codex_runtime.git(self.source, "rev-parse", "HEAD").decode().strip()
+        record = self.prepare()
+        self.assertEqual((pathlib.Path(record["worktree"]) / "selected.txt").read_bytes(), b"head\n")
+        routine_codex_runtime.validate(record)
+
     def test_failed_cli_retains_complete_output_and_failure_for_parent_disposition(self):
         record = self.prepare()
         executable = self.root / "fixture_cli.py"
@@ -12011,10 +12027,11 @@ class RoutineCodexTest(unittest.TestCase):
                          "mcp_servers": {"inherited": {"enabled": True}}}
                 second = dict(first, mcp_servers={"inherited": {"enabled": False}})
                 with mock.patch.object(routine_codex_runtime, "read_config", side_effect=[first, second]) as probe:
-                    with mock.patch.object(routine_codex_runtime.shutil, "which", return_value="/trusted/codex"):
+                    with mock.patch.object(routine_codex_runtime.shutil, "which", return_value="./bin/codex"):
                         with mock.patch.object(routine_codex_runtime.subprocess, "check_output", return_value="codex-cli fixture\n"):
                             record = routine_codex_runtime.configuration("codex", self.root / "neutral", model)
                 self.assertEqual(probe.call_count, 2)
+                self.assertEqual(record["launch_prefix"][0], str(pathlib.Path("./bin/codex").resolve()))
                 self.assertEqual(record["model_threads_started"], 0)
                 self.assertEqual(record["selected_reasoning"], "high")
                 self.assertEqual(record["daybreak"], daybreak)

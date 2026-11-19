@@ -24,8 +24,9 @@ They are machine records, not text the reviewer must reproduce.
 
 On macOS/Linux, use the installed/released `scripts/review_runtime/routine_review.py` instead of
 writing a task-local launcher. `prepare` makes an independent local Git clone,
-keeps the locally available committed history and materializes only the parent's
-explicit regular tracked file list. Include the assigned changes and necessary
+explicitly transfers both frozen endpoints and their reachable history, and
+materializes only the parent's explicit regular tracked file list as raw Git
+blob bytes, without checkout filters or line-ending conversion. Include the assigned changes and necessary
 conventions/context; deleted/base files remain available through `git show`.
 Resolve path-scoped guidance before launch. A sparse tree is not an authorization
 to omit necessary review coverage or inspect live source.
@@ -52,8 +53,8 @@ complete stream and terminal output without a model-output quota or elapsed
 review timeout. The parent judges semantic completeness and findings.
 
 This routine helper provides cooperative task isolation, not hostile same-UID
-tamper protection or the audited workspace proof contract. It copies the local
-Git object store, so budget that storage even when the selected checkout is small.
+tamper protection or the audited workspace proof contract. Its independent
+Git history can be large even when the selected checkout is small.
 Missing local objects or an unprovable range remain preparation failures; it does
 not fetch from upstream. Additional frozen context can be read through Git.
 Use a new workspace for a changed head and re-review affected units plus its

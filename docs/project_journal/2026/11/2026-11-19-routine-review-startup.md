@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-19
 updated: 2026-11-19
 branch: codex/routine-review-launch
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/156
 supersedes: []
 superseded_by:
 ---
@@ -38,6 +38,9 @@ the parent's selected regular tracked context. The audited helper is unchanged.
 
 - Focused tests cover independent sparse preparation, retained Git context,
   live-source independence, content/mode revalidation and process-local profiles.
+- Native review fixes cover relative CLI paths, frozen heads retained only by
+  PR refs, and raw-blob checkout under tracked CRLF attributes. These use the
+  existing test module and do not add CI jobs or model probes.
 - A real no-model configuration invocation confirms the installed Codex CLI's
   effective primary profile and MCP shutdown.
 - Existing policy contracts, skill metadata, journal, whitespace and consumer
