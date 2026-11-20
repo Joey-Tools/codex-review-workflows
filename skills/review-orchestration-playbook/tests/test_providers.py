@@ -33082,12 +33082,12 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
-    def test_codex_default_is_61_high_without_automatic_model_fallback(
+    def test_audited_codex_default_is_62_high_without_automatic_model_fallback(
         self,
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        first = self.attempt("codex", "gpt-6.1-sol", "entitlement")
+        first = self.attempt("codex", "gpt-6.2-sol", "entitlement")
         codex_attempt.return_value = first
         outcome = providers.run_review(
             review=self.review,
@@ -33095,10 +33095,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(outcome.returncode, 1)
         self.assertEqual(outcome.attempts, (first,))
-        self.assertEqual(providers.CODEX_MODELS, ("gpt-6.1-sol",))
+        self.assertEqual(providers.CODEX_MODELS, ("gpt-6.2-sol",))
         self.assertEqual(providers.CODEX_REASONING_EFFORT, "high")
         codex_attempt.assert_called_once()
-        self.assertEqual(codex_attempt.call_args.kwargs["model"], "gpt-6.1-sol")
+        self.assertEqual(codex_attempt.call_args.kwargs["model"], "gpt-6.2-sol")
         self.assertEqual(
             _environment.call_args.kwargs["passthrough_keys"],
             providers.CODEX_ENV_KEYS,
@@ -33598,7 +33598,7 @@ class ProviderPolicyTest(unittest.TestCase):
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        codex_attempt.return_value = self.attempt("codex", "gpt-6.1-sol", "transient")
+        codex_attempt.return_value = self.attempt("codex", "gpt-6.2-sol", "transient")
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
@@ -33623,7 +33623,7 @@ class ProviderPolicyTest(unittest.TestCase):
         codex_attempt.assert_called_once()
         self.assertEqual(len(outcome.attempts), 1)
         self.assertEqual(outcome.attempts[0].runtime, "codex")
-        self.assertEqual(outcome.attempts[0].requested_model, "gpt-6.1-sol")
+        self.assertEqual(outcome.attempts[0].requested_model, "gpt-6.2-sol")
         self.assertEqual(outcome.attempts[0].category, "inconclusive")
         self.assertTrue(pathlib.Path(outcome.attempts[0].stderr_path).is_file())
         self.assertIn(
@@ -37747,7 +37747,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "turn_context",
                     "payload": {
-                        "model": "gpt-6.1-sol",
+                        "model": "gpt-6.2-sol",
                         "effort": "high",
                         "approval_policy": "never",
                         "sandbox_policy": {"type": "read-only"},
@@ -37820,7 +37820,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command.side_effect = complete
         attempt = providers._codex_attempt(
             review=self.review,
-            model="gpt-6.1-sol",
+            model="gpt-6.2-sol",
             index=1,
             env={
                 "CODEX_HOME": str(codex_home),
@@ -37828,7 +37828,7 @@ class ProviderPolicyTest(unittest.TestCase):
             },
         )
         argv = run_command.call_args.args[0]
-        self.assertIn("gpt-6.1-sol", argv)
+        self.assertIn("gpt-6.2-sol", argv)
         self.assertIn('model_reasoning_effort="high"', argv)
         configs = [argv[index + 1] for index, value in enumerate(argv) if value == "-c"]
         self.assertIn('approval_policy="never"', configs)
@@ -37886,7 +37886,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("-s", argv)
         self.assertNotIn("-o", argv)
         self.assertEqual(attempt.final_text, "No findings.")
-        self.assertEqual(attempt.effective_model, "gpt-6.1-sol")
+        self.assertEqual(attempt.effective_model, "gpt-6.2-sol")
         self.assertEqual(attempt.effective_effort, "high")
         self.assertEqual(attempt.category, "success")
         self.assertEqual(

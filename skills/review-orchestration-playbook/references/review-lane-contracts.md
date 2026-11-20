@@ -595,7 +595,7 @@ Read [local-codex-lane.md](local-codex-lane.md).
   read-only subagent is available; candidate project controls are known to
   activate unsuppressed; or external write tools cannot be constrained to none
   or a verified read-only allowlist.
-- The default installed profile is `gpt-6.1-sol` at `high` reasoning.
+- The default installed profile is `gpt-6.2-sol` at `high` reasoning.
 - Record requested and effective adapter, model, and mode.
 - Record `self_policy_migration`, the selected adapter, and the zero-turn,
   read-only subagent launch when applicable.

@@ -3825,7 +3825,7 @@ class LocalCodexLaneContractTest(unittest.TestCase):
         contracts = _read("review-lane-contracts.md")
 
         for expected in (
-            "gpt-6.1-sol",
+            "gpt-6.2-sol",
             "reasoning: `high`",
             'fork_turns="none"',
             "Prefer a clean-context subagent when an eligible zero-context, read-only",

@@ -139,7 +139,7 @@ receipts. `required-remote` remains a blocker until its own gate passes.
 
 ### Local Model and Reasoning Consent
 
-The default local reviewer is `gpt-6.1-sol` at `high` reasoning. Pin that level
+The default local reviewer is `gpt-6.2-sol` at `high` reasoning. Pin that level
 in the installed role/CLI launch instead of inheriting the parent's or ambient
 settings. Record intent separately from runtime evidence.
 
@@ -164,20 +164,21 @@ do not inherit the parent's selections. Preserve explicit user choices.
 
 | Configuration | Model | Reasoning | Daybreak |
 | --- | --- | --- | --- |
-| Default | `gpt-6.1-sol` | `high` | Off |
-| User-authorized fallback | `gpt-6-sol` | `high` | On |
+| Default | `gpt-6.2-sol` | `high` | Off |
+| User-authorized recovery after an incomplete review | `gpt-6-sol` | `high` | On |
 
 The fallback requires the user's authorization; an authorized Luna or other
-selection remains separate. Use per-launch controls, without changing global
-configuration or authentication. If a subagent cannot set the required
-Daybreak state, use a fresh CLI that can, retaining the selected read-only
-boundary and frozen scope.
+selection remains separate. Use per-launch controls. If the available subagent
+cannot pin both the selected model and Daybreak state, use a fresh CLI that can,
+retaining the read-only boundary and frozen scope.
 
-Recover from the actual failure reason. A model/Daybreak incompatibility calls
-for correcting that pair; a still-unavailable primary may use the authorized
-fallback. Fix local MCP/configuration or permission errors at the execution
-entrypoint before retrying. A finding is not a launch failure. Confirm that an
-uncertain prior attempt has ended before starting another.
+If the primary review starts but fails before returning a usable report, the
+parent may use the authorized fallback once after confirming the attempt has
+ended and the provider permits retrying the failure. Keep the same frozen scope
+and safety boundaries, retain any actionable findings, and use only the actual
+completed report for acceptance. A policy refusal, missing consent, or an
+unknown failure does not authorize a model switch. Correct launch model/Daybreak
+pairing and local configuration or permission errors at the execution entrypoint.
 
 Reuse a successful configuration within the same task across new heads;
 reconsider it after user selection, relevant configuration, or availability
