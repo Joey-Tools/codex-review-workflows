@@ -42,7 +42,8 @@ inherited MCP servers and external write tools for this process, and pins the
 primary Sol/High/Daybreak-Off profile. Reuse that successful config record within
 the same task while its executable, user selection and relevant configuration
 remain unchanged. The separately authorized `--model gpt-6-sol` choice pins
-Sol/High/Daybreak-On; the helper never automatically switches or grants consent.
+Sol/High/Daybreak-On for the [recovery decision](default-review-routing.md#routine-local-startup-and-recovery).
+The helper runs one selected profile and leaves that decision to the parent.
 
 Keep records and the prompt outside the candidate tree. The parent prompt gives
 the trusted `$code-review` instruction, exact scope, source purpose and safe Git

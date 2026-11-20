@@ -74,7 +74,7 @@ Clean up terminal workspaces unless retained with explicit user authorization.
   read-only subagent; otherwise use a fresh non-resumed CLI for unsuppressed candidate controls or external write tools.
   Follow [Local Model and Reasoning Consent](references/default-review-routing.md#local-model-and-reasoning-consent)
   and, for routine review, [Startup And Recovery](references/default-review-routing.md#routine-local-startup-and-recovery).
-  The default is `gpt-6.1-sol` / `high`, not the parent's effort. A generic
+  The default is `gpt-6.2-sol` / `high`, not the parent's effort. A generic
   subagent with the same boundaries is also eligible. Other model/effort
   selections require explicit opt-in; worker allocation alone is insufficient.
 - Claude: read [Claude Code](references/canonical-claude-lane.md) only after

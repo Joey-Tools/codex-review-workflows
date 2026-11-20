@@ -525,7 +525,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("subagent", normalized)
             self.assertIn("cli", normalized)
             self.assertIn("peer", normalized)
-            self.assertIn("gpt-6.1-sol", normalized)
+            self.assertIn("gpt-6.2-sol", normalized)
             self.assertIn("high", normalized)
             self.assertIn("internal delegation", normalized)
         self.assertIn("Prefer a clean-context subagent when an eligible", local)
@@ -670,7 +670,7 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 document = _normalize(_read(path))
-                self.assertIn("gpt-6.1-sol", document)
+                self.assertIn("gpt-6.2-sol", document)
                 self.assertIn("gpt-6 luna", document)
                 self.assertIn("up to max", document)
 
@@ -1262,7 +1262,7 @@ class RepositoryContractTest(unittest.TestCase):
         with role_path.open("rb") as handle:
             role = tomllib.load(handle)
 
-        self.assertEqual(role["model"], "gpt-6.1-sol")
+        self.assertEqual(role["model"], "gpt-6.2-sol")
         self.assertEqual(role["model_reasoning_effort"], "high")
         self.assertEqual(role["sandbox_mode"], "read-only")
         instructions = role["developer_instructions"]

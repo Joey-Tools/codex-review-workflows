@@ -286,7 +286,7 @@ Choose from observed capability, effective reviewer strength, orchestration simp
 
   Record the resolved executable, exact version output, and complete literal
   submitted token array in shared metadata; the final report repeats the actual
-  values and requires exact match. Defaults remain `gpt-6.1-sol` and
+  values and requires exact match. Defaults remain `gpt-6.2-sol` and
   `high` reasoning; record any separately authorized
   override exactly as selected. The `-c` values disable Apps, plugins,
   computer use, browser use, image generation, persisted goals, automatic MCP
@@ -540,7 +540,7 @@ failure.
 
 The intended installed profile is:
 
-- model: `gpt-6.1-sol`;
+- model: `gpt-6.2-sol`;
 - reasoning: `high`, pinned to avoid inherited overrides;
 - context: fresh;
 - access: read-only;
@@ -575,7 +575,7 @@ triggers latest-model discovery.
 ## Low-Level Runtime Profiles
 
 The low-level `isolated_review` Codex CLI and independent app-server helpers
-pin `gpt-6.1-sol` at `high` reasoning and do not select a fallback model.
+pin `gpt-6.2-sol` at `high` reasoning and do not select a fallback model.
 An explicit runtime rejection remains blocked or inconclusive.
 
 The low-level Claude Code helper pins `claude-opus-5-5` at `high`; an

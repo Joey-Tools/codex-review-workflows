@@ -358,7 +358,7 @@ FEATURES = (
     "skill_mcp_dependency_install", "multi_agent", "multi_agent_v2",
     "daemon_auto_start", "hooks", "cli_daybreak",
 )
-PROFILES = {"gpt-6.1-sol": False, "gpt-6-sol": True}
+PROFILES = {"gpt-6.2-sol": False, "gpt-6-sol": True}
 
 
 def git_environment() -> dict[str, str]:
@@ -618,7 +618,7 @@ def _startup_main(argv: Sequence[str]) -> int:
     config = commands.add_parser("config")
     config.add_argument("--codex", default="codex")
     config.add_argument("--neutral-root", required=True)
-    config.add_argument("--model", choices=PROFILES, default="gpt-6.1-sol")
+    config.add_argument("--model", choices=PROFILES, default="gpt-6.2-sol")
     config.add_argument("--record", required=True)
     run = commands.add_parser("run")
     for name in ("workspace_record", "config_record", "output", "prompt_file"):

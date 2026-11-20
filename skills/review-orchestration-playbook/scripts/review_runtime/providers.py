@@ -161,7 +161,7 @@ def __getattr__(name: str) -> Any:
 _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
 
 
-CODEX_MODELS = ("gpt-6.1-sol",)
+CODEX_MODELS = ("gpt-6.2-sol",)
 CODEX_REASONING_EFFORT = "high"
 CLAUDE_MODELS = ("claude-opus-5-5",)
 # Copilot CLI uses the dotted ID documented by its command reference.
